@@ -1,0 +1,942 @@
+
+ElementalWarrior wine patch series
+https://gitlab.winehq.org/ElementalWarrior/wine/-/commits/affinity-photo3-wine9.13-part3
+
+# July 29, 2024 updates
+gdiplus: Fixed order of adding offset and result ternary operator (7846c206)
+cmd: Fix test failures for SET /P command (c63cc782)
+mshtml: Use dispex_next_id in NextProperty implementation (4c011a8d)
+jscript: Ensure that external property is still valid in jsdisp_next_prop (88d6e02b)
+mshtml: Use host object script bindings for storage objects (eb2729ab)
+mshtml: Use host object script bindings for frame elements (81a2aa5a)
+mshtml: Use host object script bindings for iframe elements (b505bef4)
+mshtml: Introduce get_outer_iface and use it instead of get_dispatch_this (9e581e26)
+jscript: Allow host objects to specify an outer interface (66740238)
+mshtml: Return E_UNEXPECTED for unknown ids in JSDispatchHost_CallFunction (d9d816b6)
+mshtml: Use get_prop_descs for window object (121b7f10)
+mshtml: Use host object script bindings for Window object (e58cbec2)
+mshtml: Introduce get_script_global and use it instead of get_compat_mode (3f23efd6)
+kernel32: Add SetFirmwareEnvironmentVariableA stub (c7fbc54f)
+d3dx9: Don't silently ignore d3dx_calculate_pixel_size() errors (5c395ff1)
+
+
+diff -uNarp a/dlls/d3dx9_36/surface.c b/dlls/d3dx9_36/surface.c
+--- a/dlls/d3dx9_36/surface.c	2024-07-28 16:02:13.000000000 -0400
++++ b/dlls/d3dx9_36/surface.c	2025-11-19 17:51:05.528387742 -0500
+@@ -484,7 +484,8 @@ static uint32_t d3dx_calculate_layer_pix
+     layer_size = 0;
+     for (i = 0; i < mip_levels; ++i)
+     {
+-        d3dx_calculate_pixels_size(format, dims.width, dims.height, &row_pitch, &slice_pitch);
++        if (FAILED(d3dx_calculate_pixels_size(format, dims.width, dims.height, &row_pitch, &slice_pitch)))
++            return 0;
+         layer_size += slice_pitch * dims.depth;
+         d3dx_get_next_mip_level_size(&dims);
+     }
+@@ -500,7 +501,8 @@ static UINT calculate_dds_file_size(D3DF
+     for (i = 0; i < miplevels; i++)
+     {
+         UINT pitch, size = 0;
+-        d3dx_calculate_pixels_size(format, width, height, &pitch, &size);
++        if (FAILED(d3dx_calculate_pixels_size(format, width, height, &pitch, &size)))
++            return 0;
+         size *= depth;
+         file_size += size;
+         width = max(1, width / 2);
+@@ -539,6 +541,8 @@ static HRESULT save_dds_surface_to_memor
+     if (pixel_format->type == FORMAT_UNKNOWN) return E_NOTIMPL;
+ 
+     file_size = calculate_dds_file_size(src_desc.Format, src_desc.Width, src_desc.Height, 1, 1, 1);
++    if (!file_size)
++        return D3DERR_INVALIDCALL;
+ 
+     hr = d3dx_calculate_pixels_size(src_desc.Format, src_desc.Width, src_desc.Height, &dst_pitch, &surface_size);
+     if (FAILED(hr)) return hr;
+@@ -588,6 +592,7 @@ static HRESULT d3dx_initialize_image_fro
+ {
+     const struct dds_header *header = src_data;
+     uint32_t expected_src_data_size;
++    HRESULT hr;
+ 
+     if (src_data_size < sizeof(*header) || header->pixel_format.size != sizeof(header->pixel_format))
+         return D3DXERR_INVALIDDATA;
+@@ -623,6 +628,8 @@ static HRESULT d3dx_initialize_image_fro
+ 
+     image->layer_pitch = d3dx_calculate_layer_pixels_size(image->format, image->size.width, image->size.height,
+             image->size.depth, image->mip_levels);
++    if (!image->layer_pitch)
++        return D3DXERR_INVALIDDATA;
+     expected_src_data_size = (image->layer_pitch * image->layer_count) + sizeof(*header);
+     if (src_data_size < expected_src_data_size)
+     {
+@@ -640,7 +647,9 @@ static HRESULT d3dx_initialize_image_fro
+         initial_mip_levels = image->mip_levels;
+         for (i = 0; i < starting_mip_level; i++)
+         {
+-            d3dx_calculate_pixels_size(image->format, image->size.width, image->size.height, &row_pitch, &slice_pitch);
++            hr = d3dx_calculate_pixels_size(image->format, image->size.width, image->size.height, &row_pitch, &slice_pitch);
++            if (FAILED(hr))
++                return hr;
+ 
+             image->pixels += slice_pitch * image->size.depth;
+             d3dx_get_next_mip_level_size(&image->size);
+diff -uNarp a/dlls/d3dx9_36/tests/surface.c b/dlls/d3dx9_36/tests/surface.c
+--- a/dlls/d3dx9_36/tests/surface.c	2024-07-28 16:02:13.000000000 -0400
++++ b/dlls/d3dx9_36/tests/surface.c	2025-11-19 17:51:05.528728858 -0500
+@@ -433,6 +433,7 @@ static void test_dds_header_handling(voi
+         dds->header.pixel_format = tests[i].pixel_format;
+ 
+         hr = D3DXGetImageInfoFromFileInMemory(dds, file_size, &info);
++        todo_wine_if(i == 16)
+         ok(hr == tests[i].expected.hr, "%d: D3DXGetImageInfoFromFileInMemory returned %#lx, expected %#lx\n",
+                 i, hr, tests[i].expected.hr);
+         if (SUCCEEDED(hr))
+@@ -687,10 +688,10 @@ static void test_D3DXGetImageInfo(void)
+     check_dds_pixel_format(DDS_PF_FOURCC, D3DFMT_DXT3, 0, 0, 0, 0, 0, D3DFMT_DXT3);
+     check_dds_pixel_format(DDS_PF_FOURCC, D3DFMT_DXT4, 0, 0, 0, 0, 0, D3DFMT_DXT4);
+     check_dds_pixel_format(DDS_PF_FOURCC, D3DFMT_DXT5, 0, 0, 0, 0, 0, D3DFMT_DXT5);
+-    check_dds_pixel_format(DDS_PF_FOURCC, D3DFMT_R8G8_B8G8, 0, 0, 0, 0, 0, D3DFMT_R8G8_B8G8);
+-    check_dds_pixel_format(DDS_PF_FOURCC, D3DFMT_G8R8_G8B8, 0, 0, 0, 0, 0, D3DFMT_G8R8_G8B8);
+-    check_dds_pixel_format(DDS_PF_FOURCC, D3DFMT_UYVY, 0, 0, 0, 0, 0, D3DFMT_UYVY);
+-    check_dds_pixel_format(DDS_PF_FOURCC, D3DFMT_YUY2, 0, 0, 0, 0, 0, D3DFMT_YUY2);
++    todo_wine check_dds_pixel_format(DDS_PF_FOURCC, D3DFMT_R8G8_B8G8, 0, 0, 0, 0, 0, D3DFMT_R8G8_B8G8);
++    todo_wine check_dds_pixel_format(DDS_PF_FOURCC, D3DFMT_G8R8_G8B8, 0, 0, 0, 0, 0, D3DFMT_G8R8_G8B8);
++    todo_wine check_dds_pixel_format(DDS_PF_FOURCC, D3DFMT_UYVY, 0, 0, 0, 0, 0, D3DFMT_UYVY);
++    todo_wine check_dds_pixel_format(DDS_PF_FOURCC, D3DFMT_YUY2, 0, 0, 0, 0, 0, D3DFMT_YUY2);
+     check_dds_pixel_format(DDS_PF_RGB, 0, 16, 0xf800, 0x07e0, 0x001f, 0, D3DFMT_R5G6B5);
+     check_dds_pixel_format(DDS_PF_RGB | DDS_PF_ALPHA, 0, 16, 0x7c00, 0x03e0, 0x001f, 0x8000, D3DFMT_A1R5G5B5);
+     check_dds_pixel_format(DDS_PF_RGB | DDS_PF_ALPHA, 0, 16, 0x0f00, 0x00f0, 0x000f, 0xf000, D3DFMT_A4R4G4B4);
+@@ -710,9 +711,9 @@ static void test_D3DXGetImageInfo(void)
+     check_dds_pixel_format(DDS_PF_LUMINANCE, 0, 16, 0xffff, 0, 0, 0, D3DFMT_L16);
+     check_dds_pixel_format(DDS_PF_LUMINANCE | DDS_PF_ALPHA, 0, 16, 0x00ff, 0, 0, 0xff00, D3DFMT_A8L8);
+     check_dds_pixel_format(DDS_PF_LUMINANCE | DDS_PF_ALPHA, 0, 8, 0x0f, 0, 0, 0xf0, D3DFMT_A4L4);
+-    check_dds_pixel_format(DDS_PF_BUMPDUDV, 0, 16, 0x00ff, 0xff00, 0, 0, D3DFMT_V8U8);
+-    check_dds_pixel_format(DDS_PF_BUMPDUDV, 0, 32, 0x0000ffff, 0xffff0000, 0, 0, D3DFMT_V16U16);
+-    check_dds_pixel_format(DDS_PF_BUMPLUMINANCE, 0, 32, 0x0000ff, 0x00ff00, 0xff0000, 0, D3DFMT_X8L8V8U8);
++    todo_wine check_dds_pixel_format(DDS_PF_BUMPDUDV, 0, 16, 0x00ff, 0xff00, 0, 0, D3DFMT_V8U8);
++    todo_wine check_dds_pixel_format(DDS_PF_BUMPDUDV, 0, 32, 0x0000ffff, 0xffff0000, 0, 0, D3DFMT_V16U16);
++    todo_wine check_dds_pixel_format(DDS_PF_BUMPLUMINANCE, 0, 32, 0x0000ff, 0x00ff00, 0xff0000, 0, D3DFMT_X8L8V8U8);
+ 
+     test_dds_header_handling();
+ 
+diff -uNarp a/dlls/gdiplus/metafile.c b/dlls/gdiplus/metafile.c
+--- a/dlls/gdiplus/metafile.c	2024-07-28 16:02:13.000000000 -0400
++++ b/dlls/gdiplus/metafile.c	2025-11-19 17:51:05.519232409 -0500
+@@ -5532,7 +5532,7 @@ GpStatus METAFILE_DrawArc(GpMetafile *me
+     integer_rect = is_integer_rect(rect);
+ 
+     stat = METAFILE_AllocateRecord(metafile, EmfPlusRecordTypeDrawArc, FIELD_OFFSET(EmfPlusDrawArc, RectData) +
+-        integer_rect ? sizeof(record->RectData.rect) : sizeof(record->RectData.rectF),
++        (integer_rect ? sizeof(record->RectData.rect) : sizeof(record->RectData.rectF)),
+         (void **)&record);
+     if (stat != Ok)
+         return stat;
+diff -uNarp a/dlls/jscript/dispex.c b/dlls/jscript/dispex.c
+--- a/dlls/jscript/dispex.c	2024-07-28 16:02:13.000000000 -0400
++++ b/dlls/jscript/dispex.c	2025-11-19 17:51:05.525302636 -0500
+@@ -2362,7 +2362,8 @@ static HRESULT WINAPI WineJSDispatch_Get
+    if(!(disp = lookup_global_host(This->ctx)))
+        return E_NOINTERFACE;
+ 
+-   return IDispatch_QueryInterface(disp, &IID_IWineJSDispatchHost, (void **)ret);
++   *ret = get_host_dispatch(disp);
++   return S_OK;
+ }
+ 
+ static IWineJSDispatchVtbl DispatchExVtbl = {
+@@ -3033,6 +3034,12 @@ HRESULT jsdisp_next_prop(jsdisp_t *obj,
+     }
+ 
+     for(iter = &obj->props[idx]; iter < obj->props + obj->prop_cnt; iter++) {
++        if(iter->type == PROP_EXTERN) {
++            dispex_prop_t *prop;
++            hres = find_external_prop(obj, iter->name, FALSE, iter, &prop);
++            if(FAILED(hres) || prop != iter)
++                iter->type = PROP_DELETED;
++        }
+         if(iter->type == PROP_DELETED)
+             continue;
+         if(enum_type != JSDISP_ENUM_ALL && iter->type == PROP_PROTREF)
+@@ -3509,6 +3516,7 @@ HRESULT init_host_object(script_ctx_t *c
+ 
+ IWineJSDispatchHost *get_host_dispatch(IDispatch *disp)
+ {
++    IWineJSDispatchHost *ret;
+     HostObject *host_obj;
+     jsdisp_t *jsdisp;
+ 
+@@ -3518,6 +3526,6 @@ IWineJSDispatchHost *get_host_dispatch(I
+         return NULL;
+ 
+     host_obj = HostObject_from_jsdisp(jsdisp);
+-    IWineJSDispatchHost_AddRef(host_obj->host_iface);
+-    return host_obj->host_iface;
++    IWineJSDispatchHost_GetOuterDispatch(host_obj->host_iface, &ret);
++    return ret;
+ }
+diff -uNarp a/dlls/jscript/jsdisp.idl b/dlls/jscript/jsdisp.idl
+--- a/dlls/jscript/jsdisp.idl	2024-07-28 16:02:13.000000000 -0400
++++ b/dlls/jscript/jsdisp.idl	2025-11-19 17:51:05.524393839 -0500
+@@ -64,6 +64,7 @@ interface IWineJSDispatchHost : IDispatc
+     HRESULT DeleteProperty(DISPID id);
+     HRESULT ConfigureProperty(DISPID id, UINT32 flags);
+     HRESULT CallFunction(DISPID id, UINT32 iid, DISPPARAMS *dp, VARIANT *ret, EXCEPINFO *ei, IServiceProvider *caller);
++    HRESULT GetOuterDispatch(IWineJSDispatchHost **ret);
+     HRESULT ToString(BSTR *str);
+ }
+ 
+diff -uNarp a/dlls/kernel32/kernel32.spec b/dlls/kernel32/kernel32.spec
+--- a/dlls/kernel32/kernel32.spec	2024-07-28 16:02:13.000000000 -0400
++++ b/dlls/kernel32/kernel32.spec	2025-11-19 17:51:05.527818192 -0500
+@@ -1437,7 +1437,7 @@
+ # @ stub SetFileShortNameW
+ @ stdcall -import SetFileTime(long ptr ptr ptr)
+ @ stdcall -import SetFileValidData(ptr int64)
+-# @ stub SetFirmwareEnvironmentVariableA
++@ stdcall SetFirmwareEnvironmentVariableA(str str ptr long)
+ @ stdcall SetFirmwareEnvironmentVariableW(wstr wstr ptr long)
+ @ stdcall SetHandleContext(long long)
+ @ stdcall SetHandleCount(long)
+diff -uNarp a/dlls/kernel32/process.c b/dlls/kernel32/process.c
+--- a/dlls/kernel32/process.c	2024-07-28 16:02:13.000000000 -0400
++++ b/dlls/kernel32/process.c	2025-11-19 17:51:05.528081166 -0500
+@@ -739,6 +739,16 @@ DWORD WINAPI GetFirmwareEnvironmentVaria
+ }
+ 
+ /***********************************************************************
++ *           SetFirmwareEnvironmentVariableA     (KERNEL32.@)
++ */
++BOOL WINAPI SetFirmwareEnvironmentVariableA(const char *name, const char *guid, void *buffer, DWORD size)
++{
++    FIXME("stub: %s %s %p %lu\n", debugstr_a(name), debugstr_a(guid), buffer, size);
++    SetLastError(ERROR_INVALID_FUNCTION);
++    return FALSE;
++}
++
++/***********************************************************************
+  *           SetFirmwareEnvironmentVariableW     (KERNEL32.@)
+  */
+ BOOL WINAPI SetFirmwareEnvironmentVariableW(const WCHAR *name, const WCHAR *guid, void *buffer, DWORD size)
+diff -uNarp a/dlls/mshtml/dispex.c b/dlls/mshtml/dispex.c
+--- a/dlls/mshtml/dispex.c	2024-07-28 16:02:13.000000000 -0400
++++ b/dlls/mshtml/dispex.c	2025-11-19 17:51:05.526701181 -0500
+@@ -745,6 +745,15 @@ HRESULT dispex_get_dynid(DispatchEx *Thi
+     return S_OK;
+ }
+ 
++IWineJSDispatchHost *dispex_outer_iface(DispatchEx *dispex)
++{
++    if(dispex->info->desc->vtbl->get_outer_iface)
++        return dispex->info->desc->vtbl->get_outer_iface(dispex);
++
++    IWineJSDispatchHost_AddRef(&dispex->IWineJSDispatchHost_iface);
++    return &dispex->IWineJSDispatchHost_iface;
++}
++
+ static HRESULT dispex_value(DispatchEx *This, LCID lcid, WORD flags, DISPPARAMS *params,
+         VARIANT *res, EXCEPINFO *ei, IServiceProvider *caller)
+ {
+@@ -1721,7 +1730,7 @@ static dispex_data_t *ensure_dispex_info
+     if(compat_mode >= COMPAT_MODE_IE9 && script_global) {
+         if(!script_global->jscript)
+             initialize_script_global(script_global);
+-        if(script_global->jscript) {
++        if(script_global->jscript && !dispex->jsdisp) {
+             hres = IWineJScript_InitHostObject(script_global->jscript, &dispex->IWineJSDispatchHost_iface,
+                                                &dispex->jsdisp);
+             if(FAILED(hres))
+@@ -1734,14 +1743,14 @@ static dispex_data_t *ensure_dispex_info
+ 
+ static BOOL ensure_real_info(DispatchEx *dispex)
+ {
+-    HTMLInnerWindow *script_global = NULL;
+-    compat_mode_t compat_mode;
++    HTMLInnerWindow *script_global;
+ 
+     if(dispex->info != dispex->info->desc->delayed_init_info)
+         return TRUE;
+ 
+-    compat_mode = dispex->info->desc->vtbl->get_compat_mode(dispex, &script_global);
+-    dispex->info = ensure_dispex_info(dispex, dispex->info->desc, compat_mode, script_global);
++    script_global = dispex->info->desc->vtbl->get_script_global(dispex);
++    dispex->info = ensure_dispex_info(dispex, dispex->info->desc,
++                                      script_global->doc->document_mode, script_global);
+     return dispex->info != NULL;
+ }
+ 
+@@ -2391,31 +2400,16 @@ static HRESULT WINAPI JSDispatchHost_Loo
+ static HRESULT WINAPI JSDispatchHost_NextProperty(IWineJSDispatchHost *iface, DISPID id, struct property_info *desc)
+ {
+     DispatchEx *This = impl_from_IWineJSDispatchHost(iface);
+-    func_info_t *func;
++    DISPID next;
+     HRESULT hres;
+ 
+     TRACE("%s (%p)->(%lx)\n", This->info->desc->name, This, id);
+ 
+-    if(id == DISPID_STARTENUM) {
+-        func = This->info->funcs;
+-    }else {
+-        hres = get_builtin_func(This->info, id, &func);
+-        if(FAILED(hres))
+-            return hres;
+-        func++;
+-    }
++    hres = dispex_next_id(This, id, &next);
++    if(hres != S_OK)
++        return hres;
+ 
+-    while(func < This->info->funcs + This->info->func_cnt) {
+-        if(func->func_disp_idx == -1) {
+-            desc->id = func->id;
+-            desc->name = func->name;
+-            desc->flags = PROPF_WRITABLE | PROPF_CONFIGURABLE | PROPF_ENUMERABLE;
+-            desc->func_iid = 0;
+-            return S_OK;
+-        }
+-        func++;
+-    }
+-    return S_FALSE;
++    return get_host_property_descriptor(This, next, desc);
+ }
+ 
+ static HRESULT WINAPI JSDispatchHost_GetProperty(IWineJSDispatchHost *iface, DISPID id, LCID lcid, VARIANT *r,
+@@ -2474,13 +2468,19 @@ static HRESULT WINAPI JSDispatchHost_Cal
+     TRACE("%s (%p)->(%lx %x %p %p %p %p)\n", This->info->desc->name, This, id, iid, dp, ret, ei, caller);
+ 
+     hres = get_builtin_func(This->info, id, &func);
+-    if(FAILED(hres))
+-        return hres;
+-    if(func->tid != iid || func->func_disp_idx < 0)
++    if(FAILED(hres) || func->tid != iid || func->func_disp_idx < 0)
+         return E_UNEXPECTED;
+     return call_builtin_function(This, func, dp, ret, ei, caller);
+ }
+ 
++static HRESULT WINAPI JSDispatchHost_GetOuterDispatch(IWineJSDispatchHost *iface, IWineJSDispatchHost **ret)
++{
++    DispatchEx *This = impl_from_IWineJSDispatchHost(iface);
++
++    *ret = dispex_outer_iface(This);
++    return S_OK;
++}
++
+ static HRESULT WINAPI JSDispatchHost_ToString(IWineJSDispatchHost *iface, BSTR *str)
+ {
+     DispatchEx *This = impl_from_IWineJSDispatchHost(iface);
+@@ -2514,6 +2514,7 @@ static IWineJSDispatchHostVtbl JSDispatc
+     JSDispatchHost_DeleteProperty,
+     JSDispatchHost_ConfigureProperty,
+     JSDispatchHost_CallFunction,
++    JSDispatchHost_GetOuterDispatch,
+     JSDispatchHost_ToString,
+ };
+ 
+@@ -2651,7 +2652,7 @@ void init_dispatch(DispatchEx *dispex, d
+     dispex->jsdisp = NULL;
+     ccref_init(&dispex->ccref, 1);
+ 
+-    if(data->vtbl->get_compat_mode) {
++    if(data->vtbl->get_script_global) {
+         /* delayed init */
+         if(!data->delayed_init_info) {
+             EnterCriticalSection(&cs_dispex_static_data);
+diff -uNarp a/dlls/mshtml/htmldoc.c b/dlls/mshtml/htmldoc.c
+--- a/dlls/mshtml/htmldoc.c	2024-07-28 16:02:13.000000000 -0400
++++ b/dlls/mshtml/htmldoc.c	2025-11-19 17:51:05.527104659 -0500
+@@ -5535,14 +5535,14 @@ static HRESULT HTMLDocumentNode_get_prop
+     return S_OK;
+ }
+ 
+-static compat_mode_t HTMLDocumentNode_get_compat_mode(DispatchEx *dispex, HTMLInnerWindow **script_global)
++static HTMLInnerWindow *HTMLDocumentNode_get_script_global(DispatchEx *dispex)
+ {
+     HTMLDocumentNode *This = impl_from_DispatchEx(dispex);
+ 
+-    TRACE("(%p) returning %u\n", This, This->document_mode);
++    TRACE("(%p) using %u compat mode\n", This, This->document_mode);
+ 
+-    *script_global = This->script_global;
+-    return lock_document_mode(This);
++    lock_document_mode(This);
++    return This->script_global;
+ }
+ 
+ static nsISupports *HTMLDocumentNode_get_gecko_target(DispatchEx *dispex)
+@@ -5639,7 +5639,7 @@ static const event_target_vtbl_t HTMLDoc
+         .invoke              = HTMLDocumentNode_invoke,
+         .disp_invoke         = HTMLDocumentNode_disp_invoke,
+         .next_dispid         = HTMLDocumentNode_next_dispid,
+-        .get_compat_mode     = HTMLDocumentNode_get_compat_mode,
++        .get_script_global   = HTMLDocumentNode_get_script_global,
+     },
+     .get_gecko_target        = HTMLDocumentNode_get_gecko_target,
+     .bind_event              = HTMLDocumentNode_bind_event,
+diff -uNarp a/dlls/mshtml/htmlevent.c b/dlls/mshtml/htmlevent.c
+--- a/dlls/mshtml/htmlevent.c	2024-07-28 16:02:13.000000000 -0400
++++ b/dlls/mshtml/htmlevent.c	2025-11-19 17:51:05.523551424 -0500
+@@ -321,12 +321,13 @@ static void remove_event_listener(EventT
+ 
+ static IEventTarget *get_event_target_iface(EventTarget *event_target)
+ {
+-    const event_target_vtbl_t *vtbl = dispex_get_vtbl(&event_target->dispex);
++    const dispex_static_data_vtbl_t *vtbl = dispex_get_vtbl(&event_target->dispex);
+     IEventTarget *ret;
+ 
+-    if(vtbl->get_dispatch_this) {
+-        IDispatch *disp = vtbl->get_dispatch_this(&event_target->dispex);
+-        IDispatch_QueryInterface(disp, &IID_IEventTarget, (void**)&ret);
++    if(vtbl->get_outer_iface) {
++        IWineJSDispatchHost *disp = vtbl->get_outer_iface(&event_target->dispex);
++        IWineJSDispatchHost_QueryInterface(disp, &IID_IEventTarget, (void**)&ret);
++        IWineJSDispatchHost_Release(disp);
+     }else {
+         ret = &event_target->IEventTarget_iface;
+         IEventTarget_AddRef(ret);
+@@ -4191,11 +4192,8 @@ static void call_event_handlers(EventTar
+             skip_onevent_listener = TRUE;
+ 
+             V_VT(&arg) = VT_DISPATCH;
+-            V_DISPATCH(&arg) = (IDispatch*)&event_target->dispex.IWineJSDispatchHost_iface;
++            V_DISPATCH(&arg) = (IDispatch*)dispex_outer_iface(&event_target->dispex);
+             V_VT(&v) = VT_EMPTY;
+-            if(vtbl->get_dispatch_this)
+-                V_DISPATCH(&arg) = vtbl->get_dispatch_this(&event_target->dispex);
+-            IDispatch_AddRef(V_DISPATCH(&arg));
+ 
+             TRACE("%p %s >>>\n", event_target, debugstr_w(event->type));
+             hres = call_disp_func(listener->function, &dp, &v);
+@@ -4272,10 +4270,7 @@ static void call_event_handlers(EventTar
+             DISPPARAMS dp = {args, &named_arg, 2, 1};
+ 
+             V_VT(args) = VT_DISPATCH;
+-            V_DISPATCH(args) = (IDispatch*)&event_target->dispex.IWineJSDispatchHost_iface;
+-            if(vtbl->get_dispatch_this)
+-                V_DISPATCH(args) = vtbl->get_dispatch_this(&event_target->dispex);
+-            IDispatch_AddRef(V_DISPATCH(args));
++            V_DISPATCH(args) = (IDispatch *)dispex_outer_iface(&event_target->dispex);
+ 
+             V_VT(args+1) = VT_DISPATCH;
+             V_DISPATCH(args+1) = dispatch_mode == DISPATCH_LEGACY
+diff -uNarp a/dlls/mshtml/htmlevent.h b/dlls/mshtml/htmlevent.h
+--- a/dlls/mshtml/htmlevent.h	2024-07-28 16:02:13.000000000 -0400
++++ b/dlls/mshtml/htmlevent.h	2025-11-19 17:51:05.523791249 -0500
+@@ -127,7 +127,6 @@ void detach_nsevent(HTMLDocumentNode*,co
+ /* We extend dispex vtbl for EventTarget functions to avoid separated vtbl. */
+ typedef struct {
+     dispex_static_data_vtbl_t dispex_vtbl;
+-    IDispatch *(*get_dispatch_this)(DispatchEx*);
+     nsISupports *(*get_gecko_target)(DispatchEx*);
+     void (*bind_event)(DispatchEx*,eventid_t);
+     EventTarget *(*get_parent_event_target)(DispatchEx*);
+diff -uNarp a/dlls/mshtml/htmlframe.c b/dlls/mshtml/htmlframe.c
+--- a/dlls/mshtml/htmlframe.c	2024-07-28 16:02:13.000000000 -0400
++++ b/dlls/mshtml/htmlframe.c	2025-11-19 17:51:05.522903342 -0500
+@@ -870,17 +870,15 @@ static HRESULT HTMLFrameElement_get_disp
+     return search_window_props(This->framebase.content_window->base.inner_window, name, grfdex, dispid);
+ }
+ 
+-static HRESULT HTMLFrameElement_get_name(DispatchEx *dispex, DISPID id, BSTR *name)
++static HRESULT HTMLFrameElement_get_prop_desc(DispatchEx *dispex, DISPID id, struct property_info *desc)
+ {
+     HTMLFrameElement *This = frame_from_DispatchEx(dispex);
+-    DWORD idx = id - MSHTML_DISPID_CUSTOM_MIN;
+ 
+-    if(!This->framebase.content_window ||
+-       idx >= This->framebase.content_window->base.inner_window->global_prop_cnt)
++    if(!This->framebase.content_window)
+         return DISP_E_MEMBERNOTFOUND;
+ 
+-    *name = SysAllocString(This->framebase.content_window->base.inner_window->global_props[idx].name);
+-    return *name ? S_OK : E_OUTOFMEMORY;
++    return HTMLWindow_get_prop_desc(&This->framebase.content_window->base.inner_window->event_target.dispex,
++                                    id, desc);
+ }
+ 
+ static HRESULT HTMLFrameElement_invoke(DispatchEx *dispex, DISPID id, LCID lcid, WORD flags, DISPPARAMS *params,
+@@ -893,8 +891,8 @@ static HRESULT HTMLFrameElement_invoke(D
+         return E_FAIL;
+     }
+ 
+-    return IWineJSDispatchHost_InvokeEx(&This->framebase.content_window->IWineJSDispatchHost_iface, id, lcid,
+-            flags, params, res, ei, caller);
++    return HTMLWindow_invoke(&This->framebase.content_window->base.inner_window->event_target.dispex,
++                             id, lcid, flags, params, res, ei, caller);
+ }
+ 
+ static const NodeImplVtbl HTMLFrameElementImplVtbl = {
+@@ -915,7 +913,7 @@ static const event_target_vtbl_t HTMLFra
+         .traverse       = HTMLFrameElement_traverse,
+         .unlink         = HTMLFrameElement_unlink,
+         .get_dispid     = HTMLFrameElement_get_dispid,
+-        .get_name       = HTMLFrameElement_get_name,
++        .get_prop_desc  = HTMLFrameElement_get_prop_desc,
+         .invoke         = HTMLFrameElement_invoke
+     },
+     HTMLELEMENT_EVENT_TARGET_VTBL_ENTRIES,
+@@ -1307,17 +1305,15 @@ static HRESULT HTMLIFrame_get_dispid(Dis
+     return search_window_props(This->framebase.content_window->base.inner_window, name, grfdex, dispid);
+ }
+ 
+-static HRESULT HTMLIFrame_get_name(DispatchEx *dispex, DISPID id, BSTR *name)
++static HRESULT HTMLIFrame_get_prop_desc(DispatchEx *dispex, DISPID id, struct property_info *desc)
+ {
+     HTMLIFrame *This = iframe_from_DispatchEx(dispex);
+-    DWORD idx = id - MSHTML_DISPID_CUSTOM_MIN;
+ 
+-    if(!This->framebase.content_window ||
+-       idx >= This->framebase.content_window->base.inner_window->global_prop_cnt)
++    if(!This->framebase.content_window)
+         return DISP_E_MEMBERNOTFOUND;
+ 
+-    *name = SysAllocString(This->framebase.content_window->base.inner_window->global_props[idx].name);
+-    return *name ? S_OK : E_OUTOFMEMORY;
++    return HTMLWindow_get_prop_desc(&This->framebase.content_window->base.inner_window->event_target.dispex,
++                                    id, desc);
+ }
+ 
+ static HRESULT HTMLIFrame_invoke(DispatchEx *dispex, DISPID id, LCID lcid, WORD flags, DISPPARAMS *params,
+@@ -1330,8 +1326,8 @@ static HRESULT HTMLIFrame_invoke(Dispatc
+         return E_FAIL;
+     }
+ 
+-    return IWineJSDispatchHost_InvokeEx(&This->framebase.content_window->IWineJSDispatchHost_iface, id, lcid,
+-            flags, params, res, ei, caller);
++    return HTMLWindow_invoke(&This->framebase.content_window->base.inner_window->event_target.dispex,
++                             id, lcid, flags, params, res, ei, caller);
+ }
+ 
+ static const NodeImplVtbl HTMLIFrameImplVtbl = {
+@@ -1352,7 +1348,7 @@ static const event_target_vtbl_t HTMLIFr
+         .traverse       = HTMLIFrame_traverse,
+         .unlink         = HTMLIFrame_unlink,
+         .get_dispid     = HTMLIFrame_get_dispid,
+-        .get_name       = HTMLIFrame_get_name,
++        .get_prop_desc  = HTMLIFrame_get_prop_desc,
+         .invoke         = HTMLIFrame_invoke
+     },
+     HTMLELEMENT_EVENT_TARGET_VTBL_ENTRIES,
+diff -uNarp a/dlls/mshtml/htmlstorage.c b/dlls/mshtml/htmlstorage.c
+--- a/dlls/mshtml/htmlstorage.c	2024-07-28 16:02:13.000000000 -0400
++++ b/dlls/mshtml/htmlstorage.c	2025-11-19 17:51:05.521290643 -0500
+@@ -1117,17 +1117,6 @@ static HRESULT HTMLStorage_get_dispid(Di
+     return get_prop(This, name, dispid);
+ }
+ 
+-static HRESULT HTMLStorage_get_name(DispatchEx *dispex, DISPID id, BSTR *name)
+-{
+-    HTMLStorage *This = impl_from_DispatchEx(dispex);
+-    DWORD idx = id - MSHTML_DISPID_CUSTOM_MIN;
+-
+-    if(idx >= This->num_props)
+-        return DISP_E_MEMBERNOTFOUND;
+-
+-    return (*name = SysAllocString(This->props[idx])) ? S_OK : E_OUTOFMEMORY;
+-}
+-
+ static HRESULT HTMLStorage_invoke(DispatchEx *dispex, DISPID id, LCID lcid, WORD flags, DISPPARAMS *params,
+         VARIANT *res, EXCEPINFO *ei, IServiceProvider *caller)
+ {
+@@ -1278,16 +1267,27 @@ static HRESULT HTMLStorage_next_dispid(D
+     return S_OK;
+ }
+ 
++static HRESULT HTMLStorage_get_prop_desc(DispatchEx *dispex, DISPID id, struct property_info *desc)
++{
++    HTMLStorage *This = impl_from_DispatchEx(dispex);
++
++    desc->name = This->props[id - MSHTML_DISPID_CUSTOM_MIN];
++    desc->id = id;
++    desc->flags = PROPF_WRITABLE | PROPF_CONFIGURABLE | PROPF_ENUMERABLE;
++    desc->func_iid = 0;
++    return S_OK;
++}
++
+ static const dispex_static_data_vtbl_t HTMLStorage_dispex_vtbl = {
+     .query_interface  = HTMLStorage_query_interface,
+     .destructor       = HTMLStorage_destructor,
+     .traverse         = HTMLStorage_traverse,
+     .unlink           = HTMLStorage_unlink,
+     .get_dispid       = HTMLStorage_get_dispid,
+-    .get_name         = HTMLStorage_get_name,
+     .invoke           = HTMLStorage_invoke,
+     .delete           = HTMLStorage_delete,
+     .next_dispid      = HTMLStorage_next_dispid,
++    .get_prop_desc    = HTMLStorage_get_prop_desc,
+ };
+ 
+ static const tid_t HTMLStorage_iface_tids[] = {
+@@ -1451,7 +1451,7 @@ HRESULT create_html_storage(HTMLInnerWin
+     storage->window = window;
+     IHTMLWindow2_AddRef(&window->base.IHTMLWindow2_iface);
+ 
+-    init_dispatch(&storage->dispex, &HTMLStorage_dispex, NULL,
++    init_dispatch(&storage->dispex, &HTMLStorage_dispex, window,
+                   dispex_compat_mode(&window->event_target.dispex));
+ 
+     *p = &storage->IHTMLStorage_iface;
+diff -uNarp a/dlls/mshtml/htmlwindow.c b/dlls/mshtml/htmlwindow.c
+--- a/dlls/mshtml/htmlwindow.c	2024-07-28 16:02:13.000000000 -0400
++++ b/dlls/mshtml/htmlwindow.c	2025-11-19 17:51:05.527372053 -0500
+@@ -2151,17 +2151,14 @@ static IHTMLWindow2 *get_source_window(I
+     if(hres != S_OK)
+         cmdtarget = NULL;
+ 
+-    if(compat_mode < COMPAT_MODE_IE9) {
+-        /* Legacy modes query caller unconditionally, and use it instead, if it has a command target */
+-        hres = IServiceProvider_QueryService(caller, &SID_GetCaller, &IID_IServiceProvider, (void**)&parent);
+-        if(hres == S_OK && parent) {
+-            hres = IServiceProvider_QueryService(parent, &IID_IActiveScriptSite, &IID_IOleCommandTarget, (void**)&parent_cmdtarget);
+-            IServiceProvider_Release(parent);
+-            if(hres == S_OK && parent_cmdtarget) {
+-                if(cmdtarget)
+-                    IOleCommandTarget_Release(cmdtarget);
+-                cmdtarget = parent_cmdtarget;
+-            }
++    hres = IServiceProvider_QueryService(caller, &SID_GetCaller, &IID_IServiceProvider, (void**)&parent);
++    if(hres == S_OK && parent) {
++        hres = IServiceProvider_QueryService(parent, &IID_IActiveScriptSite, &IID_IOleCommandTarget, (void**)&parent_cmdtarget);
++        IServiceProvider_Release(parent);
++        if(hres == S_OK && parent_cmdtarget) {
++            if(cmdtarget)
++                IOleCommandTarget_Release(cmdtarget);
++            cmdtarget = parent_cmdtarget;
+         }
+     }
+ 
+@@ -3508,6 +3505,15 @@ static HRESULT WINAPI WindowDispEx_CallF
+                                         id, iid, dp, ret, ei, caller);
+ }
+ 
++static HRESULT WINAPI WindowDispEx_GetOuterDispatch(IWineJSDispatchHost *iface, IWineJSDispatchHost **ret)
++{
++    HTMLOuterWindow *This = impl_from_IWineJSDispatchHost(iface);
++
++    *ret = &This->IWineJSDispatchHost_iface;
++    IWineJSDispatchHost_AddRef(*ret);
++    return S_OK;
++}
++
+ static HRESULT WINAPI WindowDispEx_ToString(IWineJSDispatchHost *iface, BSTR *str)
+ {
+     HTMLOuterWindow *This = impl_from_IWineJSDispatchHost(iface);
+@@ -3539,6 +3545,7 @@ static const IWineJSDispatchHostVtbl Win
+     WindowDispEx_DeleteProperty,
+     WindowDispEx_ConfigureProperty,
+     WindowDispEx_CallFunction,
++    WindowDispEx_GetOuterDispatch,
+     WindowDispEx_ToString,
+ };
+ 
+@@ -3779,17 +3786,6 @@ static void HTMLWindow_last_release(Disp
+     remove_target_tasks(This->task_magic);
+ }
+ 
+-static HRESULT HTMLWindow_get_name(DispatchEx *dispex, DISPID id, BSTR *name)
+-{
+-    HTMLInnerWindow *This = impl_from_DispatchEx(dispex);
+-    DWORD idx = id - MSHTML_DISPID_CUSTOM_MIN;
+-
+-    if(idx >= This->global_prop_cnt)
+-        return DISP_E_MEMBERNOTFOUND;
+-
+-    return (*name = SysAllocString(This->global_props[idx].name)) ? S_OK : E_OUTOFMEMORY;
+-}
+-
+ static HRESULT HTMLWindow_lookup_dispid(DispatchEx *dispex, const WCHAR *name, DWORD grfdex, DISPID *dispid)
+ {
+     HTMLInnerWindow *This = impl_from_DispatchEx(dispex);
+@@ -3830,8 +3826,8 @@ static HRESULT HTMLWindow_find_dispid(Di
+     return DISP_E_UNKNOWNNAME;
+ }
+ 
+-static HRESULT HTMLWindow_invoke(DispatchEx *dispex, DISPID id, LCID lcid, WORD flags, DISPPARAMS *params,
+-        VARIANT *res, EXCEPINFO *ei, IServiceProvider *caller)
++HRESULT HTMLWindow_invoke(DispatchEx *dispex, DISPID id, LCID lcid, WORD flags, DISPPARAMS *params,
++                          VARIANT *res, EXCEPINFO *ei, IServiceProvider *caller)
+ {
+     HTMLInnerWindow *This = impl_from_DispatchEx(dispex);
+     global_prop_t *prop;
+@@ -3895,7 +3891,7 @@ static HRESULT HTMLWindow_invoke(Dispatc
+ 
+             prop->type = GLOBAL_DISPEXVAR;
+             prop->id = dispex_id;
+-            return IWineJSDispatchHost_InvokeEx(&This->event_target.dispex.IWineJSDispatchHost_iface, dispex_id, 0, flags, params, res, ei, caller);
++            return dispex_prop_put(&This->event_target.dispex, dispex_id, 0, params->rgvarg, ei, caller);
+         }
+         default:
+             FIXME("Not supported flags: %x\n", flags);
+@@ -3946,16 +3942,42 @@ static HRESULT HTMLWindow_next_dispid(Di
+     return S_OK;
+ }
+ 
+-static compat_mode_t HTMLWindow_get_compat_mode(DispatchEx *dispex, HTMLInnerWindow **script_global)
++HRESULT HTMLWindow_get_prop_desc(DispatchEx *dispex, DISPID id, struct property_info *desc)
+ {
+     HTMLInnerWindow *This = impl_from_DispatchEx(dispex);
+-    return lock_document_mode(This->doc);
++    global_prop_t *prop;
++
++    if(id - MSHTML_DISPID_CUSTOM_MIN >= This->global_prop_cnt)
++        return DISP_E_MEMBERNOTFOUND;
++
++    prop = &This->global_props[id - MSHTML_DISPID_CUSTOM_MIN];
++    desc->name = prop->name;
++    desc->id = id;
++    desc->flags = PROPF_WRITABLE | PROPF_CONFIGURABLE;
++    if(prop->type == GLOBAL_DISPEXVAR)
++        desc->flags |= PROPF_ENUMERABLE;
++    desc->func_iid = 0;
++    return S_OK;
+ }
+ 
+-static IDispatch *HTMLWindow_get_dispatch_this(DispatchEx *dispex)
++static HTMLInnerWindow *HTMLWindow_get_script_global(DispatchEx *dispex)
+ {
+     HTMLInnerWindow *This = impl_from_DispatchEx(dispex);
+-    return (IDispatch*)&This->base.outer_window->base.IHTMLWindow2_iface;
++    lock_document_mode(This->doc);
++    return This;
++}
++
++static IWineJSDispatchHost *HTMLWindow_get_outer_iface(DispatchEx *dispex)
++{
++    HTMLInnerWindow *This = impl_from_DispatchEx(dispex);
++    IWineJSDispatchHost *ret;
++
++    if(This->base.outer_window)
++        ret = &This->base.outer_window->IWineJSDispatchHost_iface;
++    else
++        ret = &This->event_target.dispex.IWineJSDispatchHost_iface;
++    IWineJSDispatchHost_AddRef(ret);
++    return ret;
+ }
+ 
+ static nsISupports *HTMLWindow_get_gecko_target(DispatchEx *dispex)
+@@ -4128,14 +4150,14 @@ static const event_target_vtbl_t HTMLWin
+         .traverse            = HTMLWindow_traverse,
+         .unlink              = HTMLWindow_unlink,
+         .last_release        = HTMLWindow_last_release,
+-        .get_name            = HTMLWindow_get_name,
+         .lookup_dispid       = HTMLWindow_lookup_dispid,
+         .find_dispid         = HTMLWindow_find_dispid,
+         .invoke              = HTMLWindow_invoke,
+         .next_dispid         = HTMLWindow_next_dispid,
+-        .get_compat_mode     = HTMLWindow_get_compat_mode,
++        .get_prop_desc       = HTMLWindow_get_prop_desc,
++        .get_script_global   = HTMLWindow_get_script_global,
++        .get_outer_iface     = HTMLWindow_get_outer_iface,
+     },
+-    .get_dispatch_this       = HTMLWindow_get_dispatch_this,
+     .get_gecko_target        = HTMLWindow_get_gecko_target,
+     .bind_event              = HTMLWindow_bind_event,
+     .set_current_event       = HTMLWindow_set_current_event
+@@ -4286,7 +4308,7 @@ static HRESULT create_inner_window(HTMLO
+     window->base.outer_window = outer_window;
+     window->base.inner_window = window;
+ 
+-    EventTarget_Init(&window->event_target, &HTMLWindow_dispex, COMPAT_MODE_NONE);
++    init_event_target(&window->event_target, &HTMLWindow_dispex, NULL);
+ 
+     window->task_magic = get_task_target_magic();
+ 
+diff -uNarp a/dlls/mshtml/mshtml_private.h b/dlls/mshtml/mshtml_private.h
+--- a/dlls/mshtml/mshtml_private.h	2024-07-28 16:02:13.000000000 -0400
++++ b/dlls/mshtml/mshtml_private.h	2025-11-19 17:51:05.527544137 -0500
+@@ -375,6 +375,9 @@ typedef struct {
+     /* Called on the last release, when the refcount reaches 0 */
+     void (*last_release)(DispatchEx*);
+ 
++    /* Called to get outer interface when it may be different than DispatchEx */
++    IWineJSDispatchHost *(*get_outer_iface)(DispatchEx*);
++
+     /* Called when the object wants to handle DISPID_VALUE invocations */
+     HRESULT (*value)(DispatchEx*,LCID,WORD,DISPPARAMS*,VARIANT*,EXCEPINFO*,IServiceProvider*);
+ 
+@@ -398,7 +401,7 @@ typedef struct {
+     HRESULT (*disp_invoke)(DispatchEx*,DISPID,LCID,WORD,DISPPARAMS*,VARIANT*,EXCEPINFO*,IServiceProvider*);
+ 
+     /* Used by objects that want to delay their compat mode initialization until actually needed */
+-    compat_mode_t (*get_compat_mode)(DispatchEx*,HTMLInnerWindow**);
++    HTMLInnerWindow *(*get_script_global)(DispatchEx*);
+ 
+     /* Used by objects that want to populate some dynamic props on initialization */
+     HRESULT (*populate_props)(DispatchEx*);
+@@ -517,6 +520,7 @@ HRESULT dispex_get_id(DispatchEx *dispex
+ HRESULT dispex_next_id(DispatchEx *dispex, DISPID id, DISPID *ret);
+ HRESULT dispex_prop_name(DispatchEx *dispex, DISPID id, BSTR *ret);
+ HRESULT dispex_index_prop_desc(DispatchEx*,DISPID,struct property_info*);
++IWineJSDispatchHost *dispex_outer_iface(DispatchEx *dispex);
+ 
+ typedef enum {
+     DISPEXPROP_CUSTOM,
+@@ -1069,6 +1073,10 @@ void HTMLDocumentObj_Service_Init(HTMLDo
+ void HTMLDocumentObj_OleCmd_Init(HTMLDocumentObj*);
+ void TargetContainer_Init(HTMLDocumentObj*);
+ 
++HRESULT HTMLWindow_get_prop_desc(DispatchEx *dispex, DISPID id, struct property_info *desc);
++HRESULT HTMLWindow_invoke(DispatchEx *dispex, DISPID id, LCID lcid, WORD flags, DISPPARAMS *params,
++                          VARIANT *res, EXCEPINFO *ei, IServiceProvider *caller);
++
+ void HTMLDocumentNode_Persist_Init(HTMLDocumentNode*);
+ void HTMLDocumentNode_Service_Init(HTMLDocumentNode*);
+ void HTMLDocumentNode_OleCmd_Init(HTMLDocumentNode*);
+diff -uNarp a/dlls/mshtml/script.c b/dlls/mshtml/script.c
+--- a/dlls/mshtml/script.c	2024-07-28 16:02:13.000000000 -0400
++++ b/dlls/mshtml/script.c	2025-11-19 17:51:05.525998159 -0500
+@@ -199,6 +199,27 @@ static BOOL init_script_engine(ScriptHos
+         return FALSE;
+     }
+ 
++    if(compat_mode >= COMPAT_MODE_IE9 && IsEqualGUID(&CLSID_JScript, &script_host->guid)) {
++        IWineJScript *jscript;
++        hres = IActiveScript_QueryInterface(script, &IID_IWineJScript, (void **)&jscript);
++        if(SUCCEEDED(hres)) {
++            assert(!script_host->window->jscript);
++            assert(!script_host->window->event_target.dispex.jsdisp);
++            script_host->window->jscript = jscript;
++
++            hres = IWineJScript_InitHostObject(jscript,
++                                               &script_host->window->event_target.dispex.IWineJSDispatchHost_iface,
++                                               &script_host->window->event_target.dispex.jsdisp);
++            if(FAILED(hres))
++                ERR("Could not initialize script global: %08lx\n", hres);
++
++            /* make sure that script global is fully initialized */
++            dispex_compat_mode(&script_host->window->event_target.dispex);
++        }else {
++            ERR("Could not get IWineJScript, don't use native jscript.dll\n");
++        }
++    }
++
+     hres = IActiveScript_AddNamedItem(script, L"window",
+             SCRIPTITEM_ISVISIBLE|SCRIPTITEM_ISSOURCE|SCRIPTITEM_GLOBALMEMBERS);
+     if(SUCCEEDED(hres)) {
+@@ -381,8 +402,10 @@ static HRESULT WINAPI ActiveScriptSite_G
+     if(!This->window || !This->window->base.outer_window)
+         return E_FAIL;
+ 
+-    /* FIXME: Return proxy object */
+-    *ppiunkItem = (IUnknown*)&This->window->base.outer_window->base.IHTMLWindow2_iface;
++    if(dispex_compat_mode(&This->window->event_target.dispex) >= COMPAT_MODE_IE9)
++        *ppiunkItem = (IUnknown*)This->window->event_target.dispex.jsdisp;
++    else
++        *ppiunkItem = (IUnknown*)&This->window->base.outer_window->base.IHTMLWindow2_iface;
+     IUnknown_AddRef(*ppiunkItem);
+ 
+     return S_OK;
+@@ -1390,19 +1413,9 @@ static ScriptHost *get_script_host(HTMLI
+ 
+ void initialize_script_global(HTMLInnerWindow *script_global)
+ {
+-    ScriptHost *script_host;
+-    HRESULT hres;
+-
+-    if(script_global->jscript)
++    if(!script_global->base.outer_window)
+         return;
+-
+-    script_host = get_script_host(script_global, &CLSID_JScript);
+-    if(!script_host)
+-        return;
+-
+-    hres = IActiveScript_QueryInterface(script_host->script, &IID_IWineJScript, (void **)&script_global->jscript);
+-    if(FAILED(hres))
+-        ERR("Could not get IWineJScript, don't use native jscript.dll\n");
++    get_script_host(script_global, &CLSID_JScript);
+ }
+ 
+ static ScriptHost *get_elem_script_host(HTMLInnerWindow *window, HTMLScriptElement *script_elem)
+diff -uNarp a/dlls/mshtml/tests/documentmode.js b/dlls/mshtml/tests/documentmode.js
+--- a/dlls/mshtml/tests/documentmode.js	2024-07-28 16:02:13.000000000 -0400
++++ b/dlls/mshtml/tests/documentmode.js	2025-11-19 17:51:05.526154872 -0500
+@@ -150,7 +150,7 @@ sync_test("builtin_toString", function()
+         [ "font",            "Font", -1 ],
+         [ "footer",          "" ],
+         [ "form",            "Form" ],
+-        [ "frame",           "Frame", -1 ],
++        [ "frame",           "Frame" ],
+         [ "frameset",        "FrameSet", -1 ],
+         [ "h1",              "Heading", -1 ],
+         [ "h2",              "Heading", -1 ],
+@@ -164,7 +164,7 @@ sync_test("builtin_toString", function()
+         [ "hr",              "HR", -1 ],
+         [ "html",            "Html" ],
+         [ "i",               "Phrase", -1 ],
+-        [ "iframe",          "IFrame", -1 ],
++        [ "iframe",          "IFrame" ],
+         [ "img",             "Image" ],
+         [ "input",           "Input" ],
+         [ "ins",             "Mod", -1 ],
+@@ -300,7 +300,7 @@ sync_test("builtin_toString", function()
+     test("elements", document.getElementsByTagName("body"), "HTMLCollection", null, true);
+     test("history", window.history, "History");
+     test("implementation", document.implementation, "DOMImplementation");
+-    if(localStorage) test("localStorage", localStorage, "Storage", null, true);
++    if(localStorage) test("localStorage", localStorage, "Storage");
+     test("location", window.location, "Object", window.location.href, null, true);
+     if(v >= 11 /* todo_wine */) test("mimeTypes", window.navigator.mimeTypes, v < 11 ? "MSMimeTypesCollection" : "MimeTypeArray");
+     test("navigator", window.navigator, "Navigator");
+@@ -309,7 +309,7 @@ sync_test("builtin_toString", function()
+     test("performanceTiming", window.performance.timing, "PerformanceTiming");
+     if(v >= 11 /* todo_wine */) test("plugins", window.navigator.plugins, v < 11 ? "MSPluginsCollection" : "PluginArray");
+     test("screen", window.screen, "Screen");
+-    test("sessionStorage", window.sessionStorage, "Storage", null, true);
++    test("sessionStorage", window.sessionStorage, "Storage");
+     test("style", document.body.style, "MSStyleCSSProperties", null, true);
+     test("styleSheet", sheet, "CSSStyleSheet", null, true);
+     test("styleSheetRule", sheet.rules[0], "CSSStyleRule", null, true);
+@@ -317,7 +317,7 @@ sync_test("builtin_toString", function()
+     test("styleSheets", document.styleSheets, "StyleSheetList", null, true);
+     test("textNode", document.createTextNode("testNode"), "Text", v < 9 ? "testNode" : null);
+     test("textRange", txtRange, "TextRange");
+-    test("window", window, "Window", "[object Window]", true);
++    test("window", window, "Window", "[object Window]");
+     test("xmlHttpRequest", new XMLHttpRequest(), "XMLHttpRequest");
+     if(v < 10) {
+         test("namespaces", document.namespaces, "MSNamespaceInfoCollection");
+diff -uNarp a/dlls/mshtml/tests/es5.js b/dlls/mshtml/tests/es5.js
+--- a/dlls/mshtml/tests/es5.js	2024-07-28 16:02:13.000000000 -0400
++++ b/dlls/mshtml/tests/es5.js	2025-11-19 17:51:05.526487608 -0500
+@@ -1151,7 +1151,6 @@ sync_test("toString", function() {
+     todo_wine.
+     ok(tmp === "[object Arguments]", "toString.call(arguments) = " + tmp);
+     tmp = Object.prototype.toString.call(this);
+-    todo_wine.
+     ok(tmp === "[object Window]", "toString.call(null) = " + tmp);
+     tmp = Object.prototype.toString.call(null);
+     ok(tmp === "[object Null]", "toString.call(null) = " + tmp);
+@@ -2297,7 +2296,6 @@ sync_test("substituted this", function()
+     ok(r === "[object Undefined]", "detached scope Object.toString returned " + r);
+ 
+     var r = (function() { this.f = Object.prototype.toString; return this.f(); })();
+-    todo_wine.
+     ok(r === "[object Window]", "Object.toString returned " + r);
+ 
+     var r = (function() { var f = Object.prototype.toString; return f(); })();
+diff -uNarp a/programs/cmd/builtins.c b/programs/cmd/builtins.c
+--- a/programs/cmd/builtins.c	2024-07-28 16:02:13.000000000 -0400
++++ b/programs/cmd/builtins.c	2025-11-19 17:51:05.520141322 -0500
+@@ -3185,7 +3185,6 @@ RETURN_CODE WCMD_setshow_env(WCHAR *s)
+       /* Output the prompt */
+       *p++ = '\0';
+       if (*p) {
+-        p = WCMD_strtrim(p);
+         if (*p == L'"') {
+           WCHAR* last = wcsrchr(p+1, L'"');
+           p++;
+diff -uNarp a/programs/cmd/tests/test_builtins.cmd.exp b/programs/cmd/tests/test_builtins.cmd.exp
+--- a/programs/cmd/tests/test_builtins.cmd.exp	2024-07-28 16:02:13.000000000 -0400
++++ b/programs/cmd/tests/test_builtins.cmd.exp	2025-11-19 17:51:05.520435878 -0500
+@@ -709,7 +709,7 @@ I'm here!@space@
+ prompt XbarX
+ prompt YfooY
+ 'prompt' YfooY
+-@todo_wine@promptYfooY
++promptYfooY
+ ------------ Testing 'choice' ------------
+ Example message [A,B,C]?A@or_broken@choice unavailable
+ 1@or_broken@9009
+-- 
+2.47.1
+

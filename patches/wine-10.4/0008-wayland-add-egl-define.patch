@@ -1,0 +1,23 @@
+
+Debian 11 (Bullseye) lacks the EGL_PRESENT_OPAQUE_EXT definition in header
+Add the definition so can use the Debian 11 build toolchain
+
+
+diff -uarp a/dlls/winewayland.drv/opengl.c b/dlls/winewayland.drv/opengl.c
+--- a/dlls/winewayland.drv/opengl.c
++++ b/dlls/winewayland.drv/opengl.c
+@@ -42,6 +42,11 @@ WINE_DEFAULT_DEBUG_CHANNEL(waylanddrv);
+ 
+ #include "wine/opengl_driver.h"
+ 
++#ifndef EGL_EXT_present_opaque
++#define EGL_EXT_present_opaque 1
++#define EGL_PRESENT_OPAQUE_EXT 0x31DF
++#endif /* EGL_EXT_present_opaque */
++
+ static void *egl_handle;
+ static struct opengl_funcs opengl_funcs;
+ static EGLDisplay egl_display;
+-- 
+2.47.1
+

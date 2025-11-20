@@ -1,0 +1,1945 @@
+
+ElementalWarrior wine patch series
+https://gitlab.winehq.org/ElementalWarrior/wine/-/commits/affinity-photo3-wine9.13-part3
+
+# July 31, 2024 updates
+wined3d: Invalidate push constant flags only for the primary stateblock (81dbeba0)
+wined3d: Feed the material through a push constant buffer (9b8a99a8)
+wined3d: Move get_projection_matrix() to glsl_shader.c (283ef7f9)
+wined3d: Feed the projection matrix through a push constant buffer (a44bf43f)
+wined3d: Do not use the normal or modelview matrices when drawing pretransformed vertices (6305c5ab)
+wined3d: Feed modelview matrices through a push constant buffer (870d9d3e)
+comctl32: Handle WM_GETOBJECT in tab control (8b1e784f)
+mshtml: Use dispex_index_prop_desc for HTMLElementCollection (6136e9b3)
+mshtml: Use host object script bindings for HTMLDOMChildrenCollection (4abbf077)
+mshtml: Use host object script bindings for HTMLStyleSheetsCollection (c08e2c88)
+mshtml: Use host object script bindings for HTMLStyleSheet (644b5a27)
+mshtml: Use host object script bindings for HTMLStyleSheetRulesCollection (e30fef7f)
+mshtml: Use host object script bindings for HTMLStyleSheetRule (e8a2751e)
+mshtml: Use get_prop_desc for legacy function object implementation (61115561)
+mshtml: Use host object script bindings for style objects (089f39c4)
+atl: Correct comment above AtlModuleRegisterTypeLib function (3d045847)
+atl: Only warn in AtlModuleGetClassObject if the class was not found (ed9b44c3)
+include: Add gdiplus effect parameter structs (c3d34d43)
+include: Add *_SHIFT macros (37e2b7cc)
+include: Forward declare all gdiplus classes (6de806d6)
+include: Ensure that x86_64 syscall thunks have a consistent length when built with Clang (0291c9f9)
+ntdll: Use environ/_NSGetEnviron() directly rather than caching it in main_envp (8cb1009e)
+ntdll: Use _NSGetEnviron() instead of environ when spawning the server on macOS (8b1a6bb7)
+msv1_0: Use _NSGetEnviron() instead of environ on macOS (6cd79a0e)
+
+
+diff -uNarp a/dlls/atl/atl30.c b/dlls/atl/atl30.c
+--- a/dlls/atl/atl30.c	2024-07-28 16:02:13.000000000 -0400
++++ b/dlls/atl/atl30.c	2025-11-19 17:54:35.807162010 -0500
+@@ -247,7 +247,7 @@ HRESULT WINAPI AtlModuleGetClassObject(_
+                                                   (void **)&obj->pCF);
+                 if (obj->pCF)
+                     hres = IUnknown_QueryInterface(obj->pCF, riid, ppv);
+-                break;
++                return hres;
+             }
+         }
+     }
+@@ -258,7 +258,7 @@ HRESULT WINAPI AtlModuleGetClassObject(_
+ }
+ 
+ /***********************************************************************
+- *           AtlModuleGetClassObject              [ATL.@]
++ *           AtlModuleRegisterTypeLib             [ATL.@]
+  */
+ HRESULT WINAPI AtlModuleRegisterTypeLib(_ATL_MODULEW *pm, LPCOLESTR lpszIndex)
+ {
+diff -uNarp a/dlls/comctl32/tab.c b/dlls/comctl32/tab.c
+--- a/dlls/comctl32/tab.c	2024-07-28 16:02:13.000000000 -0400
++++ b/dlls/comctl32/tab.c	2025-11-19 17:54:35.801596630 -0500
+@@ -3368,6 +3368,11 @@ TAB_WindowProc (HWND hwnd, UINT uMsg, WP
+     case TCM_SETEXTENDEDSTYLE:
+       return TAB_SetExtendedStyle (infoPtr, wParam, lParam);
+ 
++    case WM_GETOBJECT:
++      if ((LONG)lParam == OBJID_QUERYCLASSNAMEIDX)
++        return 0x1000f;
++      break;
++
+     case WM_GETFONT:
+       return TAB_GetFont (infoPtr);
+ 
+diff -uNarp a/dlls/comctl32/tests/tab.c b/dlls/comctl32/tests/tab.c
+--- a/dlls/comctl32/tests/tab.c	2024-07-28 16:02:13.000000000 -0400
++++ b/dlls/comctl32/tests/tab.c	2025-11-19 17:54:35.801736953 -0500
+@@ -1621,6 +1621,20 @@ static void test_TCM_GETROWCOUNT(void)
+     DestroyWindow(hTab);
+ }
+ 
++static void test_WM_GETOBJECT(void)
++{
++    HWND hTab;
++    DWORD objid;
++
++    hTab = createFilledTabControl(parent_wnd, TCS_FIXEDWIDTH, TCIF_TEXT|TCIF_IMAGE, 2);
++    ok(hTab != NULL, "Failed to create tab control\n");
++
++    objid = SendMessageA(hTab, WM_GETOBJECT, 0, OBJID_QUERYCLASSNAMEIDX);
++    ok(objid == 0x1000f, "Unexpected objid %lu.\n", objid);
++
++    DestroyWindow(hTab);
++}
++
+ START_TEST(tab)
+ {
+     LOGFONTA logfont;
+@@ -1660,6 +1674,7 @@ START_TEST(tab)
+     test_create();
+     test_TCN_SELCHANGING();
+     test_TCM_GETROWCOUNT();
++    test_WM_GETOBJECT();
+ 
+     uninit_winevent_hook();
+ 
+diff -uNarp a/dlls/mshtml/dispex.c b/dlls/mshtml/dispex.c
+--- a/dlls/mshtml/dispex.c	2025-11-19 17:51:05.526701181 -0500
++++ b/dlls/mshtml/dispex.c	2025-11-19 17:54:35.805993667 -0500
+@@ -1021,14 +1021,18 @@ static HRESULT function_get_dispid(Dispa
+     return DISP_E_UNKNOWNNAME;
+ }
+ 
+-static HRESULT function_get_name(DispatchEx *dispex, DISPID id, BSTR *name)
++static HRESULT function_get_prop_desc(DispatchEx *dispex, DISPID id, struct property_info *desc)
+ {
+     DWORD idx = id - MSHTML_DISPID_CUSTOM_MIN;
+ 
+     if(idx >= ARRAY_SIZE(function_props))
+         return DISP_E_MEMBERNOTFOUND;
+ 
+-    return (*name = SysAllocString(function_props[idx].name)) ? S_OK : E_OUTOFMEMORY;
++    desc->id = id;
++    desc->flags = 0;
++    desc->name = function_props[idx].name;
++    desc->func_iid = 0;
++    return S_OK;
+ }
+ 
+ static HRESULT function_invoke(DispatchEx *dispex, DISPID id, LCID lcid, WORD flags, DISPPARAMS *params,
+@@ -1058,7 +1062,7 @@ static const dispex_static_data_vtbl_t f
+     .destructor       = function_destructor,
+     .value            = function_value,
+     .get_dispid       = function_get_dispid,
+-    .get_name         = function_get_name,
++    .get_prop_desc    = function_get_prop_desc,
+     .invoke           = function_invoke
+ };
+ 
+@@ -1079,7 +1083,7 @@ static func_disp_t *create_func_disp(Dis
+     if(!ret)
+         return NULL;
+ 
+-    init_dispatch(&ret->dispex, &function_dispex, NULL, dispex_compat_mode(obj));
++    init_dispatch_with_owner(&ret->dispex, &function_dispex, obj);
+     ret->obj = obj;
+     ret->info = info;
+ 
+@@ -2188,23 +2192,21 @@ HRESULT dispex_prop_name(DispatchEx *dis
+     HRESULT hres;
+ 
+     if(is_custom_dispid(id)) {
+-        if(dispex->info->desc->vtbl->get_prop_desc) {
+-            struct property_info desc;
+-            WCHAR buf[12];
++        struct property_info desc;
++        WCHAR buf[12];
+ 
+-            hres = dispex->info->desc->vtbl->get_prop_desc(dispex, id, &desc);
+-            if(FAILED(hres))
+-                return hres;
+-            if(!desc.name) {
+-                swprintf(buf, ARRAYSIZE(buf), L"%u", desc.index);
+-                desc.name = buf;
+-            }
+-            *ret = SysAllocString(desc.name);
+-            return *ret ? S_OK : E_OUTOFMEMORY;
++        if(!dispex->info->desc->vtbl->get_prop_desc)
++            return DISP_E_MEMBERNOTFOUND;
++
++        hres = dispex->info->desc->vtbl->get_prop_desc(dispex, id, &desc);
++        if(FAILED(hres))
++            return hres;
++        if(!desc.name) {
++            swprintf(buf, ARRAYSIZE(buf), L"%u", desc.index);
++            desc.name = buf;
+         }
+-        if(dispex->info->desc->vtbl->get_name)
+-            return dispex->info->desc->vtbl->get_name(dispex, id, ret);
+-        return DISP_E_MEMBERNOTFOUND;
++        *ret = SysAllocString(desc.name);
++        return *ret ? S_OK : E_OUTOFMEMORY;
+     }
+ 
+     if(is_dynamic_dispid(id)) {
+diff -uNarp a/dlls/mshtml/htmlcurstyle.c b/dlls/mshtml/htmlcurstyle.c
+--- a/dlls/mshtml/htmlcurstyle.c	2024-07-28 16:02:13.000000000 -0400
++++ b/dlls/mshtml/htmlcurstyle.c	2025-11-19 17:54:35.806212591 -0500
+@@ -1198,7 +1198,7 @@ HRESULT HTMLCurrentStyle_Create(HTMLElem
+     ret->IHTMLCurrentStyle3_iface.lpVtbl = &HTMLCurrentStyle3Vtbl;
+     ret->IHTMLCurrentStyle4_iface.lpVtbl = &HTMLCurrentStyle4Vtbl;
+ 
+-    init_css_style(&ret->css_style, nsstyle, &HTMLCurrentStyle_dispex, dispex_compat_mode(&elem->node.event_target.dispex));
++    init_css_style(&ret->css_style, nsstyle, &HTMLCurrentStyle_dispex, &elem->node.event_target.dispex);
+     nsIDOMCSSStyleDeclaration_Release(nsstyle);
+ 
+     IHTMLElement_AddRef(&elem->IHTMLElement_iface);
+diff -uNarp a/dlls/mshtml/htmldoc.c b/dlls/mshtml/htmldoc.c
+--- a/dlls/mshtml/htmldoc.c	2025-11-19 17:51:05.527104659 -0500
++++ b/dlls/mshtml/htmldoc.c	2025-11-19 17:54:35.804852354 -0500
+@@ -491,7 +491,7 @@ static HRESULT WINAPI HTMLDocument_get_i
+     }
+ 
+     if(nscoll) {
+-        *p = create_collection_from_htmlcol(nscoll, This->document_mode);
++        *p = create_collection_from_htmlcol(nscoll, &This->node.event_target.dispex);
+         nsIDOMHTMLCollection_Release(nscoll);
+     }
+ 
+@@ -528,7 +528,7 @@ static HRESULT WINAPI HTMLDocument_get_a
+     }
+ 
+     if(nscoll) {
+-        *p = create_collection_from_htmlcol(nscoll, This->document_mode);
++        *p = create_collection_from_htmlcol(nscoll, &This->node.event_target.dispex);
+         nsIDOMHTMLCollection_Release(nscoll);
+     }
+ 
+@@ -565,7 +565,7 @@ static HRESULT WINAPI HTMLDocument_get_l
+     }
+ 
+     if(nscoll) {
+-        *p = create_collection_from_htmlcol(nscoll, This->document_mode);
++        *p = create_collection_from_htmlcol(nscoll, &This->node.event_target.dispex);
+         nsIDOMHTMLCollection_Release(nscoll);
+     }
+ 
+@@ -602,7 +602,7 @@ static HRESULT WINAPI HTMLDocument_get_f
+     }
+ 
+     if(nscoll) {
+-        *p = create_collection_from_htmlcol(nscoll, This->document_mode);
++        *p = create_collection_from_htmlcol(nscoll, &This->node.event_target.dispex);
+         nsIDOMHTMLCollection_Release(nscoll);
+     }
+ 
+@@ -639,7 +639,7 @@ static HRESULT WINAPI HTMLDocument_get_a
+     }
+ 
+     if(nscoll) {
+-        *p = create_collection_from_htmlcol(nscoll, This->document_mode);
++        *p = create_collection_from_htmlcol(nscoll, &This->node.event_target.dispex);
+         nsIDOMHTMLCollection_Release(nscoll);
+     }
+ 
+@@ -729,7 +729,7 @@ static HRESULT WINAPI HTMLDocument_get_s
+     }
+ 
+     if(nscoll) {
+-        *p = create_collection_from_htmlcol(nscoll, This->document_mode);
++        *p = create_collection_from_htmlcol(nscoll, &This->node.event_target.dispex);
+         nsIDOMHTMLCollection_Release(nscoll);
+     }
+ 
+@@ -1934,8 +1934,7 @@ static HRESULT WINAPI HTMLDocument_get_s
+         return map_nsresult(nsres);
+     }
+ 
+-    hres = create_style_sheet_collection(nsstylelist,
+-                                         dispex_compat_mode(&This->node.event_target.dispex), p);
++    hres = create_style_sheet_collection(nsstylelist, This, p);
+     nsIDOMStyleSheetList_Release(nsstylelist);
+     return hres;
+ }
+@@ -2004,8 +2003,7 @@ static HRESULT WINAPI HTMLDocument_creat
+ 
+     if(bstrHref && *bstrHref) {
+         FIXME("semi-stub for href %s\n", debugstr_w(bstrHref));
+-        return create_style_sheet(NULL, dispex_compat_mode(&This->node.event_target.dispex),
+-                                  ppnewStyleSheet);
++        return create_style_sheet(NULL, &This->node.event_target.dispex, ppnewStyleSheet);
+     }
+ 
+     hres = create_element(This, L"style", &elem);
+@@ -2601,7 +2599,7 @@ static HRESULT WINAPI HTMLDocument3_getE
+         return E_FAIL;
+     }
+ 
+-    *ppelColl = create_collection_from_nodelist(node_list, This->document_mode);
++    *ppelColl = create_collection_from_nodelist(node_list, &This->node.event_target.dispex);
+     nsIDOMNodeList_Release(node_list);
+     return S_OK;
+ }
+@@ -2678,7 +2676,7 @@ static HRESULT WINAPI HTMLDocument3_getE
+     }
+ 
+ 
+-    *pelColl = create_collection_from_nodelist(nslist, This->document_mode);
++    *pelColl = create_collection_from_nodelist(nslist, &This->node.event_target.dispex);
+     nsIDOMNodeList_Release(nslist);
+ 
+     return S_OK;
+@@ -3487,7 +3485,7 @@ static HRESULT WINAPI HTMLDocument7_getE
+     }
+ 
+ 
+-    *pel = create_collection_from_nodelist(nslist, This->document_mode);
++    *pel = create_collection_from_nodelist(nslist, &This->node.event_target.dispex);
+     nsIDOMNodeList_Release(nslist);
+     return S_OK;
+ }
+@@ -4447,7 +4445,7 @@ static HRESULT WINAPI DocumentSelector_q
+         return map_nsresult(nsres);
+     }
+ 
+-    hres = create_child_collection(node_list, dispex_compat_mode(&This->node.event_target.dispex), pel);
++    hres = create_child_collection(node_list, &This->node.event_target.dispex, pel);
+     nsIDOMNodeList_Release(node_list);
+     return hres;
+ }
+diff -uNarp a/dlls/mshtml/htmlelem.c b/dlls/mshtml/htmlelem.c
+--- a/dlls/mshtml/htmlelem.c	2025-11-19 17:53:55.163297069 -0500
++++ b/dlls/mshtml/htmlelem.c	2025-11-19 17:54:35.803410135 -0500
+@@ -2611,7 +2611,7 @@ static HRESULT WINAPI HTMLElement_get_ch
+         return E_FAIL;
+     }
+ 
+-    *p = (IDispatch*)create_collection_from_nodelist(nsnode_list, This->node.doc->document_mode);
++    *p = (IDispatch*)create_collection_from_nodelist(nsnode_list, &This->node.event_target.dispex);
+ 
+     nsIDOMNodeList_Release(nsnode_list);
+     return S_OK;
+@@ -3792,7 +3792,7 @@ static HRESULT WINAPI HTMLElement2_getEl
+     TRACE("(%p)->(%s %p)\n", This, debugstr_w(v), pelColl);
+ 
+     if(!This->dom_element) {
+-        *pelColl = create_collection_from_htmlcol(NULL, This->node.doc->document_mode);
++        *pelColl = create_collection_from_htmlcol(NULL, &This->node.event_target.dispex);
+         return S_OK;
+     }
+ 
+@@ -3804,7 +3804,7 @@ static HRESULT WINAPI HTMLElement2_getEl
+         return E_FAIL;
+     }
+ 
+-    *pelColl = create_collection_from_htmlcol(nscol, dispex_compat_mode(&This->node.event_target.dispex));
++    *pelColl = create_collection_from_htmlcol(nscol, &This->node.event_target.dispex);
+     nsIDOMHTMLCollection_Release(nscol);
+     return S_OK;
+ }
+@@ -4820,7 +4820,7 @@ static HRESULT WINAPI HTMLElement6_getEl
+         }
+     }
+ 
+-    *pel = create_collection_from_htmlcol(nscol, dispex_compat_mode(&This->node.event_target.dispex));
++    *pel = create_collection_from_htmlcol(nscol, &This->node.event_target.dispex);
+     nsIDOMHTMLCollection_Release(nscol);
+     return S_OK;
+ }
+@@ -5964,7 +5964,7 @@ static HRESULT WINAPI ElementSelector_qu
+         return map_nsresult(nsres);
+     }
+ 
+-    hres = create_child_collection(node_list, dispex_compat_mode(&This->node.event_target.dispex), pel);
++    hres = create_child_collection(node_list, &This->node.event_target.dispex, pel);
+     nsIDOMNodeList_Release(node_list);
+     return hres;
+ }
+diff -uNarp a/dlls/mshtml/htmlelemcol.c b/dlls/mshtml/htmlelemcol.c
+--- a/dlls/mshtml/htmlelemcol.c	2024-07-28 16:02:13.000000000 -0400
++++ b/dlls/mshtml/htmlelemcol.c	2025-11-19 17:54:35.802447497 -0500
+@@ -60,7 +60,7 @@ static inline HTMLElement *elem_from_HTM
+     return CONTAINING_RECORD(iface, HTMLElement, node);
+ }
+ 
+-static IHTMLElementCollection *HTMLElementCollection_Create(HTMLElement**,DWORD,compat_mode_t);
++static IHTMLElementCollection *HTMLElementCollection_Create(HTMLElement**,DWORD,DispatchEx*);
+ 
+ static void elem_vector_add(elem_vector_t *buf, HTMLElement *elem)
+ {
+@@ -377,8 +377,7 @@ static HRESULT WINAPI HTMLElementCollect
+ 
+             if(buf.len > 1) {
+                 elem_vector_normalize(&buf);
+-                *pdisp = (IDispatch*)HTMLElementCollection_Create(buf.buf, buf.len,
+-                                                                  dispex_compat_mode(&This->dispex));
++                *pdisp = (IDispatch*)HTMLElementCollection_Create(buf.buf, buf.len, &This->dispex);
+             }else {
+                 if(buf.len == 1) {
+                     /* Already AddRef-ed */
+@@ -440,8 +439,7 @@ static HRESULT WINAPI HTMLElementCollect
+ 
+     TRACE("found %ld tags\n", buf.len);
+ 
+-    *pdisp = (IDispatch*)HTMLElementCollection_Create(buf.buf, buf.len,
+-                                                      dispex_compat_mode(&This->dispex));
++    *pdisp = (IDispatch*)HTMLElementCollection_Create(buf.buf, buf.len, &This->dispex);
+     return S_OK;
+ }
+ 
+@@ -535,20 +533,6 @@ static HRESULT HTMLElementCollection_get
+     return S_OK;
+ }
+ 
+-static HRESULT HTMLElementCollection_get_name(DispatchEx *dispex, DISPID id, BSTR *name)
+-{
+-    HTMLElementCollection *This = impl_from_DispatchEx(dispex);
+-    DWORD idx = id - MSHTML_DISPID_CUSTOM_MIN;
+-    WCHAR buf[11];
+-    UINT len;
+-
+-    if(idx >= This->len)
+-        return DISP_E_MEMBERNOTFOUND;
+-
+-    len = swprintf(buf, ARRAY_SIZE(buf), L"%u", idx);
+-    return (*name = SysAllocStringLen(buf, len)) ? S_OK : E_OUTOFMEMORY;
+-}
+-
+ static HRESULT HTMLElementCollection_invoke(DispatchEx *dispex, DISPID id, LCID lcid, WORD flags, DISPPARAMS *params,
+         VARIANT *res, EXCEPINFO *ei, IServiceProvider *caller)
+ {
+@@ -581,7 +565,7 @@ static const dispex_static_data_vtbl_t H
+     .traverse         = HTMLElementCollection_traverse,
+     .unlink           = HTMLElementCollection_unlink,
+     .get_dispid       = HTMLElementCollection_get_dispid,
+-    .get_name         = HTMLElementCollection_get_name,
++    .get_prop_desc    = dispex_index_prop_desc,
+     .invoke           = HTMLElementCollection_invoke,
+ };
+ 
+@@ -653,11 +637,10 @@ IHTMLElementCollection *create_all_colle
+     create_all_list(node, &buf);
+     elem_vector_normalize(&buf);
+ 
+-    return HTMLElementCollection_Create(buf.buf, buf.len,
+-                                        dispex_compat_mode(&node->event_target.dispex));
++    return HTMLElementCollection_Create(buf.buf, buf.len, &node->event_target.dispex);
+ }
+ 
+-IHTMLElementCollection *create_collection_from_nodelist(nsIDOMNodeList *nslist, compat_mode_t compat_mode)
++IHTMLElementCollection *create_collection_from_nodelist(nsIDOMNodeList *nslist, DispatchEx *owner)
+ {
+     UINT32 length = 0, i;
+     HTMLDOMNode *node;
+@@ -689,10 +672,10 @@ IHTMLElementCollection *create_collectio
+         buf.buf = NULL;
+     }
+ 
+-    return HTMLElementCollection_Create(buf.buf, buf.len, compat_mode);
++    return HTMLElementCollection_Create(buf.buf, buf.len, owner);
+ }
+ 
+-IHTMLElementCollection *create_collection_from_htmlcol(nsIDOMHTMLCollection *nscol, compat_mode_t compat_mode)
++IHTMLElementCollection *create_collection_from_htmlcol(nsIDOMHTMLCollection *nscol, DispatchEx *owner)
+ {
+     UINT32 length = 0, i;
+     elem_vector_t buf;
+@@ -725,7 +708,7 @@ IHTMLElementCollection *create_collectio
+         return NULL;
+     }
+ 
+-    return HTMLElementCollection_Create(buf.buf, buf.len, compat_mode);
++    return HTMLElementCollection_Create(buf.buf, buf.len, owner);
+ }
+ 
+ HRESULT get_elem_source_index(HTMLElement *elem, LONG *ret)
+@@ -801,7 +784,7 @@ HRESULT get_elem_source_index(HTMLElemen
+ }
+ 
+ static IHTMLElementCollection *HTMLElementCollection_Create(HTMLElement **elems, DWORD len,
+-                                                            compat_mode_t compat_mode)
++                                                            DispatchEx *owner)
+ {
+     HTMLElementCollection *ret = calloc(1, sizeof(HTMLElementCollection));
+ 
+@@ -812,7 +795,7 @@ static IHTMLElementCollection *HTMLEleme
+     ret->elems = elems;
+     ret->len = len;
+ 
+-    init_dispatch(&ret->dispex, &HTMLElementCollection_dispex, NULL, compat_mode);
++    init_dispatch_with_owner(&ret->dispex, &HTMLElementCollection_dispex, owner);
+ 
+     TRACE("ret=%p len=%ld\n", ret, len);
+ 
+diff -uNarp a/dlls/mshtml/htmlform.c b/dlls/mshtml/htmlform.c
+--- a/dlls/mshtml/htmlform.c	2024-07-28 16:02:13.000000000 -0400
++++ b/dlls/mshtml/htmlform.c	2025-11-19 17:54:35.802524628 -0500
+@@ -401,7 +401,7 @@ static HRESULT WINAPI HTMLFormElement_ge
+         return E_FAIL;
+     }
+ 
+-    *p = (IDispatch*)create_collection_from_htmlcol(elements, dispex_compat_mode(&This->element.node.event_target.dispex));
++    *p = (IDispatch*)create_collection_from_htmlcol(elements, &This->element.node.event_target.dispex);
+     nsIDOMHTMLCollection_Release(elements);
+     return S_OK;
+ }
+diff -uNarp a/dlls/mshtml/htmlnode.c b/dlls/mshtml/htmlnode.c
+--- a/dlls/mshtml/htmlnode.c	2025-11-19 17:53:55.161190067 -0500
++++ b/dlls/mshtml/htmlnode.c	2025-11-19 17:54:35.803621270 -0500
+@@ -338,21 +338,6 @@ static HRESULT HTMLDOMChildrenCollection
+     return S_OK;
+ }
+ 
+-static HRESULT HTMLDOMChildrenCollection_get_name(DispatchEx *dispex, DISPID id, BSTR *name)
+-{
+-    HTMLDOMChildrenCollection *This = impl_from_DispatchEx(dispex);
+-    DWORD idx = id - DISPID_CHILDCOL_0;
+-    UINT32 len = 0;
+-    WCHAR buf[11];
+-
+-    nsIDOMNodeList_GetLength(This->nslist, &len);
+-    if(idx >= len)
+-        return DISP_E_MEMBERNOTFOUND;
+-
+-    len = swprintf(buf, ARRAY_SIZE(buf), L"%u", idx);
+-    return (*name = SysAllocStringLen(buf, len)) ? S_OK : E_OUTOFMEMORY;
+-}
+-
+ static HRESULT HTMLDOMChildrenCollection_invoke(DispatchEx *dispex, DISPID id, LCID lcid, WORD flags, DISPPARAMS *params,
+         VARIANT *res, EXCEPINFO *ei, IServiceProvider *caller)
+ {
+@@ -389,7 +374,7 @@ static const dispex_static_data_vtbl_t H
+     .traverse         = HTMLDOMChildrenCollection_traverse,
+     .unlink           = HTMLDOMChildrenCollection_unlink,
+     .get_dispid       = HTMLDOMChildrenCollection_get_dispid,
+-    .get_name         = HTMLDOMChildrenCollection_get_name,
++    .get_prop_desc    = dispex_index_prop_desc,
+     .invoke           = HTMLDOMChildrenCollection_invoke,
+ };
+ 
+@@ -406,7 +391,7 @@ static dispex_static_data_t HTMLDOMChild
+     HTMLDOMNode_init_dispex_info
+ };
+ 
+-HRESULT create_child_collection(nsIDOMNodeList *nslist, compat_mode_t compat_mode, IHTMLDOMChildrenCollection **ret)
++HRESULT create_child_collection(nsIDOMNodeList *nslist, DispatchEx *owner, IHTMLDOMChildrenCollection **ret)
+ {
+     HTMLDOMChildrenCollection *collection;
+ 
+@@ -418,7 +403,7 @@ HRESULT create_child_collection(nsIDOMNo
+     nsIDOMNodeList_AddRef(nslist);
+     collection->nslist = nslist;
+ 
+-    init_dispatch(&collection->dispex, &HTMLDOMChildrenCollection_dispex, NULL, compat_mode);
++    init_dispatch_with_owner(&collection->dispex, &HTMLDOMChildrenCollection_dispex, owner);
+ 
+     *ret = &collection->IHTMLDOMChildrenCollection_iface;
+     return S_OK;
+@@ -530,7 +515,7 @@ static HRESULT WINAPI HTMLDOMNode_get_ch
+         return hres;
+     }
+ 
+-    hres = create_child_collection(nslist, dispex_compat_mode(&This->event_target.dispex),
++    hres = create_child_collection(nslist, &This->event_target.dispex,
+                                    (IHTMLDOMChildrenCollection**)p);
+     nsIDOMNodeList_Release(nslist);
+     return hres;
+diff -uNarp a/dlls/mshtml/htmlstyle.c b/dlls/mshtml/htmlstyle.c
+--- a/dlls/mshtml/htmlstyle.c	2024-07-28 16:02:13.000000000 -0400
++++ b/dlls/mshtml/htmlstyle.c	2025-11-19 17:54:35.806415725 -0500
+@@ -2940,8 +2940,8 @@ static HRESULT WINAPI HTMLStyle_removeAt
+         DISPID dispid;
+         unsigned i;
+ 
+-        hres = IWineJSDispatchHost_GetDispID(&This->css_style.dispex.IWineJSDispatchHost_iface, strAttributeName,
+-                (lFlags&1) ? fdexNameCaseSensitive : fdexNameCaseInsensitive, &dispid);
++        hres = dispex_get_id(&This->css_style.dispex, strAttributeName,
++                             (lFlags & 1) ? fdexNameCaseSensitive : fdexNameCaseInsensitive, &dispid);
+         if(hres != S_OK) {
+             *pfSuccess = VARIANT_FALSE;
+             return S_OK;
+@@ -9714,14 +9714,14 @@ static HRESULT get_style_from_elem(HTMLE
+     return E_NOTIMPL;
+ }
+ 
+-void init_css_style(CSSStyle *style, nsIDOMCSSStyleDeclaration *nsstyle, dispex_static_data_t *dispex_info, compat_mode_t compat_mode)
++void init_css_style(CSSStyle *style, nsIDOMCSSStyleDeclaration *nsstyle, dispex_static_data_t *dispex_info, DispatchEx *owner)
+ {
+     style->IHTMLCSSStyleDeclaration_iface.lpVtbl = &HTMLCSSStyleDeclarationVtbl;
+     style->IHTMLCSSStyleDeclaration2_iface.lpVtbl = &HTMLCSSStyleDeclaration2Vtbl;
+     style->nsstyle = nsstyle;
+     nsIDOMCSSStyleDeclaration_AddRef(nsstyle);
+ 
+-    init_dispatch(&style->dispex, dispex_info, NULL, compat_mode);
++    init_dispatch_with_owner(&style->dispex, dispex_info, owner);
+ }
+ 
+ HRESULT HTMLStyle_Create(HTMLElement *elem, HTMLStyle **ret)
+@@ -9750,7 +9750,7 @@ HRESULT HTMLStyle_Create(HTMLElement *el
+     style->elem = elem;
+     IHTMLDOMNode_AddRef(&elem->node.IHTMLDOMNode_iface);
+ 
+-    init_css_style(&style->css_style, nsstyle, &HTMLStyle_dispex, dispex_compat_mode(&elem->node.event_target.dispex));
++    init_css_style(&style->css_style, nsstyle, &HTMLStyle_dispex, &elem->node.event_target.dispex);
+     nsIDOMCSSStyleDeclaration_Release(nsstyle);
+ 
+     *ret = style;
+@@ -9775,14 +9775,14 @@ static dispex_static_data_t HTMLW3CCompu
+     CSSStyle_init_dispex_info
+ };
+ 
+-HRESULT create_computed_style(nsIDOMCSSStyleDeclaration *nsstyle, compat_mode_t compat_mode, IHTMLCSSStyleDeclaration **p)
++HRESULT create_computed_style(nsIDOMCSSStyleDeclaration *nsstyle, DispatchEx *owner, IHTMLCSSStyleDeclaration **p)
+ {
+     CSSStyle *style;
+ 
+     if(!(style = calloc(1, sizeof(*style))))
+         return E_OUTOFMEMORY;
+ 
+-    init_css_style(style, nsstyle, &HTMLW3CComputedStyle_dispex, compat_mode);
++    init_css_style(style, nsstyle, &HTMLW3CComputedStyle_dispex, owner);
+     *p = &style->IHTMLCSSStyleDeclaration_iface;
+     return S_OK;
+ }
+diff -uNarp a/dlls/mshtml/htmlstyleelem.c b/dlls/mshtml/htmlstyleelem.c
+--- a/dlls/mshtml/htmlstyleelem.c	2024-07-28 16:02:13.000000000 -0400
++++ b/dlls/mshtml/htmlstyleelem.c	2025-11-19 17:54:35.805002117 -0500
+@@ -150,8 +150,7 @@ static HRESULT WINAPI HTMLStyleElement_g
+         assert(nsres == NS_OK);
+ 
+         if(ss) {
+-            HRESULT hres = create_style_sheet(ss, dispex_compat_mode(&This->element.node.event_target.dispex),
+-                                              &This->style_sheet);
++            HRESULT hres = create_style_sheet(ss, &This->element.node.event_target.dispex, &This->style_sheet);
+             nsIDOMStyleSheet_Release(ss);
+             if(FAILED(hres))
+                 return hres;
+diff -uNarp a/dlls/mshtml/htmlstyle.h b/dlls/mshtml/htmlstyle.h
+--- a/dlls/mshtml/htmlstyle.h	2024-07-28 16:02:13.000000000 -0400
++++ b/dlls/mshtml/htmlstyle.h	2025-11-19 17:54:35.806636810 -0500
+@@ -150,8 +150,8 @@ typedef enum {
+ } styleid_t;
+ 
+ HRESULT HTMLStyle_Create(HTMLElement*,HTMLStyle**);
+-HRESULT create_computed_style(nsIDOMCSSStyleDeclaration*,compat_mode_t,IHTMLCSSStyleDeclaration**);
+-void init_css_style(CSSStyle*,nsIDOMCSSStyleDeclaration*,dispex_static_data_t*,compat_mode_t);
++HRESULT create_computed_style(nsIDOMCSSStyleDeclaration*,DispatchEx*,IHTMLCSSStyleDeclaration**);
++void init_css_style(CSSStyle*,nsIDOMCSSStyleDeclaration*,dispex_static_data_t*,DispatchEx*);
+ 
+ void *CSSStyle_query_interface(DispatchEx*,REFIID);
+ void CSSStyle_traverse(DispatchEx*,nsCycleCollectionTraversalCallback*);
+diff -uNarp a/dlls/mshtml/htmlstylesheet.c b/dlls/mshtml/htmlstylesheet.c
+--- a/dlls/mshtml/htmlstylesheet.c	2024-07-28 16:02:13.000000000 -0400
++++ b/dlls/mshtml/htmlstylesheet.c	2025-11-19 17:54:35.805704971 -0500
+@@ -171,7 +171,7 @@ static dispex_static_data_t HTMLStyleShe
+     HTMLStyleSheetRule_iface_tids
+ };
+ 
+-static HRESULT create_style_sheet_rule(nsIDOMCSSRule *nsstylesheetrule, compat_mode_t compat_mode,
++static HRESULT create_style_sheet_rule(nsIDOMCSSRule *nsstylesheetrule, DispatchEx *owner,
+                                        IHTMLStyleSheetRule **ret)
+ {
+     HTMLStyleSheetRule *rule;
+@@ -183,7 +183,7 @@ static HRESULT create_style_sheet_rule(n
+     rule->IHTMLStyleSheetRule_iface.lpVtbl = &HTMLStyleSheetRuleVtbl;
+     rule->nsstylesheetrule = NULL;
+ 
+-    init_dispatch(&rule->dispex, &HTMLStyleSheetRule_dispex, NULL, compat_mode);
++    init_dispatch_with_owner(&rule->dispex, &HTMLStyleSheetRule_dispex, owner);
+ 
+     if (nsstylesheetrule)
+     {
+@@ -241,7 +241,7 @@ static HRESULT WINAPI HTMLStyleSheetRule
+     if(!nsstylesheetrule)
+         return E_INVALIDARG;
+ 
+-    hres = create_style_sheet_rule(nsstylesheetrule, dispex_compat_mode(&This->dispex), p);
++    hres = create_style_sheet_rule(nsstylesheetrule, &This->dispex, p);
+     nsIDOMCSSRule_Release(nsstylesheetrule);
+     return hres;
+ }
+@@ -313,21 +313,6 @@ static HRESULT HTMLStyleSheetRulesCollec
+     return S_OK;
+ }
+ 
+-static HRESULT HTMLStyleSheetRulesCollection_get_name(DispatchEx *dispex, DISPID id, BSTR *name)
+-{
+-    HTMLStyleSheetRulesCollection *This = HTMLStyleSheetRulesCollection_from_DispatchEx(dispex);
+-    DWORD idx = id - MSHTML_DISPID_CUSTOM_MIN;
+-    UINT32 len = 0;
+-    WCHAR buf[11];
+-
+-    nsIDOMCSSRuleList_GetLength(This->nslist, &len);
+-    if(idx >= len)
+-        return DISP_E_MEMBERNOTFOUND;
+-
+-    len = swprintf(buf, ARRAY_SIZE(buf), L"%u", idx);
+-    return (*name = SysAllocStringLen(buf, len)) ? S_OK : E_OUTOFMEMORY;
+-}
+-
+ static HRESULT HTMLStyleSheetRulesCollection_invoke(DispatchEx *dispex, DISPID id, LCID lcid, WORD flags, DISPPARAMS *params,
+         VARIANT *res, EXCEPINFO *ei, IServiceProvider *caller)
+ {
+@@ -350,7 +335,7 @@ static HRESULT HTMLStyleSheetRulesCollec
+             return S_OK;
+         }
+ 
+-        hres = create_style_sheet_rule(nsstylesheetrule, dispex_compat_mode(&This->dispex), &stylesheetrule);
++        hres = create_style_sheet_rule(nsstylesheetrule, &This->dispex, &stylesheetrule);
+         nsIDOMCSSRule_Release(nsstylesheetrule);
+         if(FAILED(hres))
+             return hres;
+@@ -374,7 +359,7 @@ static const dispex_static_data_vtbl_t H
+     .traverse         = HTMLStyleSheetRulesCollection_traverse,
+     .unlink           = HTMLStyleSheetRulesCollection_unlink,
+     .get_dispid       = HTMLStyleSheetRulesCollection_get_dispid,
+-    .get_name         = HTMLStyleSheetRulesCollection_get_name,
++    .get_prop_desc    = dispex_index_prop_desc,
+     .invoke           = HTMLStyleSheetRulesCollection_invoke
+ };
+ static const tid_t HTMLStyleSheetRulesCollection_iface_tids[] = {
+@@ -388,7 +373,7 @@ static dispex_static_data_t HTMLStyleShe
+     HTMLStyleSheetRulesCollection_iface_tids
+ };
+ 
+-static HRESULT create_style_sheet_rules_collection(nsIDOMCSSRuleList *nslist, compat_mode_t compat_mode,
++static HRESULT create_style_sheet_rules_collection(nsIDOMCSSRuleList *nslist, DispatchEx *owner,
+                                                    IHTMLStyleSheetRulesCollection **ret)
+ {
+     HTMLStyleSheetRulesCollection *collection;
+@@ -399,7 +384,7 @@ static HRESULT create_style_sheet_rules_
+     collection->IHTMLStyleSheetRulesCollection_iface.lpVtbl = &HTMLStyleSheetRulesCollectionVtbl;
+     collection->nslist = nslist;
+ 
+-    init_dispatch(&collection->dispex, &HTMLStyleSheetRulesCollection_dispex, NULL, compat_mode);
++    init_dispatch_with_owner(&collection->dispex, &HTMLStyleSheetRulesCollection_dispex, owner);
+ 
+     if(nslist)
+         nsIDOMCSSRuleList_AddRef(nslist);
+@@ -601,7 +586,7 @@ static HRESULT WINAPI HTMLStyleSheetsCol
+             return E_INVALIDARG;
+         }
+ 
+-        hres = create_style_sheet(nsstylesheet, dispex_compat_mode(&This->dispex), &stylesheet);
++        hres = create_style_sheet(nsstylesheet, &This->dispex, &stylesheet);
+         nsIDOMStyleSheet_Release(nsstylesheet);
+         if(FAILED(hres))
+             return hres;
+@@ -690,21 +675,6 @@ static HRESULT HTMLStyleSheetsCollection
+     return S_OK;
+ }
+ 
+-static HRESULT HTMLStyleSheetsCollection_get_name(DispatchEx *dispex, DISPID id, BSTR *name)
+-{
+-    HTMLStyleSheetsCollection *This = HTMLStyleSheetsCollection_from_DispatchEx(dispex);
+-    DWORD idx = id - MSHTML_DISPID_CUSTOM_MIN;
+-    UINT32 len = 0;
+-    WCHAR buf[11];
+-
+-    nsIDOMStyleSheetList_GetLength(This->nslist, &len);
+-    if(idx >= len)
+-        return DISP_E_MEMBERNOTFOUND;
+-
+-    len = swprintf(buf, ARRAY_SIZE(buf), L"%u", idx);
+-    return (*name = SysAllocStringLen(buf, len)) ? S_OK : E_OUTOFMEMORY;
+-}
+-
+ static HRESULT HTMLStyleSheetsCollection_invoke(DispatchEx *dispex, DISPID id, LCID lcid, WORD flags, DISPPARAMS *params,
+         VARIANT *res, EXCEPINFO *ei, IServiceProvider *caller)
+ {
+@@ -727,7 +697,7 @@ static HRESULT HTMLStyleSheetsCollection
+             return S_OK;
+         }
+ 
+-        hres = create_style_sheet(nsstylesheet, dispex_compat_mode(&This->dispex), &stylesheet);
++        hres = create_style_sheet(nsstylesheet, &This->dispex, &stylesheet);
+         nsIDOMStyleSheet_Release(nsstylesheet);
+         if(FAILED(hres))
+             return hres;
+@@ -751,7 +721,7 @@ static const dispex_static_data_vtbl_t H
+     .traverse         = HTMLStyleSheetsCollection_traverse,
+     .unlink           = HTMLStyleSheetsCollection_unlink,
+     .get_dispid       = HTMLStyleSheetsCollection_get_dispid,
+-    .get_name         = HTMLStyleSheetsCollection_get_name,
++    .get_prop_desc    = dispex_index_prop_desc,
+     .invoke           = HTMLStyleSheetsCollection_invoke
+ };
+ static const tid_t HTMLStyleSheetsCollection_iface_tids[] = {
+@@ -765,7 +735,7 @@ static dispex_static_data_t HTMLStyleShe
+     HTMLStyleSheetsCollection_iface_tids
+ };
+ 
+-HRESULT create_style_sheet_collection(nsIDOMStyleSheetList *nslist, compat_mode_t compat_mode,
++HRESULT create_style_sheet_collection(nsIDOMStyleSheetList *nslist, HTMLDocumentNode *doc,
+                                       IHTMLStyleSheetsCollection **ret)
+ {
+     HTMLStyleSheetsCollection *collection;
+@@ -779,7 +749,8 @@ HRESULT create_style_sheet_collection(ns
+         nsIDOMStyleSheetList_AddRef(nslist);
+     collection->nslist = nslist;
+ 
+-    init_dispatch(&collection->dispex, &HTMLStyleSheetsCollection_dispex, NULL, compat_mode);
++    init_dispatch(&collection->dispex, &HTMLStyleSheetsCollection_dispex, doc->script_global,
++                  dispex_compat_mode(&doc->node.event_target.dispex));
+ 
+     *ret = &collection->IHTMLStyleSheetsCollection_iface;
+     return S_OK;
+@@ -1046,7 +1017,7 @@ static HRESULT WINAPI HTMLStyleSheet_get
+         return E_FAIL;
+     }
+ 
+-    hres = create_style_sheet_rules_collection(nslist, dispex_compat_mode(&This->dispex), p);
++    hres = create_style_sheet_rules_collection(nslist, &This->dispex, p);
+     nsIDOMCSSRuleList_Release(nslist);
+     return hres;
+ }
+@@ -1248,7 +1219,7 @@ static dispex_static_data_t HTMLStyleShe
+     HTMLStyleSheet_init_dispex_info
+ };
+ 
+-HRESULT create_style_sheet(nsIDOMStyleSheet *nsstylesheet, compat_mode_t compat_mode, IHTMLStyleSheet **ret)
++HRESULT create_style_sheet(nsIDOMStyleSheet *nsstylesheet, DispatchEx *owner, IHTMLStyleSheet **ret)
+ {
+     HTMLStyleSheet *style_sheet;
+     nsresult nsres;
+@@ -1260,7 +1231,7 @@ HRESULT create_style_sheet(nsIDOMStyleSh
+     style_sheet->IHTMLStyleSheet4_iface.lpVtbl = &HTMLStyleSheet4Vtbl;
+     style_sheet->nsstylesheet = NULL;
+ 
+-    init_dispatch(&style_sheet->dispex, &HTMLStyleSheet_dispex, NULL, compat_mode);
++    init_dispatch_with_owner(&style_sheet->dispex, &HTMLStyleSheet_dispex, owner);
+ 
+     if(nsstylesheet) {
+         nsres = nsIDOMStyleSheet_QueryInterface(nsstylesheet, &IID_nsIDOMCSSStyleSheet,
+diff -uNarp a/dlls/mshtml/htmltable.c b/dlls/mshtml/htmltable.c
+--- a/dlls/mshtml/htmltable.c	2024-07-28 16:02:13.000000000 -0400
++++ b/dlls/mshtml/htmltable.c	2025-11-19 17:54:35.802595299 -0500
+@@ -693,7 +693,7 @@ static HRESULT WINAPI HTMLTableRow_get_c
+         return E_FAIL;
+     }
+ 
+-    *p = create_collection_from_htmlcol(nscol, dispex_compat_mode(&This->element.node.event_target.dispex));
++    *p = create_collection_from_htmlcol(nscol, &This->element.node.event_target.dispex);
+ 
+     nsIDOMHTMLCollection_Release(nscol);
+     return S_OK;
+@@ -1224,7 +1224,7 @@ static HRESULT WINAPI HTMLTable_get_rows
+         return E_FAIL;
+     }
+ 
+-    *p = create_collection_from_htmlcol(nscol, dispex_compat_mode(&This->element.node.event_target.dispex));
++    *p = create_collection_from_htmlcol(nscol, &This->element.node.event_target.dispex);
+ 
+     nsIDOMHTMLCollection_Release(nscol);
+     return S_OK;
+@@ -1339,7 +1339,7 @@ static HRESULT WINAPI HTMLTable_get_tBod
+         return E_FAIL;
+     }
+ 
+-    *p = create_collection_from_htmlcol(nscol, dispex_compat_mode(&This->element.node.event_target.dispex));
++    *p = create_collection_from_htmlcol(nscol, &This->element.node.event_target.dispex);
+ 
+     nsIDOMHTMLCollection_Release(nscol);
+     return S_OK;
+diff -uNarp a/dlls/mshtml/htmlwindow.c b/dlls/mshtml/htmlwindow.c
+--- a/dlls/mshtml/htmlwindow.c	2025-11-19 17:51:05.527372053 -0500
++++ b/dlls/mshtml/htmlwindow.c	2025-11-19 17:54:35.806757422 -0500
+@@ -2429,7 +2429,7 @@ static HRESULT WINAPI HTMLWindow7_getCom
+         return S_OK;
+     }
+ 
+-    hres = create_computed_style(nsstyle, dispex_compat_mode(&This->inner_window->event_target.dispex), p);
++    hres = create_computed_style(nsstyle, &This->inner_window->event_target.dispex, p);
+     nsIDOMCSSStyleDeclaration_Release(nsstyle);
+     return hres;
+ }
+diff -uNarp a/dlls/mshtml/mshtml_private.h b/dlls/mshtml/mshtml_private.h
+--- a/dlls/mshtml/mshtml_private.h	2025-11-19 17:53:55.161353051 -0500
++++ b/dlls/mshtml/mshtml_private.h	2025-11-19 17:54:35.806135160 -0500
+@@ -391,7 +391,6 @@ typedef struct {
+     HRESULT (*lookup_dispid)(DispatchEx*,const WCHAR*,DWORD,DISPID*);
+ 
+     /* These are called when the object implements GetMemberName, InvokeEx, DeleteMemberByDispID and GetNextDispID for custom props */
+-    HRESULT (*get_name)(DispatchEx*,DISPID,BSTR*);
+     HRESULT (*invoke)(DispatchEx*,DISPID,LCID,WORD,DISPPARAMS*,VARIANT*,EXCEPINFO*,IServiceProvider*);
+     HRESULT (*delete)(DispatchEx*,DISPID);
+     HRESULT (*next_dispid)(DispatchEx*,DISPID,DISPID*);
+@@ -1175,8 +1174,8 @@ HRESULT get_readystate_string(READYSTATE
+ 
+ HRESULT HTMLSelectionObject_Create(HTMLDocumentNode*,nsISelection*,IHTMLSelectionObject**);
+ HRESULT HTMLTxtRange_Create(HTMLDocumentNode*,nsIDOMRange*,IHTMLTxtRange**);
+-HRESULT create_style_sheet(nsIDOMStyleSheet*,compat_mode_t,IHTMLStyleSheet**);
+-HRESULT create_style_sheet_collection(nsIDOMStyleSheetList*,compat_mode_t,
++HRESULT create_style_sheet(nsIDOMStyleSheet*,DispatchEx*,IHTMLStyleSheet**);
++HRESULT create_style_sheet_collection(nsIDOMStyleSheetList*,HTMLDocumentNode*,
+                                       IHTMLStyleSheetsCollection**);
+ HRESULT create_dom_range(nsIDOMRange*,HTMLDocumentNode*,IHTMLDOMRange**);
+ HRESULT create_markup_pointer(IMarkupPointer**);
+@@ -1300,9 +1299,9 @@ ULONG WINAPI wrapper_Release(IUnknown *i
+ extern const void *iface_wrapper_vtbl[];
+ 
+ IHTMLElementCollection *create_all_collection(HTMLDOMNode*,BOOL);
+-IHTMLElementCollection *create_collection_from_nodelist(nsIDOMNodeList*,compat_mode_t);
+-IHTMLElementCollection *create_collection_from_htmlcol(nsIDOMHTMLCollection*,compat_mode_t);
+-HRESULT create_child_collection(nsIDOMNodeList*,compat_mode_t,IHTMLDOMChildrenCollection**);
++IHTMLElementCollection *create_collection_from_nodelist(nsIDOMNodeList*,DispatchEx*);
++IHTMLElementCollection *create_collection_from_htmlcol(nsIDOMHTMLCollection*,DispatchEx*);
++HRESULT create_child_collection(nsIDOMNodeList*,DispatchEx*,IHTMLDOMChildrenCollection**);
+ 
+ HRESULT attr_value_to_string(VARIANT*);
+ HRESULT get_elem_attr_value_by_dispid(HTMLElement*,DISPID,VARIANT*);
+diff -uNarp a/dlls/mshtml/tests/documentmode.js b/dlls/mshtml/tests/documentmode.js
+--- a/dlls/mshtml/tests/documentmode.js	2025-11-19 17:53:55.162685997 -0500
++++ b/dlls/mshtml/tests/documentmode.js	2025-11-19 17:54:35.806946556 -0500
+@@ -292,12 +292,12 @@ sync_test("builtin_toString", function()
+ 
+     test("attribute", document.createAttribute("class"), "Attr");
+     if(false /* todo_wine */) test("attributes", e.attributes, "NamedNodeMap");
+-    test("childNodes", document.body.childNodes, "NodeList", null, true);
++    test("childNodes", document.body.childNodes, "NodeList");
+     if(clientRects) test("clientRect", clientRects[0], "ClientRect");
+     if(clientRects) test("clientRects", clientRects, "ClientRectList");
+-    if(currentStyle) test("currentStyle", currentStyle, "MSCurrentStyleCSSProperties", null, true);
++    if(currentStyle) test("currentStyle", currentStyle, "MSCurrentStyleCSSProperties");
+     if(v >= 11 /* todo_wine */) test("document", document, v < 11 ? "Document" : "HTMLDocument");
+-    test("elements", document.getElementsByTagName("body"), "HTMLCollection", null, true);
++    test("elements", document.getElementsByTagName("body"), "HTMLCollection");
+     test("history", window.history, "History");
+     test("implementation", document.implementation, "DOMImplementation");
+     if(localStorage) test("localStorage", localStorage, "Storage");
+@@ -310,11 +310,11 @@ sync_test("builtin_toString", function()
+     if(v >= 11 /* todo_wine */) test("plugins", window.navigator.plugins, v < 11 ? "MSPluginsCollection" : "PluginArray");
+     test("screen", window.screen, "Screen");
+     test("sessionStorage", window.sessionStorage, "Storage");
+-    test("style", document.body.style, "MSStyleCSSProperties", null, true);
+-    test("styleSheet", sheet, "CSSStyleSheet", null, true);
+-    test("styleSheetRule", sheet.rules[0], "CSSStyleRule", null, true);
+-    test("styleSheetRules", sheet.rules, "MSCSSRuleList", null, true);
+-    test("styleSheets", document.styleSheets, "StyleSheetList", null, true);
++    test("style", document.body.style, "MSStyleCSSProperties");
++    test("styleSheet", sheet, "CSSStyleSheet");
++    test("styleSheetRule", sheet.rules[0], "CSSStyleRule");
++    test("styleSheetRules", sheet.rules, "MSCSSRuleList");
++    test("styleSheets", document.styleSheets, "StyleSheetList");
+     test("textNode", document.createTextNode("testNode"), "Text", v < 9 ? "testNode" : null);
+     test("textRange", txtRange, "TextRange");
+     test("window", window, "Window", "[object Window]");
+@@ -327,7 +327,7 @@ sync_test("builtin_toString", function()
+         test("selection", document.selection, "MSSelection");
+     }
+     if(v >= 9) {
+-        test("computedStyle", window.getComputedStyle(e), "CSSStyleDeclaration", null, true);
++        test("computedStyle", window.getComputedStyle(e), "CSSStyleDeclaration");
+         test("doctype", document.doctype, "DocumentType");
+ 
+         test("Event", document.createEvent("Event"), "Event");
+diff -uNarp a/dlls/msv1_0/unixlib.c b/dlls/msv1_0/unixlib.c
+--- a/dlls/msv1_0/unixlib.c	2024-07-28 16:02:13.000000000 -0400
++++ b/dlls/msv1_0/unixlib.c	2025-11-19 17:54:35.807926405 -0500
+@@ -40,7 +40,12 @@
+ #include "wine/debug.h"
+ #include "unixlib.h"
+ 
+-extern char **environ;
++#ifdef __APPLE__
++# include <crt_externs.h>
++# define environ (*_NSGetEnviron())
++#else
++  extern char **environ;
++#endif
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(ntlm);
+ WINE_DECLARE_DEBUG_CHANNEL(winediag);
+diff -uNarp a/dlls/ntdll/unix/env.c b/dlls/ntdll/unix/env.c
+--- a/dlls/ntdll/unix/env.c	2024-07-28 16:02:13.000000000 -0400
++++ b/dlls/ntdll/unix/env.c	2025-11-19 17:54:35.807423355 -0500
+@@ -44,6 +44,10 @@
+ #ifdef __APPLE__
+ # include <CoreFoundation/CFLocale.h>
+ # include <CoreFoundation/CFString.h>
++# include <crt_externs.h>
++# define environ (*_NSGetEnviron())
++#else
++  extern char **environ;
+ #endif
+ 
+ #include "ntstatus.h"
+@@ -70,7 +74,6 @@ static const WCHAR bootstrapW[] = {'W','
+ 
+ int main_argc = 0;
+ char **main_argv = NULL;
+-char **main_envp = NULL;
+ WCHAR **main_wargv = NULL;
+ 
+ static LCID user_lcid, system_lcid;
+@@ -931,12 +934,12 @@ static WCHAR *get_initial_environment( S
+ 
+     /* estimate needed size */
+     *size = 1;
+-    for (e = main_envp; *e; e++) *size += strlen(*e) + 1;
++    for (e = environ; *e; e++) *size += strlen(*e) + 1;
+ 
+     env = malloc( *size * sizeof(WCHAR) );
+     ptr = env;
+     end = env + *size - 1;
+-    for (e = main_envp; *e && ptr < end; e++)
++    for (e = environ; *e && ptr < end; e++)
+     {
+         char *str = *e;
+ 
+diff -uNarp a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
+--- a/dlls/ntdll/unix/loader.c	2024-07-28 16:02:13.000000000 -0400
++++ b/dlls/ntdll/unix/loader.c	2025-11-19 17:54:35.807842313 -0500
+@@ -73,11 +73,13 @@
+ # ifndef _POSIX_SPAWN_DISABLE_ASLR
+ #  define _POSIX_SPAWN_DISABLE_ASLR 0x0100
+ # endif
++# define environ (*_NSGetEnviron())
++#else
++  extern char **environ;
+ #endif
+ #ifdef __ANDROID__
+ # include <jni.h>
+ #endif
+-extern char **environ;
+ 
+ #include "ntstatus.h"
+ #define WIN32_NO_STATUS
+@@ -1953,7 +1955,6 @@ static jstring wine_init_jni( JNIEnv *en
+ 
+     main_argc = argc;
+     main_argv = argv;
+-    main_envp = environ;
+ 
+     init_paths( argv );
+     virtual_init();
+@@ -2149,11 +2150,10 @@ static void check_command_line( int argc
+  *
+  * Main entry point called by the wine loader.
+  */
+-DECLSPEC_EXPORT void __wine_main( int argc, char *argv[], char *envp[] )
++DECLSPEC_EXPORT void __wine_main( int argc, char *argv[] )
+ {
+     main_argc = argc;
+     main_argv = argv;
+-    main_envp = envp;
+ 
+     init_paths( argv );
+ 
+diff -uNarp a/dlls/ntdll/unix/unix_private.h b/dlls/ntdll/unix/unix_private.h
+--- a/dlls/ntdll/unix/unix_private.h	2024-07-28 16:02:13.000000000 -0400
++++ b/dlls/ntdll/unix/unix_private.h	2025-11-19 17:54:35.807638239 -0500
+@@ -172,7 +172,6 @@ extern SIZE_T startup_info_size;
+ extern BOOL is_prefix_bootstrap;
+ extern int main_argc;
+ extern char **main_argv;
+-extern char **main_envp;
+ extern WCHAR **main_wargv;
+ extern const WCHAR system_dir[];
+ extern unsigned int supported_machines_count;
+diff -uNarp a/dlls/wined3d/cs.c b/dlls/wined3d/cs.c
+--- a/dlls/wined3d/cs.c	2024-07-28 16:02:13.000000000 -0400
++++ b/dlls/wined3d/cs.c	2025-11-19 17:54:35.793854857 -0500
+@@ -121,7 +121,6 @@ enum wined3d_cs_op
+     WINED3D_CS_OP_SET_TRANSFORM,
+     WINED3D_CS_OP_SET_CLIP_PLANE,
+     WINED3D_CS_OP_SET_COLOR_KEY,
+-    WINED3D_CS_OP_SET_MATERIAL,
+     WINED3D_CS_OP_SET_LIGHT,
+     WINED3D_CS_OP_SET_LIGHT_ENABLE,
+     WINED3D_CS_OP_SET_FEATURE_LEVEL,
+@@ -383,12 +382,6 @@ struct wined3d_cs_set_clip_plane
+     struct wined3d_vec4 plane;
+ };
+ 
+-struct wined3d_cs_set_material
+-{
+-    enum wined3d_cs_op opcode;
+-    struct wined3d_material material;
+-};
+-
+ struct wined3d_cs_set_light
+ {
+     enum wined3d_cs_op opcode;
+@@ -604,7 +597,6 @@ static const char *debug_cs_op(enum wine
+         WINED3D_TO_STR(WINED3D_CS_OP_SET_TRANSFORM);
+         WINED3D_TO_STR(WINED3D_CS_OP_SET_CLIP_PLANE);
+         WINED3D_TO_STR(WINED3D_CS_OP_SET_COLOR_KEY);
+-        WINED3D_TO_STR(WINED3D_CS_OP_SET_MATERIAL);
+         WINED3D_TO_STR(WINED3D_CS_OP_SET_LIGHT);
+         WINED3D_TO_STR(WINED3D_CS_OP_SET_LIGHT_ENABLE);
+         WINED3D_TO_STR(WINED3D_CS_OP_SET_FEATURE_LEVEL);
+@@ -2015,26 +2007,6 @@ void wined3d_cs_emit_set_color_key(struc
+     wined3d_device_context_submit(&cs->c, WINED3D_CS_QUEUE_DEFAULT);
+ }
+ 
+-static void wined3d_cs_exec_set_material(struct wined3d_cs *cs, const void *data)
+-{
+-    const struct wined3d_cs_set_material *op = data;
+-
+-    cs->state.material = op->material;
+-    device_invalidate_state(cs->c.device, STATE_MATERIAL);
+-}
+-
+-void wined3d_device_context_emit_set_material(struct wined3d_device_context *context,
+-        const struct wined3d_material *material)
+-{
+-    struct wined3d_cs_set_material *op;
+-
+-    op = wined3d_device_context_require_space(context, sizeof(*op), WINED3D_CS_QUEUE_DEFAULT);
+-    op->opcode = WINED3D_CS_OP_SET_MATERIAL;
+-    op->material = *material;
+-
+-    wined3d_device_context_submit(context, WINED3D_CS_QUEUE_DEFAULT);
+-}
+-
+ static void wined3d_cs_exec_set_light(struct wined3d_cs *cs, const void *data)
+ {
+     const struct wined3d_cs_set_light *op = data;
+@@ -2957,7 +2929,6 @@ static void (* const wined3d_cs_op_handl
+     /* WINED3D_CS_OP_SET_TRANSFORM               */ wined3d_cs_exec_set_transform,
+     /* WINED3D_CS_OP_SET_CLIP_PLANE              */ wined3d_cs_exec_set_clip_plane,
+     /* WINED3D_CS_OP_SET_COLOR_KEY               */ wined3d_cs_exec_set_color_key,
+-    /* WINED3D_CS_OP_SET_MATERIAL                */ wined3d_cs_exec_set_material,
+     /* WINED3D_CS_OP_SET_LIGHT                   */ wined3d_cs_exec_set_light,
+     /* WINED3D_CS_OP_SET_LIGHT_ENABLE            */ wined3d_cs_exec_set_light_enable,
+     /* WINED3D_CS_OP_SET_FEATURE_LEVEL           */ wined3d_cs_exec_set_feature_level,
+diff -uNarp a/dlls/wined3d/ffp_gl.c b/dlls/wined3d/ffp_gl.c
+--- a/dlls/wined3d/ffp_gl.c	2024-07-28 16:02:13.000000000 -0400
++++ b/dlls/wined3d/ffp_gl.c	2025-11-19 17:54:35.797478159 -0500
+@@ -759,8 +759,8 @@ static void depth(struct wined3d_context
+         }
+     }
+ 
+-    if (context->stream_info.position_transformed && !isStateDirty(context, STATE_TRANSFORM(WINED3D_TS_PROJECTION)))
+-        context_apply_state(context, state, STATE_TRANSFORM(WINED3D_TS_PROJECTION));
++    if (context->stream_info.position_transformed)
++        context->constant_update_mask |= WINED3D_SHADER_CONST_FFP_PROJ;
+ }
+ 
+ static void depth_stencil(struct wined3d_context *context, const struct wined3d_state *state, DWORD state_id)
+@@ -1139,7 +1139,7 @@ static void viewport_miscpart_cc(struct
+         const struct wined3d_state *state, DWORD state_id)
+ {
+     const struct wined3d_gl_info *gl_info = wined3d_context_gl(context)->gl_info;
+-    /* See get_projection_matrix() in utils.c for a discussion about those values. */
++    /* See get_projection_matrix() in glsl_shader.c for a discussion about those values. */
+     float pixel_center_offset = context->d3d_info->wined3d_creation_flags
+             & WINED3D_PIXEL_CENTER_INTEGER ? 0.5f : 0.0f;
+     GLdouble depth_ranges[2 * WINED3D_MAX_VIEWPORTS];
+@@ -1684,7 +1684,6 @@ static void validate_state_table(struct
+     };
+     static const unsigned int simple_states[] =
+     {
+-        STATE_MATERIAL,
+         STATE_VDECL,
+         STATE_STREAMSRC,
+         STATE_INDEXBUFFER,
+diff -uNarp a/dlls/wined3d/glsl_shader.c b/dlls/wined3d/glsl_shader.c
+--- a/dlls/wined3d/glsl_shader.c	2024-07-28 16:02:13.000000000 -0400
++++ b/dlls/wined3d/glsl_shader.c	2025-11-19 17:54:35.800309044 -0500
+@@ -1477,18 +1477,102 @@ static void reset_program_constant_versi
+     WINE_RB_ENTRY_VALUE(entry, struct glsl_shader_prog_link, program_lookup_entry)->constant_version = 0;
+ }
+ 
++static void get_projection_matrix(const struct wined3d_context *context,
++        const struct wined3d_ffp_vs_constants *constants, const struct wined3d_state *state, struct wined3d_matrix *mat)
++{
++    const struct wined3d_d3d_info *d3d_info = context->d3d_info;
++    bool clip_control, flip;
++    float center_offset;
++
++    /* There are a couple of additional things we have to take into account
++     * here besides the projection transformation itself:
++     *   - We need to flip along the y-axis in case of offscreen rendering.
++     *   - OpenGL Z range is {-Wc,...,Wc} while D3D Z range is {0,...,Wc}.
++     *   - <= D3D9 coordinates refer to pixel centers while GL coordinates
++     *     refer to pixel corners. D3D10 fixed this particular oddity.
++     *   - D3D has a top-left filling convention while GL does not specify
++     *     a particular behavior, other than that that the GL implementation
++     *     needs to be consistent.
++     *
++     * In order to handle the pixel center, we translate by 0.5 / VPw and
++     * 0.5 / VPh. We test the filling convention during adapter init and
++     * add a small offset to correct it if necessary. See
++     * wined3d_caps_gl_ctx_test_filling_convention() for more details on how
++     * we test GL and considerations regarding the added offset value.
++     *
++     * If we have GL_ARB_clip_control we take care of all this through
++     * viewport properties and don't have to translate geometry. */
++
++    /* Projection matrices are <= d3d9, which all have integer pixel centers. */
++    if (!(d3d_info->wined3d_creation_flags & WINED3D_PIXEL_CENTER_INTEGER))
++        ERR("Did not expect to enter this codepath without WINED3D_PIXEL_CENTER_INTEGER.\n");
++
++    clip_control = d3d_info->clip_control;
++    flip = !clip_control;
++    if (!clip_control)
++        center_offset = 1.0f + d3d_info->filling_convention_offset;
++    else
++        center_offset = 0.0f;
++
++    if (context->stream_info.position_transformed)
++    {
++        /* Transform D3D RHW coordinates to OpenGL clip coordinates. */
++        float x = state->viewports[0].x;
++        float y = state->viewports[0].y;
++        float w = state->viewports[0].width;
++        float h = state->viewports[0].height;
++        float x_scale = 2.0f / w;
++        float x_offset = (center_offset - (2.0f * x) - w) / w;
++        float y_scale = flip ? 2.0f / h : 2.0f / -h;
++        float y_offset = flip
++                ? (center_offset - (2.0f * y) - h) / h
++                : (center_offset - (2.0f * y) - h) / -h;
++        bool zenable = state->fb.depth_stencil ?
++                (state->depth_stencil_state ? state->depth_stencil_state->desc.depth : true) : false;
++        float z_scale = zenable ? clip_control ? 1.0f : 2.0f : 0.0f;
++        float z_offset = zenable ? clip_control ? 0.0f : -1.0f : 0.0f;
++        const struct wined3d_matrix projection =
++        {
++             x_scale,     0.0f,      0.0f, 0.0f,
++                0.0f,  y_scale,      0.0f, 0.0f,
++                0.0f,     0.0f,   z_scale, 0.0f,
++            x_offset, y_offset,  z_offset, 1.0f,
++        };
++
++        *mat = projection;
++    }
++    else
++    {
++        float y_scale = flip ? -1.0f : 1.0f;
++        float x_offset = center_offset / state->viewports[0].width;
++        float y_offset = flip
++                ? center_offset / state->viewports[0].height
++                : -center_offset / state->viewports[0].height;
++        float z_scale = clip_control ? 1.0f : 2.0f;
++        float z_offset = clip_control ? 0.0f : -1.0f;
++        const struct wined3d_matrix projection =
++        {
++                1.0f,     0.0f,     0.0f, 0.0f,
++                0.0f,  y_scale,     0.0f, 0.0f,
++                0.0f,     0.0f,  z_scale, 0.0f,
++            x_offset, y_offset, z_offset, 1.0f,
++        };
++
++        multiply_matrix(mat, &projection, &constants->projection_matrix);
++    }
++}
++
+ static void shader_glsl_ffp_vertex_normalmatrix_uniform(const struct wined3d_context_gl *context_gl,
+-        const struct wined3d_state *state, struct glsl_shader_prog_link *prog)
++        const struct wined3d_ffp_vs_constants *constants, struct glsl_shader_prog_link *prog)
+ {
+     const struct wined3d_gl_info *gl_info = context_gl->gl_info;
+-    struct wined3d_matrix mv;
+     float mat[3 * 3];
+ 
+     if (prog->vs.normal_matrix_location == -1)
+         return;
+ 
+-    get_modelview_matrix(&context_gl->c, state, 0, &mv);
+-    compute_normal_matrix(mat, context_gl->c.d3d_info->wined3d_creation_flags & WINED3D_LEGACY_FFP_LIGHTING, &mv);
++    compute_normal_matrix(mat, context_gl->c.d3d_info->wined3d_creation_flags & WINED3D_LEGACY_FFP_LIGHTING,
++            &constants->modelview_matrices[0]);
+ 
+     GL_EXTCALL(glUniformMatrix3fv(prog->vs.normal_matrix_location, 1, FALSE, mat));
+     checkGLcall("glUniformMatrix3fv");
+@@ -1509,16 +1593,20 @@ static void shader_glsl_ffp_vertex_texma
+     checkGLcall("glUniformMatrix4fv");
+ }
+ 
+-static void shader_glsl_ffp_vertex_material_uniform(const struct wined3d_context_gl *context_gl,
++static void shader_glsl_ffp_vertex_material_uniform(struct wined3d_context_gl *context_gl,
+         const struct wined3d_state *state, struct glsl_shader_prog_link *prog)
+ {
+     const struct wined3d_gl_info *gl_info = context_gl->gl_info;
++    const struct wined3d_ffp_vs_constants *constants;
++
++    constants = wined3d_buffer_load_sysmem(
++            context_gl->c.device->push_constants[WINED3D_PUSH_CONSTANTS_VS_FFP], &context_gl->c);
+ 
+-    GL_EXTCALL(glUniform4fv(prog->vs.material_specular_location, 1, &state->material.specular.r));
+-    GL_EXTCALL(glUniform1f(prog->vs.material_shininess_location, state->material.power));
+-    GL_EXTCALL(glUniform4fv(prog->vs.material_ambient_location, 1, &state->material.ambient.r));
+-    GL_EXTCALL(glUniform4fv(prog->vs.material_diffuse_location, 1, &state->material.diffuse.r));
+-    GL_EXTCALL(glUniform4fv(prog->vs.material_emissive_location, 1, &state->material.emissive.r));
++    GL_EXTCALL(glUniform4fv(prog->vs.material_specular_location, 1, &constants->material.specular.r));
++    GL_EXTCALL(glUniform1f(prog->vs.material_shininess_location, constants->material.power));
++    GL_EXTCALL(glUniform4fv(prog->vs.material_ambient_location, 1, &constants->material.ambient.r));
++    GL_EXTCALL(glUniform4fv(prog->vs.material_diffuse_location, 1, &constants->material.diffuse.r));
++    GL_EXTCALL(glUniform4fv(prog->vs.material_emissive_location, 1, &constants->material.emissive.r));
+     checkGLcall("setting FFP material uniforms");
+ }
+ 
+@@ -1699,35 +1787,42 @@ static void shader_glsl_load_constants(s
+ 
+     if (update_mask & WINED3D_SHADER_CONST_FFP_MODELVIEW)
+     {
+-        struct wined3d_matrix mat;
++        const struct wined3d_ffp_vs_constants *constants;
++
++        constants = wined3d_buffer_load_sysmem(context->device->push_constants[WINED3D_PUSH_CONSTANTS_VS_FFP], context);
+ 
+-        get_modelview_matrix(context, state, 0, &mat);
+-        GL_EXTCALL(glUniformMatrix4fv(prog->vs.modelview_matrix_location[0], 1, FALSE, &mat._11));
++        GL_EXTCALL(glUniformMatrix4fv(prog->vs.modelview_matrix_location[0], 1,
++                FALSE, &constants->modelview_matrices[0]._11));
+         checkGLcall("glUniformMatrix4fv");
+ 
+-        shader_glsl_ffp_vertex_normalmatrix_uniform(context_gl, state, prog);
++        shader_glsl_ffp_vertex_normalmatrix_uniform(context_gl, constants, prog);
+     }
+ 
+     if (update_mask & WINED3D_SHADER_CONST_FFP_VERTEXBLEND)
+     {
+-        struct wined3d_matrix mat;
++        const struct wined3d_ffp_vs_constants *constants;
++
++        constants = wined3d_buffer_load_sysmem(context->device->push_constants[WINED3D_PUSH_CONSTANTS_VS_FFP], context);
+ 
+         for (i = 1; i < MAX_VERTEX_BLENDS; ++i)
+         {
+             if (prog->vs.modelview_matrix_location[i] == -1)
+                 break;
+ 
+-            get_modelview_matrix(context, state, i, &mat);
+-            GL_EXTCALL(glUniformMatrix4fv(prog->vs.modelview_matrix_location[i], 1, FALSE, &mat._11));
++            GL_EXTCALL(glUniformMatrix4fv(prog->vs.modelview_matrix_location[i],
++                    1, FALSE, &constants->modelview_matrices[i]._11));
+             checkGLcall("glUniformMatrix4fv");
+         }
+     }
+ 
+     if (update_mask & WINED3D_SHADER_CONST_FFP_PROJ)
+     {
++        const struct wined3d_ffp_vs_constants *constants;
+         struct wined3d_matrix projection;
+ 
+-        get_projection_matrix(context, state, &projection);
++        constants = wined3d_buffer_load_sysmem(context->device->push_constants[WINED3D_PUSH_CONSTANTS_VS_FFP], context);
++
++        get_projection_matrix(context, constants, state, &projection);
+         GL_EXTCALL(glUniformMatrix4fv(prog->vs.projection_matrix_location, 1, FALSE, &projection._11));
+         checkGLcall("glUniformMatrix4fv");
+     }
+@@ -9166,12 +9261,20 @@ static GLuint shader_glsl_generate_ffp_v
+     {
+         if (!settings->vertexblends)
+         {
+-            shader_addline(buffer, "normal = ffp_normal_matrix * ffp_attrib_normal;\n");
++            if (settings->transformed)
++                shader_addline(buffer, "normal = ffp_attrib_normal;\n");
++            else
++                shader_addline(buffer, "normal = ffp_normal_matrix * ffp_attrib_normal;\n");
+         }
+         else
+         {
+             for (i = 0; i < settings->vertexblends + 1; ++i)
+-                shader_addline(buffer, "normal += ffp_attrib_blendweight[%u] * (mat3(ffp_modelview_matrix[%u]) * ffp_attrib_normal);\n", i, i);
++            {
++                if (settings->transformed)
++                    shader_addline(buffer, "normal += ffp_attrib_blendweight[%u] * ffp_attrib_normal;\n", i);
++                else
++                    shader_addline(buffer, "normal += ffp_attrib_blendweight[%u] * (mat3(ffp_modelview_matrix[%u]) * ffp_attrib_normal);\n", i, i);
++            }
+         }
+ 
+         if (settings->normalize)
+@@ -11808,24 +11911,6 @@ static void glsl_vertex_pipe_pixel_shade
+         context->shader_update_mask |= 1u << WINED3D_SHADER_TYPE_VERTEX;
+ }
+ 
+-static void glsl_vertex_pipe_world(struct wined3d_context *context,
+-        const struct wined3d_state *state, DWORD state_id)
+-{
+-    context->constant_update_mask |= WINED3D_SHADER_CONST_FFP_MODELVIEW;
+-}
+-
+-static void glsl_vertex_pipe_vertexblend(struct wined3d_context *context,
+-        const struct wined3d_state *state, DWORD state_id)
+-{
+-    context->constant_update_mask |= WINED3D_SHADER_CONST_FFP_VERTEXBLEND;
+-}
+-
+-static void glsl_vertex_pipe_view(struct wined3d_context *context, const struct wined3d_state *state, DWORD state_id)
+-{
+-    context->constant_update_mask |= WINED3D_SHADER_CONST_FFP_MODELVIEW
+-            | WINED3D_SHADER_CONST_FFP_VERTEXBLEND;
+-}
+-
+ static void glsl_vertex_pipe_projection(struct wined3d_context *context,
+         const struct wined3d_state *state, DWORD state_id)
+ {
+@@ -11833,24 +11918,15 @@ static void glsl_vertex_pipe_projection(
+     if (state->render_states[WINED3D_RS_FOGENABLE]
+             && state->render_states[WINED3D_RS_FOGTABLEMODE] != WINED3D_FOG_NONE)
+         context->shader_update_mask |= 1u << WINED3D_SHADER_TYPE_VERTEX;
+-    context->constant_update_mask |= WINED3D_SHADER_CONST_FFP_PROJ;
+ }
+ 
+ static void glsl_vertex_pipe_viewport(struct wined3d_context *context,
+         const struct wined3d_state *state, DWORD state_id)
+ {
+-    if (!isStateDirty(context, STATE_TRANSFORM(WINED3D_TS_PROJECTION)))
+-        glsl_vertex_pipe_projection(context, state, STATE_TRANSFORM(WINED3D_TS_PROJECTION));
+     if (!isStateDirty(context, STATE_RENDER(WINED3D_RS_POINTSCALEENABLE))
+             && state->render_states[WINED3D_RS_POINTSCALEENABLE])
+         context->constant_update_mask |= WINED3D_SHADER_CONST_VS_POINTSIZE;
+-    context->constant_update_mask |= WINED3D_SHADER_CONST_POS_FIXUP;
+-}
+-
+-static void glsl_vertex_pipe_material(struct wined3d_context *context,
+-        const struct wined3d_state *state, DWORD state_id)
+-{
+-    context->constant_update_mask |= WINED3D_SHADER_CONST_FFP_MATERIAL;
++    context->constant_update_mask |= WINED3D_SHADER_CONST_POS_FIXUP | WINED3D_SHADER_CONST_FFP_PROJ;
+ }
+ 
+ static void glsl_vertex_pipe_pointsize(struct wined3d_context *context,
+@@ -11902,7 +11978,6 @@ static const struct wined3d_state_entry_
+     {STATE_SHADER(WINED3D_SHADER_TYPE_HULL),                     {STATE_SHADER(WINED3D_SHADER_TYPE_HULL),                     glsl_vertex_pipe_hs    }, WINED3D_GL_EXT_NONE          },
+     {STATE_SHADER(WINED3D_SHADER_TYPE_GEOMETRY),                 {STATE_SHADER(WINED3D_SHADER_TYPE_GEOMETRY),                 glsl_vertex_pipe_geometry_shader}, WINED3D_GL_EXT_NONE },
+     {STATE_SHADER(WINED3D_SHADER_TYPE_PIXEL),                    {STATE_SHADER(WINED3D_SHADER_TYPE_PIXEL),                    glsl_vertex_pipe_pixel_shader}, WINED3D_GL_EXT_NONE    },
+-    {STATE_MATERIAL,                                             {STATE_MATERIAL,                                             glsl_vertex_pipe_material}, WINED3D_GL_EXT_NONE        },
+     /* Clip planes */
+     {STATE_CLIPPLANE(0),                                         {STATE_CLIPPLANE(0),                                         glsl_vertex_pipe_clip_plane}, WINED3D_GLSL_130         },
+     {STATE_CLIPPLANE(0),                                         {STATE_CLIPPLANE(0),                                         clipplane              }, WINED3D_GL_EXT_NONE          },
+@@ -11925,12 +12000,7 @@ static const struct wined3d_state_entry_
+     /* Viewport */
+     {STATE_VIEWPORT,                                             {STATE_VIEWPORT,                                             glsl_vertex_pipe_viewport}, WINED3D_GL_EXT_NONE        },
+     /* Transform states */
+-    {STATE_TRANSFORM(WINED3D_TS_VIEW),                           {STATE_TRANSFORM(WINED3D_TS_VIEW),                           glsl_vertex_pipe_view  }, WINED3D_GL_EXT_NONE          },
+     {STATE_TRANSFORM(WINED3D_TS_PROJECTION),                     {STATE_TRANSFORM(WINED3D_TS_PROJECTION),                     glsl_vertex_pipe_projection}, WINED3D_GL_EXT_NONE      },
+-    {STATE_TRANSFORM(WINED3D_TS_WORLD_MATRIX(0)),                {STATE_TRANSFORM(WINED3D_TS_WORLD_MATRIX(0)),                glsl_vertex_pipe_world }, WINED3D_GL_EXT_NONE          },
+-    {STATE_TRANSFORM(WINED3D_TS_WORLD_MATRIX(1)),                {STATE_TRANSFORM(WINED3D_TS_WORLD_MATRIX(1)),                glsl_vertex_pipe_vertexblend }, WINED3D_GL_EXT_NONE    },
+-    {STATE_TRANSFORM(WINED3D_TS_WORLD_MATRIX(2)),                {STATE_TRANSFORM(WINED3D_TS_WORLD_MATRIX(2)),                glsl_vertex_pipe_vertexblend }, WINED3D_GL_EXT_NONE    },
+-    {STATE_TRANSFORM(WINED3D_TS_WORLD_MATRIX(3)),                {STATE_TRANSFORM(WINED3D_TS_WORLD_MATRIX(3)),                glsl_vertex_pipe_vertexblend }, WINED3D_GL_EXT_NONE    },
+     {STATE_TEXTURESTAGE(0, WINED3D_TSS_TEXCOORD_INDEX),          {STATE_SHADER(WINED3D_SHADER_TYPE_VERTEX),                   NULL                   }, WINED3D_GL_EXT_NONE          },
+     {STATE_TEXTURESTAGE(1, WINED3D_TSS_TEXCOORD_INDEX),          {STATE_SHADER(WINED3D_SHADER_TYPE_VERTEX),                   NULL                   }, WINED3D_GL_EXT_NONE          },
+     {STATE_TEXTURESTAGE(2, WINED3D_TSS_TEXCOORD_INDEX),          {STATE_SHADER(WINED3D_SHADER_TYPE_VERTEX),                   NULL                   }, WINED3D_GL_EXT_NONE          },
+diff -uNarp a/dlls/wined3d/shader_spirv.c b/dlls/wined3d/shader_spirv.c
+--- a/dlls/wined3d/shader_spirv.c	2024-07-28 16:02:13.000000000 -0400
++++ b/dlls/wined3d/shader_spirv.c	2025-11-19 17:54:35.794999040 -0500
+@@ -1176,7 +1176,6 @@ static const struct wined3d_state_entry_
+     {STATE_RENDER(WINED3D_RS_POINTSCALE_B),             {STATE_RENDER(WINED3D_RS_POINTSCALE_B),             state_nop}},
+     {STATE_RENDER(WINED3D_RS_POINTSCALE_C),             {STATE_RENDER(WINED3D_RS_POINTSCALE_C),             state_nop}},
+     {STATE_RENDER(WINED3D_RS_POINTSIZE_MAX),            {STATE_RENDER(WINED3D_RS_POINTSIZE_MAX),            state_nop}},
+-    {STATE_MATERIAL,                                    {STATE_MATERIAL,                                    state_nop}},
+     {STATE_SHADER(WINED3D_SHADER_TYPE_VERTEX),          {STATE_SHADER(WINED3D_SHADER_TYPE_VERTEX),          state_nop}},
+     {STATE_LIGHT_TYPE,                                  {STATE_LIGHT_TYPE,                                  state_nop}},
+     {0}, /* Terminate */
+diff -uNarp a/dlls/wined3d/stateblock.c b/dlls/wined3d/stateblock.c
+--- a/dlls/wined3d/stateblock.c	2024-07-28 16:02:13.000000000 -0400
++++ b/dlls/wined3d/stateblock.c	2025-11-19 17:54:35.800745593 -0500
+@@ -62,6 +62,7 @@ struct wined3d_saved_states
+      * translation from stateblock formats to wined3d_state formats. */
+     uint32_t ffp_ps_constants : 1;
+     uint32_t texture_matrices : 1;
++    uint32_t modelview_matrices : 1;
+ };
+ 
+ struct stage_state
+@@ -1580,6 +1581,10 @@ void CDECL wined3d_stateblock_set_render
+             stateblock->changed.ffp_ps_constants = 1;
+             break;
+ 
++        case WINED3D_RS_VERTEXBLEND:
++            stateblock->changed.modelview_matrices = 1;
++            break;
++
+         default:
+             break;
+     }
+@@ -1673,6 +1678,8 @@ void CDECL wined3d_stateblock_set_transf
+ 
+     if (d3dts >= WINED3D_TS_TEXTURE0 && d3dts <= WINED3D_TS_TEXTURE7)
+         stateblock->changed.texture_matrices = 1;
++    else if (d3dts == WINED3D_TS_VIEW || d3dts >= WINED3D_TS_WORLD)
++        stateblock->changed.modelview_matrices = 1;
+ }
+ 
+ void CDECL wined3d_stateblock_multiply_transform(struct wined3d_stateblock *stateblock,
+@@ -2250,6 +2257,10 @@ static void wined3d_stateblock_invalidat
+     stateblock->changed.ffp_ps_constants = 1;
+     stateblock->changed.lights = 1;
+     stateblock->changed.texture_matrices = 1;
++    stateblock->changed.material = 1;
++    stateblock->changed.transforms = 1;
++    memset(stateblock->changed.transform, 0xff, sizeof(stateblock->changed.transform));
++    stateblock->changed.modelview_matrices = 1;
+ }
+ 
+ static HRESULT stateblock_init(struct wined3d_stateblock *stateblock, const struct wined3d_stateblock *device_state,
+@@ -2266,7 +2277,8 @@ static HRESULT stateblock_init(struct wi
+     stateblock->changed.store_stream_offset = 1;
+     list_init(&stateblock->changed.changed_lights);
+ 
+-    wined3d_stateblock_invalidate_push_constants(stateblock);
++    if (type == WINED3D_SBT_PRIMARY)
++        wined3d_stateblock_invalidate_push_constants(stateblock);
+ 
+     if (type == WINED3D_SBT_RECORDED || type == WINED3D_SBT_PRIMARY)
+         return WINED3D_OK;
+@@ -2609,14 +2621,6 @@ static void wined3d_device_set_texture(s
+     return;
+ }
+ 
+-static void wined3d_device_set_material(struct wined3d_device *device, const struct wined3d_material *material)
+-{
+-    TRACE("device %p, material %p.\n", device, material);
+-
+-    device->cs->c.state->material = *material;
+-    wined3d_device_context_emit_set_material(&device->cs->c, material);
+-}
+-
+ static void wined3d_device_set_transform(struct wined3d_device *device,
+         enum wined3d_transform_state state, const struct wined3d_matrix *matrix)
+ {
+@@ -3340,8 +3344,16 @@ void CDECL wined3d_device_apply_stateblo
+                     changed->clipplane = wined3d_mask_from_size(WINED3D_MAX_CLIP_DISTANCES);
+                 }
+ 
+-                if (!(idx >= WINED3D_TS_TEXTURE0 && idx <= WINED3D_TS_TEXTURE7))
++                if (idx == WINED3D_TS_PROJECTION)
++                {
++                    wined3d_device_context_push_constants(context,
++                            WINED3D_PUSH_CONSTANTS_VS_FFP, WINED3D_SHADER_CONST_FFP_PROJ,
++                            offsetof(struct wined3d_ffp_vs_constants, projection_matrix),
++                            sizeof(state->transforms[idx]), &state->transforms[idx]);
++                    /* wined3d_ffp_vs_settings.ortho_fog still needs the
++                     * device state to be set. */
+                     wined3d_device_set_transform(device, idx, &state->transforms[idx]);
++                }
+             }
+         }
+ 
+@@ -3354,8 +3366,6 @@ void CDECL wined3d_device_apply_stateblo
+     wined3d_device_set_base_vertex_index(device, state->base_vertex_index);
+     if (changed->vertexDecl)
+         wined3d_device_context_set_vertex_declaration(context, state->vertex_declaration);
+-    if (changed->material)
+-        wined3d_device_set_material(device, &state->material);
+     if (changed->viewport)
+         wined3d_device_context_set_viewports(context, 1, &state->viewport);
+     if (changed->scissorRect)
+@@ -3425,6 +3435,10 @@ void CDECL wined3d_device_apply_stateblo
+         }
+     }
+ 
++    if (changed->material)
++        wined3d_device_context_push_constants(context, WINED3D_PUSH_CONSTANTS_VS_FFP, WINED3D_SHADER_CONST_FFP_MATERIAL,
++                offsetof(struct wined3d_ffp_vs_constants, material), sizeof(state->material), &state->material);
++
+     if (changed->lights)
+     {
+         unsigned int point_idx, spot_idx, directional_idx, parallel_point_idx;
+@@ -3514,6 +3528,26 @@ void CDECL wined3d_device_apply_stateblo
+                 offsetof(struct wined3d_ffp_vs_constants, light), sizeof(constants), &constants);
+     }
+ 
++    if (changed->modelview_matrices)
++    {
++        struct wined3d_matrix matrices[MAX_VERTEX_BLENDS];
++
++        get_modelview_matrix(state, 0, &matrices[0]);
++        wined3d_device_context_push_constants(context,
++                WINED3D_PUSH_CONSTANTS_VS_FFP, WINED3D_SHADER_CONST_FFP_MODELVIEW,
++                offsetof(struct wined3d_ffp_vs_constants, modelview_matrices[0]), sizeof(matrices[0]), &matrices[0]);
++
++        if (state->rs[WINED3D_RS_VERTEXBLEND])
++        {
++            for (i = 1; i < MAX_VERTEX_BLENDS; ++i)
++                get_modelview_matrix(state, i, &matrices[i]);
++            wined3d_device_context_push_constants(context,
++                    WINED3D_PUSH_CONSTANTS_VS_FFP, WINED3D_SHADER_CONST_FFP_VERTEXBLEND,
++                    offsetof(struct wined3d_ffp_vs_constants, modelview_matrices[1]),
++                    sizeof(matrices) - sizeof(matrices[0]), &matrices[1]);
++        }
++    }
++
+     if (changed->texture_matrices)
+     {
+         struct wined3d_ffp_vs_constants constants;
+diff -uNarp a/dlls/wined3d/utils.c b/dlls/wined3d/utils.c
+--- a/dlls/wined3d/utils.c	2024-07-28 16:02:13.000000000 -0400
++++ b/dlls/wined3d/utils.c	2025-11-19 17:54:35.801018898 -0500
+@@ -5369,8 +5369,6 @@ const char *debug_d3dstate(uint32_t stat
+         return "STATE_SCISSORRECT";
+     if (STATE_IS_CLIPPLANE(state))
+         return wine_dbg_sprintf("STATE_CLIPPLANE(%#x)", state - STATE_CLIPPLANE(0));
+-    if (STATE_IS_MATERIAL(state))
+-        return "STATE_MATERIAL";
+     if (STATE_IS_RASTERIZER(state))
+         return "STATE_RASTERIZER";
+     if (STATE_IS_DEPTH_BOUNDS(state))
+@@ -5591,98 +5589,9 @@ void get_identity_matrix(struct wined3d_
+     *mat = identity;
+ }
+ 
+-void get_modelview_matrix(const struct wined3d_context *context, const struct wined3d_state *state,
+-        unsigned int index, struct wined3d_matrix *mat)
++void get_modelview_matrix(const struct wined3d_stateblock_state *state, unsigned int index, struct wined3d_matrix *mat)
+ {
+-    if (context->stream_info.position_transformed)
+-        get_identity_matrix(mat);
+-    else
+-        multiply_matrix(mat, &state->transforms[WINED3D_TS_VIEW], &state->transforms[WINED3D_TS_WORLD_MATRIX(index)]);
+-}
+-
+-void get_projection_matrix(const struct wined3d_context *context, const struct wined3d_state *state,
+-        struct wined3d_matrix *mat)
+-{
+-    const struct wined3d_d3d_info *d3d_info = context->d3d_info;
+-    BOOL clip_control, flip;
+-    float center_offset;
+-
+-    /* There are a couple of additional things we have to take into account
+-     * here besides the projection transformation itself:
+-     *   - We need to flip along the y-axis in case of offscreen rendering.
+-     *   - OpenGL Z range is {-Wc,...,Wc} while D3D Z range is {0,...,Wc}.
+-     *   - <= D3D9 coordinates refer to pixel centers while GL coordinates
+-     *     refer to pixel corners. D3D10 fixed this particular oddity.
+-     *   - D3D has a top-left filling convention while GL does not specify
+-     *     a particular behavior, other than that that the GL implementation
+-     *     needs to be consistent.
+-     *
+-     * In order to handle the pixel center, we translate by 0.5 / VPw and
+-     * 0.5 / VPh. We test the filling convention during adapter init and
+-     * add a small offset to correct it if necessary. See
+-     * wined3d_caps_gl_ctx_test_filling_convention() for more details on how
+-     * we test GL and considerations regarding the added offset value.
+-     *
+-     * If we have GL_ARB_clip_control we take care of all this through
+-     * viewport properties and don't have to translate geometry. */
+-
+-    /* Projection matrices are <= d3d9, which all have integer pixel centers. */
+-    if (!(d3d_info->wined3d_creation_flags & WINED3D_PIXEL_CENTER_INTEGER))
+-        ERR("Did not expect to enter this codepath without WINED3D_PIXEL_CENTER_INTEGER.\n");
+-
+-    clip_control = d3d_info->clip_control;
+-    flip = !clip_control;
+-    if (!clip_control)
+-        center_offset = 1.0f + d3d_info->filling_convention_offset;
+-    else
+-        center_offset = 0.0f;
+-
+-    if (context->stream_info.position_transformed)
+-    {
+-        /* Transform D3D RHW coordinates to OpenGL clip coordinates. */
+-        float x = state->viewports[0].x;
+-        float y = state->viewports[0].y;
+-        float w = state->viewports[0].width;
+-        float h = state->viewports[0].height;
+-        float x_scale = 2.0f / w;
+-        float x_offset = (center_offset - (2.0f * x) - w) / w;
+-        float y_scale = flip ? 2.0f / h : 2.0f / -h;
+-        float y_offset = flip
+-                ? (center_offset - (2.0f * y) - h) / h
+-                : (center_offset - (2.0f * y) - h) / -h;
+-        bool zenable = state->fb.depth_stencil ?
+-                (state->depth_stencil_state ? state->depth_stencil_state->desc.depth : true) : false;
+-        float z_scale = zenable ? clip_control ? 1.0f : 2.0f : 0.0f;
+-        float z_offset = zenable ? clip_control ? 0.0f : -1.0f : 0.0f;
+-        const struct wined3d_matrix projection =
+-        {
+-             x_scale,     0.0f,      0.0f, 0.0f,
+-                0.0f,  y_scale,      0.0f, 0.0f,
+-                0.0f,     0.0f,   z_scale, 0.0f,
+-            x_offset, y_offset,  z_offset, 1.0f,
+-        };
+-
+-        *mat = projection;
+-    }
+-    else
+-    {
+-        float y_scale = flip ? -1.0f : 1.0f;
+-        float x_offset = center_offset / state->viewports[0].width;
+-        float y_offset = flip
+-                ? center_offset / state->viewports[0].height
+-                : -center_offset / state->viewports[0].height;
+-        float z_scale = clip_control ? 1.0f : 2.0f;
+-        float z_offset = clip_control ? 0.0f : -1.0f;
+-        const struct wined3d_matrix projection =
+-        {
+-                1.0f,     0.0f,     0.0f, 0.0f,
+-                0.0f,  y_scale,     0.0f, 0.0f,
+-                0.0f,     0.0f,  z_scale, 0.0f,
+-            x_offset, y_offset, z_offset, 1.0f,
+-        };
+-
+-        multiply_matrix(mat, &projection, &state->transforms[WINED3D_TS_PROJECTION]);
+-    }
++    multiply_matrix(mat, &state->transforms[WINED3D_TS_VIEW], &state->transforms[WINED3D_TS_WORLD_MATRIX(index)]);
+ }
+ 
+ /* Setup this textures matrix according to the texture flags. */
+diff -uNarp a/dlls/wined3d/wined3d_private.h b/dlls/wined3d/wined3d_private.h
+--- a/dlls/wined3d/wined3d_private.h	2024-07-28 16:02:13.000000000 -0400
++++ b/dlls/wined3d/wined3d_private.h	2025-11-19 17:54:35.801377115 -0500
+@@ -1757,10 +1757,7 @@ void dispatch_compute(struct wined3d_dev
+ #define STATE_CLIPPLANE(a) (STATE_SCISSORRECT + 1 + (a))
+ #define STATE_IS_CLIPPLANE(a) ((a) >= STATE_CLIPPLANE(0) && (a) <= STATE_CLIPPLANE(WINED3D_MAX_CLIP_DISTANCES - 1))
+ 
+-#define STATE_MATERIAL (STATE_CLIPPLANE(WINED3D_MAX_CLIP_DISTANCES))
+-#define STATE_IS_MATERIAL(a) ((a) == STATE_MATERIAL)
+-
+-#define STATE_RASTERIZER (STATE_MATERIAL + 1)
++#define STATE_RASTERIZER (STATE_CLIPPLANE(WINED3D_MAX_CLIP_DISTANCES))
+ #define STATE_IS_RASTERIZER(a) ((a) == STATE_RASTERIZER)
+ 
+ #define STATE_DEPTH_BOUNDS (STATE_RASTERIZER + 1)
+@@ -2771,7 +2768,10 @@ BOOL wined3d_get_app_name(char *app_name
+ 
+ struct wined3d_ffp_vs_constants
+ {
++    struct wined3d_matrix modelview_matrices[MAX_VERTEX_BLENDS];
++    struct wined3d_matrix projection_matrix;
+     struct wined3d_matrix texture_matrices[WINED3D_MAX_FFP_TEXTURES];
++    struct wined3d_material material;
+     struct wined3d_ffp_light_constants
+     {
+         struct wined3d_color ambient;
+@@ -2889,7 +2889,6 @@ struct wined3d_state
+ 
+     struct wined3d_matrix transforms[WINED3D_HIGHEST_TRANSFORM_STATE + 1];
+     struct wined3d_vec4 clip_planes[WINED3D_MAX_CLIP_DISTANCES];
+-    struct wined3d_material material;
+     struct wined3d_viewport viewports[WINED3D_MAX_VIEWPORTS];
+     unsigned int viewport_count;
+     RECT scissor_rects[WINED3D_MAX_VIEWPORTS];
+@@ -3702,8 +3701,6 @@ void wined3d_device_context_emit_set_lig
+         const struct wined3d_light_info *light);
+ void wined3d_device_context_emit_set_light_enable(struct wined3d_device_context *context, unsigned int idx,
+         BOOL enable);
+-void wined3d_device_context_emit_set_material(struct wined3d_device_context *context,
+-        const struct wined3d_material *material);
+ void wined3d_device_context_emit_set_predication(struct wined3d_device_context *context,
+         struct wined3d_query *predicate, BOOL value);
+ void wined3d_device_context_emit_set_rasterizer_state(struct wined3d_device_context *context,
+@@ -4326,7 +4323,7 @@ static inline void shader_get_position_f
+     float center_offset, x = 0.0f, y = 0.0f;
+     unsigned int i;
+ 
+-    /* See get_projection_matrix() in utils.c for a discussion of the position fixup.
++    /* See get_projection_matrix() in glsl_shader.c for a discussion of the position fixup.
+      * This function here also applies to d3d10+ which does not need adjustment for
+      * integer pixel centers, but it may need the filling convention offset. */
+     if (context->d3d_info->wined3d_creation_flags & WINED3D_PIXEL_CENTER_INTEGER)
+@@ -4379,10 +4376,7 @@ static inline BOOL shader_sampler_is_sha
+ }
+ 
+ void get_identity_matrix(struct wined3d_matrix *mat);
+-void get_modelview_matrix(const struct wined3d_context *context, const struct wined3d_state *state,
+-        unsigned int index, struct wined3d_matrix *mat);
+-void get_projection_matrix(const struct wined3d_context *context, const struct wined3d_state *state,
+-        struct wined3d_matrix *mat);
++void get_modelview_matrix(const struct wined3d_stateblock_state *state, unsigned int index, struct wined3d_matrix *mat);
+ void get_texture_matrix(const struct wined3d_stream_info *si,
+         const struct wined3d_stateblock_state *state, const unsigned int tex, struct wined3d_matrix *mat);
+ void get_pointsize_minmax(const struct wined3d_context *context, const struct wined3d_state *state,
+diff -uNarp a/include/gdipluscolormatrix.h b/include/gdipluscolormatrix.h
+--- a/include/gdipluscolormatrix.h	2024-07-28 16:02:13.000000000 -0400
++++ b/include/gdipluscolormatrix.h	2025-11-19 17:54:35.807206101 -0500
+@@ -62,6 +62,7 @@ enum HistogramFormat
+ 
+ #ifndef __cplusplus
+ 
++typedef BYTE ColorChannelLUT[256];
+ typedef enum ColorAdjustType ColorAdjustType;
+ typedef enum ColorMatrixFlags ColorMatrixFlags;
+ typedef enum HistogramFormat HistogramFormat;
+diff -uNarp a/include/gdipluseffects.h b/include/gdipluseffects.h
+--- a/include/gdipluseffects.h	2024-07-28 16:02:13.000000000 -0400
++++ b/include/gdipluseffects.h	2025-11-19 17:54:35.807239101 -0500
+@@ -31,6 +31,92 @@ DEFINE_GUID(ColorBalanceEffectGuid,
+ DEFINE_GUID(RedEyeCorrectionEffectGuid,       0x74d29d05, 0x69a4, 0x4266, 0x95, 0x49, 0x3c, 0xc5, 0x28, 0x36, 0xb6, 0x32);
+ DEFINE_GUID(ColorCurveEffectGuid,             0xdd6a0022, 0x58e4, 0x4a67, 0x9d, 0x9b, 0xd4, 0x8e, 0xb8, 0x81, 0xa5, 0x3d);
+ 
++struct BlurParams
++{
++    float radius;
++    BOOL expandEdge;
++};
++
++struct SharpenParams
++{
++    float radius;
++    float amount;
++};
++
++struct TintParams
++{
++    INT hue;
++    INT amount;
++};
++
++struct RedEyeCorrectionParams
++{
++    UINT numberOfAreas;
++    RECT *areas;
++};
++
++struct ColorLUTParams
++{
++   ColorChannelLUT lutB;
++   ColorChannelLUT lutG;
++   ColorChannelLUT lutR;
++   ColorChannelLUT lutA;
++};
++
++struct BrightnessContrastParams
++{
++    INT brightnessLevel;
++    INT contrastLevel;
++};
++
++struct HueSaturationLightnessParams
++{
++    INT hueLevel;
++    INT saturationLevel;
++    INT lightnessLevel;
++};
++
++struct ColorBalanceParams
++{
++    INT cyanRed;
++    INT magentaGreen;
++    INT yellowBlue;
++};
++
++struct LevelsParams
++{
++    INT highlight;
++    INT midtone;
++    INT shadow;
++};
++
++enum CurveAdjustments
++{
++   AdjustExposure,
++   AdjustDensity,
++   AdjustContrast,
++   AdjustHighlight,
++   AdjustShadow,
++   AdjustMidtone,
++   AdjustWhiteSaturation,
++   AdjustBlackSaturation
++};
++
++enum CurveChannel
++{
++    CurveChannelAll,
++    CurveChannelRed,
++    CurveChannelGreen,
++    CurveChannelBlue
++};
++
++struct ColorCurveParams
++{
++    enum CurveAdjustments adjustment;
++    enum CurveChannel channel;
++    INT adjustValue;
++};
++
+ #ifdef __cplusplus
+ extern "C" {
+ #endif
+diff -uNarp a/include/gdiplusgpstubs.h b/include/gdiplusgpstubs.h
+--- a/include/gdiplusgpstubs.h	2024-07-28 16:02:13.000000000 -0400
++++ b/include/gdiplusgpstubs.h	2025-11-19 17:54:35.807293752 -0500
+@@ -21,6 +21,28 @@
+ 
+ #ifdef __cplusplus
+ 
++class Bitmap;
++class Brush;
++class CachedBitmap;
++class Font;
++class FontCollection;
++class FontFamily;
++class Graphics;
++class GraphicsPath;
++class HatchBrush;
++class Image;
++class ImageAttributes;
++class InstalledFontCollection;
++class LinearGradientBrush;
++class Matrix;
++class Metafile;
++class PathGradientBrush;
++class PathIterator;
++class Pen;
++class Region;
++class SolidBrush;
++class TextureBrush;
++
+ class GpGraphics {};
+ class GpPen {};
+ class GpBrush {};
+diff -uNarp a/include/gdipluspixelformats.h b/include/gdipluspixelformats.h
+--- a/include/gdipluspixelformats.h	2024-07-28 16:02:13.000000000 -0400
++++ b/include/gdipluspixelformats.h	2025-11-19 17:54:35.807266012 -0500
+@@ -22,6 +22,12 @@
+ typedef DWORD ARGB;
+ typedef INT PixelFormat;
+ 
++#define ALPHA_SHIFT 24
++#define RED_SHIFT   16
++#define GREEN_SHIFT 8
++#define BLUE_SHIFT  0
++#define ALPHA_MASK  ((ARGB) 0xff << ALPHA_SHIFT)
++
+ #define    PixelFormatIndexed   0x00010000
+ #define    PixelFormatGDI       0x00020000
+ #define    PixelFormatAlpha     0x00040000
+diff -uNarp a/include/wine/asm.h b/include/wine/asm.h
+--- a/include/wine/asm.h	2024-07-28 16:02:13.000000000 -0400
++++ b/include/wine/asm.h	2025-11-19 17:54:35.807328753 -0500
+@@ -245,9 +245,9 @@
+                        ".byte 0x75,0x03\n\t"      /* jne 1f */ \
+                        ".byte 0x0f,0x05\n\t"      /* syscall */ \
+                        ".byte 0xc3\n\t"           /* ret */ \
+-                       "jmp 1f\n\t" \
+-                       ".byte 0xc3\n"             /* ret */ \
+-                       "1:\t.byte 0xff,0x14,0x25\n\t" /* 1: callq *(0x7ffe1000) */ \
++                       ".byte 0xeb,0x01\n\t"      /* jmp 1f */ \
++                       ".byte 0xc3\n\t"           /* ret */ \
++                       ".byte 0xff,0x14,0x25\n\t" /* 1: callq *(0x7ffe1000) */ \
+                        ".long 0x7ffe1000\n\t" \
+                        "ret" )
+ # else
+@@ -260,10 +260,10 @@
+                        ".byte 0x75,0x03\n\t"      /* jne 1f */ \
+                        ".byte 0x0f,0x05\n\t"      /* syscall */ \
+                        ".byte 0xc3\n\t"           /* ret */ \
+-                       "jmp 1f\n\t" \
++                       ".byte 0xeb,0x02\n\t"      /* jmp 1f */ \
+                        ".byte 0xc3\n"             /* ret */ \
+-                       "nop\n" \
+-                       "1:\tcallq *" __ASM_NAME("__wine_syscall_dispatcher") "(%rip)\n\t" \
++                       "nop\n\t" \
++                       "callq *" __ASM_NAME("__wine_syscall_dispatcher") "(%rip)\n\t" /* 1: callq __wine_syscall_dispatcher */ \
+                        "ret" )
+ # endif
+ #elif defined __arm__
+diff -uNarp a/loader/main.c b/loader/main.c
+--- a/loader/main.c	2024-07-28 16:02:13.000000000 -0400
++++ b/loader/main.c	2025-11-19 17:54:35.807693440 -0500
+@@ -37,8 +37,6 @@
+ 
+ #include "main.h"
+ 
+-extern char **environ;
+-
+ #if defined(__APPLE__) && defined(__x86_64__) && !defined(HAVE_WINE_PRELOADER)
+ 
+ /* Not using the preloader on x86_64:
+@@ -260,8 +258,8 @@ int main( int argc, char *argv[] )
+ 
+     if ((handle = load_ntdll( argv[0] )))
+     {
+-        void (*init_func)(int, char **, char **) = dlsym( handle, "__wine_main" );
+-        if (init_func) init_func( argc, argv, environ );
++        void (*init_func)(int, char **) = dlsym( handle, "__wine_main" );
++        if (init_func) init_func( argc, argv );
+         fprintf( stderr, "wine: __wine_main function not found in ntdll.so\n" );
+         exit(1);
+     }
+-- 
+2.47.1
+

@@ -1,0 +1,167 @@
+
+From 8d61f4c37350575f06d073b4fa999e6200be11d6 Mon Sep 17 00:00:00 2001
+From: James McDonnell <topgamer7@xxxxxxxxxx>
+Date: Mon, 21 Nov 2022 21:26:19 -0800
+Subject: [PATCH] wintypes: Hack in some calls to RoResolveNamespace
+
+---
+ dlls/wintypes/main.c | 139 +++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 139 insertions(+)
+
+diff --git a/dlls/wintypes/main.c b/dlls/wintypes/main.c
+index 287e5992225..4eb7f3d526e 100644
+--- a/dlls/wintypes/main.c
++++ b/dlls/wintypes/main.c
+@@ -379,10 +379,149 @@ HRESULT WINAPI RoResolveNamespace(HSTRING name, HSTRING windowsMetaDataDir,
+                                   DWORD *metaDataFilePathsCount, HSTRING **metaDataFilePaths,
+                                   DWORD *subNamespacesCount, HSTRING **subNamespaces)
+ {
++    //https://learn.microsoft.com/en-us/windows/win32/api/rometadataresolution/nf-rometadataresolution-roresolvenamespace
++    //name L"Windows.Services.Store", windowsMetaDataDir L"", metaDataFilePaths 0000000000419088, subNamespaces 0000000000000000 stub!
++    const WCHAR *buffer = WindowsGetStringRawBuffer( name, NULL );
++    HSTRING *str = malloc(sizeof(HSTRING));
++    // const WCHAR *path = L"C:\\Windows\\system32\\WinMetadata\\Windows.Services.winmd";
++    const WCHAR *path;
+     FIXME("name %s, windowsMetaDataDir %s, metaDataFilePaths %p, subNamespaces %p stub!\n",
+             debugstr_hstring(name), debugstr_hstring(windowsMetaDataDir),
+             metaDataFilePaths, subNamespaces);
+ 
++    if(wcsstr(buffer, L"Windows.Storage") > 0){
++        FIXME("Found Windows.Storage \n");
++        path = L"C:\\windows\\system32\\WinMetadata\\Windows.winmd";
++        if(WindowsCreateString(path, wcslen(path), str) == S_OK) {
++            FIXME("Setting vars\n");
++            *metaDataFilePaths = str;
++            *metaDataFilePathsCount = 1;
++            FIXME("Done setting\n");
++        } else {
++            FIXME("OUT OF MEMORY");
++            return E_OUTOFMEMORY;
++        }
++        // *subNamespacesCount = 0;
++        // WindowsCreateString(L"StoreContract", wcslen(L"StoreContract"), str2);
++        // *subNamespaces = str2;
++        FIXME("S_OK\n");
++        return S_OK;
++    }
++
++    if(wcsstr(buffer, L"Windows.Management.Deployment") > 0){
++        FIXME("Found Windows.Management.Deployment \n");
++        path = L"C:\\windows\\system32\\WinMetadata\\Windows.winmd";
++        if(WindowsCreateString(path, wcslen(path), str) == S_OK) {
++            FIXME("Setting vars\n");
++            *metaDataFilePaths = str;
++            *metaDataFilePathsCount = 1;
++            FIXME("Done setting\n");
++        } else {
++            FIXME("OUT OF MEMORY");
++            return E_OUTOFMEMORY;
++        }
++        // *subNamespacesCount = 0;
++        // WindowsCreateString(L"StoreContract", wcslen(L"StoreContract"), str2);
++        // *subNamespaces = str2;
++        FIXME("S_OK\n");
++        return S_OK;
++    }
++
++    if(wcsstr(buffer, L"Windows.ApplicationModel.DesignMode") > 0){
++        FIXME("Found Windows.ApplicationModel.DesignMode \n");
++        path = L"C:\\windows\\system32\\WinMetadata\\Windows.winmd";
++        if(WindowsCreateString(path, wcslen(path), str) == S_OK) {
++            FIXME("Setting vars\n");
++            *metaDataFilePaths = str;
++            *metaDataFilePathsCount = 1;
++            FIXME("Done setting\n");
++        } else {
++            FIXME("OUT OF MEMORY");
++            return E_OUTOFMEMORY;
++        }
++        // *subNamespacesCount = 0;
++        // WindowsCreateString(L"StoreContract", wcslen(L"StoreContract"), str2);
++        // *subNamespaces = str2;
++        FIXME("S_OK\n");
++        return S_OK;
++    }
++
++    if(wcsstr(buffer, L"Windows.ApplicationModel") > 0){
++        FIXME("Found Windows.ApplicationModel \n");
++        path = L"C:\\windows\\system32\\WinMetadata\\Windows.winmd";
++        if(WindowsCreateString(path, wcslen(path), str) == S_OK) {
++            FIXME("Setting vars\n");
++            *metaDataFilePaths = str;
++            *metaDataFilePathsCount = 1;
++            FIXME("Done setting\n");
++        } else {
++            FIXME("OUT OF MEMORY");
++            return E_OUTOFMEMORY;
++        }
++        // *subNamespacesCount = 0;
++        // WindowsCreateString(L"StoreContract", wcslen(L"StoreContract"), str2);
++        // *subNamespaces = str2;
++        FIXME("S_OK\n");
++        return S_OK;
++    }
++
++    if(wcsstr(buffer, L"Windows.Services.Store") > 0){
++        FIXME("Found Windows.Services.Store \n");
++        path = L"C:\\windows\\system32\\WinMetadata\\Windows.winmd";
++        if(WindowsCreateString(path, wcslen(path), str) == S_OK) {
++            FIXME("Setting vars\n");
++            *metaDataFilePaths = str;
++            *metaDataFilePathsCount = 1;
++            FIXME("Done setting\n");
++        } else {
++            FIXME("OUT OF MEMORY");
++            return E_OUTOFMEMORY;
++        }
++        // *subNamespacesCount = 0;
++        // WindowsCreateString(L"StoreContract", wcslen(L"StoreContract"), str2);
++        // *subNamespaces = str2;
++        FIXME("S_OK\n");
++        return S_OK;
++    }
++
++    if(wcsstr(buffer, L"Windows.Foundation") > 0){
++        FIXME("Found Windows.Foundation \n");
++        path = L"C:\\windows\\system32\\WinMetadata\\Windows.winmd";
++        if(WindowsCreateString(path, wcslen(path), str) == S_OK) {
++            FIXME("Setting vars\n");
++            *metaDataFilePaths = str;
++            *metaDataFilePathsCount = 1;
++            FIXME("Done setting\n");
++        } else {
++            FIXME("OUT OF MEMORY");
++            return E_OUTOFMEMORY;
++        }
++        // *subNamespacesCount = 0;
++        // WindowsCreateString(L"StoreContract", wcslen(L"StoreContract"), str2);
++        // *subNamespaces = str2;
++        FIXME("S_OK\n");
++        return S_OK;
++    }
++
++    if(wcsstr(buffer, L"System.Runtime.WindowsRuntime") > 0){
++        FIXME("Found System.Runtime.WindowsRuntime \n");
++        path = L"C:\\windows\\system32\\WinMetadata\\Windows.winmd";
++        if(WindowsCreateString(path, wcslen(path), str) == S_OK) {
++            FIXME("Setting vars\n");
++            *metaDataFilePaths = str;
++            *metaDataFilePathsCount = 1;
++            FIXME("Done setting\n");
++        } else {
++            FIXME("OUT OF MEMORY");
++            return E_OUTOFMEMORY;
++        }
++        // *subNamespacesCount = 0;
++        // WindowsCreateString(L"StoreContract", wcslen(L"StoreContract"), str2);
++        // *subNamespaces = str2;
++        FIXME("S_OK\n");
++        return S_OK;
++    }
++
+     if (!metaDataFilePaths && !subNamespaces)
+         return E_INVALIDARG;
+ 
+-- 
+GitLab
+

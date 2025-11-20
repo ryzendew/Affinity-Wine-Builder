@@ -1,0 +1,960 @@
+
+ElementalWarrior wine patch series
+https://gitlab.winehq.org/ElementalWarrior/wine/-/commits/affinity-photo3-wine9.13-part3
+
+winewayland: Store visible_rect in wayland_win_data (8ee0e0ae)
+winewayland: Create subsurfaces for child windows (c685252e)
+winewayland: Handle subsurface reconfiguration (b986e08d)
+winewayland: Use weak references for parent wayland_surfaces (308a3bd7)
+winewayland: Support Wayland surface role changes (bb6c7c6e)
+winewayland: Ensure parent surface contents for accelerated windows (a90e7463)
+winewayland: Create Wayland surfaces for child windows on demand (99313d55)
+winewayland: Improve integration of GDI rendering with accelerated content (9a93b5b1)
+winewayland: Post WM_WAYLAND_CONFIGURE outside of the surface lock (148655be)
+winewayland: Use WL_SHM_FORMAT_ARGB8888 format for window surfaces (92007b13)
+winewayland: Implement window surface shape and color keying (5f1431ce)
+
+
+diff -uarp a/dlls/winewayland.drv/opengl.c b/dlls/winewayland.drv/opengl.c
+--- a/dlls/winewayland.drv/opengl.c	2024-07-28 16:02:13.000000000 -0400
++++ b/dlls/winewayland.drv/opengl.c	2025-11-17 18:01:23.380565171 -0500
+@@ -165,7 +165,7 @@ static struct wayland_gl_drawable *wayla
+     /* Get the client surface for the HWND. If don't have a wayland surface
+      * (e.g., HWND_MESSAGE windows) just create a dummy surface to act as the
+      * target render surface. */
+-    if ((wayland_surface = wayland_surface_lock_hwnd(hwnd)))
++    if ((wayland_surface = wayland_surface_lock_accel_hwnd(hwnd)))
+     {
+         gl->client = wayland_surface_get_client(wayland_surface);
+         client_width = wayland_surface->window.client_rect.right -
+@@ -267,21 +267,25 @@ static void wayland_gl_drawable_sync_siz
+ static void wayland_gl_drawable_sync_surface_state(struct wayland_gl_drawable *gl)
+ {
+     struct wayland_surface *wayland_surface;
++    HWND hwnd = gl->hwnd;
+ 
+-    if (!(wayland_surface = wayland_surface_lock_hwnd(gl->hwnd))) return;
++    while (hwnd && (wayland_surface = wayland_surface_lock_hwnd(hwnd)))
++    {
++        wayland_surface_ensure_contents(wayland_surface);
+ 
+-    wayland_surface_ensure_contents(wayland_surface);
++        /* Handle any processed configure request, to ensure the related
++         * surface state is applied by the compositor. */
++        if (wayland_surface->processing.serial &&
++            wayland_surface->processing.processed &&
++            wayland_surface_reconfigure(wayland_surface))
++        {
++            wl_surface_commit(wayland_surface->wl_surface);
++        }
+ 
+-    /* Handle any processed configure request, to ensure the related
+-     * surface state is applied by the compositor. */
+-    if (wayland_surface->processing.serial &&
+-        wayland_surface->processing.processed &&
+-        wayland_surface_reconfigure(wayland_surface))
+-    {
+-        wl_surface_commit(wayland_surface->wl_surface);
++        hwnd = wayland_surface->parent_weak_ref ?
++               wayland_surface->parent_weak_ref->hwnd : 0;
++        pthread_mutex_unlock(&wayland_surface->mutex);
+     }
+-
+-    pthread_mutex_unlock(&wayland_surface->mutex);
+ }
+ 
+ static BOOL wgl_context_make_current(struct wgl_context *ctx, HWND draw_hwnd,
+diff -uarp a/dlls/winewayland.drv/vulkan.c b/dlls/winewayland.drv/vulkan.c
+--- a/dlls/winewayland.drv/vulkan.c	2025-11-17 17:56:20.308325524 -0500
++++ b/dlls/winewayland.drv/vulkan.c	2025-11-17 18:01:23.380644863 -0500
+@@ -85,7 +85,7 @@ static VkResult wayland_vulkan_surface_c
+ 
+     TRACE("%p %p %p %p\n", hwnd, instance, surface, private);
+ 
+-    wayland_surface = wayland_surface_lock_hwnd(hwnd);
++    wayland_surface = wayland_surface_lock_accel_hwnd(hwnd);
+     if (!wayland_surface)
+     {
+         ERR("Failed to find wayland surface for hwnd=%p\n", hwnd);
+@@ -144,7 +144,7 @@ static void wayland_vulkan_surface_prese
+ {
+     struct wayland_surface *wayland_surface;
+ 
+-    if ((wayland_surface = wayland_surface_lock_hwnd(hwnd)))
++    while (hwnd && (wayland_surface = wayland_surface_lock_hwnd(hwnd)))
+     {
+         wayland_surface_ensure_contents(wayland_surface);
+ 
+@@ -157,6 +157,8 @@ static void wayland_vulkan_surface_prese
+             wl_surface_commit(wayland_surface->wl_surface);
+         }
+ 
++        hwnd = wayland_surface->parent_weak_ref ?
++               wayland_surface->parent_weak_ref->hwnd : 0;
+         pthread_mutex_unlock(&wayland_surface->mutex);
+     }
+ }
+diff -uarp a/dlls/winewayland.drv/waylanddrv.h b/dlls/winewayland.drv/waylanddrv.h
+--- a/dlls/winewayland.drv/waylanddrv.h	2024-07-28 16:02:13.000000000 -0400
++++ b/dlls/winewayland.drv/waylanddrv.h	2025-11-17 18:01:23.380689024 -0500
+@@ -73,6 +73,13 @@ enum wayland_surface_config_state
+     WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN = (1 << 3)
+ };
+ 
++enum wayland_surface_role
++{
++    WAYLAND_SURFACE_ROLE_NONE,
++    WAYLAND_SURFACE_ROLE_TOPLEVEL,
++    WAYLAND_SURFACE_ROLE_SUBSURFACE,
++};
++
+ struct wayland_keyboard
+ {
+     struct wl_keyboard *wl_keyboard;
+@@ -195,6 +202,7 @@ struct wayland_surface
+     struct wl_surface *wl_surface;
+     struct xdg_surface *xdg_surface;
+     struct xdg_toplevel *xdg_toplevel;
++    struct wl_subsurface *wl_subsurface;
+     struct wp_viewport *wp_viewport;
+     pthread_mutex_t mutex;
+     struct wayland_surface_config pending, requested, processing, current;
+@@ -204,6 +212,10 @@ struct wayland_surface
+     struct wayland_client_surface *client;
+     int buffer_width, buffer_height;
+     HCURSOR hcursor;
++    enum wayland_surface_role role;
++    LONG weak_ref;
++    BOOL destroyed;
++    struct wayland_surface *parent_weak_ref;
+ };
+ 
+ struct wayland_shm_buffer
+@@ -237,13 +249,19 @@ void wayland_output_use_xdg_extension(st
+  */
+ 
+ struct wayland_surface *wayland_surface_create(HWND hwnd);
++struct wayland_surface *wayland_surface_get_weak_ref(struct wayland_surface *surface);
++void wayland_surface_release_weak_ref(struct wayland_surface *surface);
++struct wayland_surface *wayland_surface_lock_weak_ref(struct wayland_surface *surface);
+ void wayland_surface_destroy(struct wayland_surface *surface);
+ void wayland_surface_make_toplevel(struct wayland_surface *surface);
++void wayland_surface_make_subsurface(struct wayland_surface *surface,
++                                     struct wayland_surface *parent);
+ void wayland_surface_clear_role(struct wayland_surface *surface);
+ void wayland_surface_attach_shm(struct wayland_surface *surface,
+                                 struct wayland_shm_buffer *shm_buffer,
+                                 HRGN surface_damage_region);
+ struct wayland_surface *wayland_surface_lock_hwnd(HWND hwnd);
++struct wayland_surface *wayland_surface_lock_accel_hwnd(HWND hwnd);
+ BOOL wayland_surface_reconfigure(struct wayland_surface *surface);
+ BOOL wayland_surface_config_is_compatible(struct wayland_surface_config *conf,
+                                           int width, int height,
+@@ -256,6 +274,8 @@ void wayland_surface_coords_to_window(st
+                                       int *window_x, int *window_y);
+ struct wayland_client_surface *wayland_surface_get_client(struct wayland_surface *surface);
+ BOOL wayland_client_surface_release(struct wayland_client_surface *client);
++void wayland_surface_attach_client(struct wayland_surface *surface,
++                                   struct wayland_client_surface *client);
+ void wayland_surface_ensure_contents(struct wayland_surface *surface);
+ void wayland_surface_set_title(struct wayland_surface *surface, LPCWSTR title);
+ 
+@@ -294,6 +314,7 @@ struct wayland_win_data
+     RECT window_rect;
+     /* USER client rectangle relative to win32 parent window client area */
+     RECT client_rect;
++    RECT visible_rect;
+     BOOL managed;
+ };
+ 
+diff -uarp a/dlls/winewayland.drv/wayland_surface.c b/dlls/winewayland.drv/wayland_surface.c
+--- a/dlls/winewayland.drv/wayland_surface.c	2024-07-28 16:02:13.000000000 -0400
++++ b/dlls/winewayland.drv/wayland_surface.c	2025-11-17 18:01:29.546957036 -0500
+@@ -38,7 +38,7 @@ static void xdg_surface_handle_configure
+                                          uint32_t serial)
+ {
+     struct wayland_surface *surface;
+-    BOOL initial_configure = FALSE;
++    BOOL should_post = FALSE, initial_configure = FALSE;
+     HWND hwnd = data;
+ 
+     TRACE("serial=%u\n", serial);
+@@ -52,16 +52,17 @@ static void xdg_surface_handle_configure
+         /* If we have a previously requested config, we have already sent a
+          * WM_WAYLAND_CONFIGURE which hasn't been handled yet. In that case,
+          * avoid sending another message to reduce message queue traffic. */
+-        BOOL should_post = surface->requested.serial == 0;
++        should_post = surface->requested.serial == 0;
+         initial_configure = surface->current.serial == 0;
+         surface->pending.serial = serial;
+         surface->requested = surface->pending;
+         memset(&surface->pending, 0, sizeof(surface->pending));
+-        if (should_post) NtUserPostMessage(hwnd, WM_WAYLAND_CONFIGURE, 0, 0);
+     }
+ 
+     pthread_mutex_unlock(&surface->mutex);
+ 
++    if (should_post) NtUserPostMessage(hwnd, WM_WAYLAND_CONFIGURE, 0, 0);
++
+     /* Flush the window surface in case there is content that we weren't
+      * able to flush before due to the lack of the initial configure. */
+     if (initial_configure) wayland_window_flush(hwnd);
+@@ -168,6 +169,7 @@ struct wayland_surface *wayland_surface_
+     }
+ 
+     surface->window.scale = 1.0;
++    surface->weak_ref = 1;
+ 
+     return surface;
+ 
+@@ -177,6 +179,43 @@ err:
+ }
+ 
+ /**********************************************************************
++ *          wayland_surface_get_weak_ref
++ *
++ * Gets a weak reference to a wayland_surface.
++ */
++struct wayland_surface *wayland_surface_get_weak_ref(struct wayland_surface *surface)
++{
++    InterlockedIncrement(&surface->weak_ref);
++    return surface;
++}
++
++/**********************************************************************
++ *          wayland_surface_get_weak_ref
++ *
++ * Releases a weak reference to a wayland_surface.
++ */
++void wayland_surface_release_weak_ref(struct wayland_surface *surface)
++{
++    if (InterlockedDecrement(&surface->weak_ref) > 0) return;
++    pthread_mutex_destroy(&surface->mutex);
++    free(surface);
++}
++
++/**********************************************************************
++ *          wayland_surface_lock_weak_ref
++ *
++ * Returns a locked wayland_surface from a weak reference, or NULL if the
++ * surface has been destroyed.
++ */
++struct wayland_surface *wayland_surface_lock_weak_ref(struct wayland_surface *surface)
++{
++    pthread_mutex_lock(&surface->mutex);
++    if (!surface->destroyed) return surface;
++    pthread_mutex_unlock(&surface->mutex);
++    return NULL;
++}
++
++/**********************************************************************
+  *          wayland_surface_destroy
+  *
+  * Destroys a wayland surface.
+@@ -218,6 +257,12 @@ void wayland_surface_destroy(struct wayl
+         surface->xdg_surface = NULL;
+     }
+ 
++    if (surface->wl_subsurface)
++    {
++        wl_subsurface_destroy(surface->wl_subsurface);
++        surface->wl_subsurface = NULL;
++    }
++
+     if (surface->wl_surface)
+     {
+         wl_surface_destroy(surface->wl_surface);
+@@ -231,9 +276,7 @@ void wayland_surface_destroy(struct wayl
+ 
+     wl_display_flush(process_wayland.wl_display);
+ 
+-    pthread_mutex_destroy(&surface->mutex);
+-
+-    free(surface);
++    wayland_surface_release_weak_ref(surface);
+ }
+ 
+ /**********************************************************************
+@@ -253,6 +296,7 @@ void wayland_surface_make_toplevel(struc
+     surface->xdg_toplevel = xdg_surface_get_toplevel(surface->xdg_surface);
+     if (!surface->xdg_toplevel) goto err;
+     xdg_toplevel_add_listener(surface->xdg_toplevel, &xdg_toplevel_listener, surface->hwnd);
++    surface->role = WAYLAND_SURFACE_ROLE_TOPLEVEL;
+ 
+     if (process_name)
+         xdg_toplevel_set_app_id(surface->xdg_toplevel, process_name);
+@@ -268,6 +312,53 @@ err:
+ }
+ 
+ /**********************************************************************
++ *          wayland_surface_make_subsurface
++ *
++ * Gives the subsurface role to a plain wayland surface.
++ */
++void wayland_surface_make_subsurface(struct wayland_surface *surface,
++                                     struct wayland_surface *parent)
++{
++    struct wl_region *empty_region;
++
++    TRACE("surface=%p parent=%p\n", surface, parent);
++
++    surface->wl_subsurface =
++        wl_subcompositor_get_subsurface(process_wayland.wl_subcompositor,
++                                        surface->wl_surface,
++                                        parent->wl_surface);
++    if (!surface->wl_subsurface)
++    {
++        ERR("Failed to create client wl_subsurface\n");
++        goto err;
++    }
++
++    surface->role = WAYLAND_SURFACE_ROLE_SUBSURFACE;
++    surface->parent_weak_ref = wayland_surface_get_weak_ref(parent);
++
++    /* Let parent handle all pointer events. */
++    empty_region = wl_compositor_create_region(process_wayland.wl_compositor);
++    if (!empty_region)
++    {
++        ERR("Failed to create wl_region\n");
++        goto err;
++    }
++    wl_surface_set_input_region(surface->wl_surface, empty_region);
++    wl_region_destroy(empty_region);
++
++    /* Present contents independently of the parent surface. */
++    wl_subsurface_set_desync(surface->wl_subsurface);
++
++    wl_display_flush(process_wayland.wl_display);
++
++    return;
++
++err:
++    wayland_surface_clear_role(surface);
++    ERR("Failed to assign subsurface role to wayland surface\n");
++}
++
++/**********************************************************************
+  *          wayland_surface_clear_role
+  *
+  * Clears the role related Wayland objects of a Wayland surface, making it a
+@@ -290,6 +381,18 @@ void wayland_surface_clear_role(struct w
+         surface->xdg_surface = NULL;
+     }
+ 
++    if (surface->wl_subsurface)
++    {
++        wl_subsurface_destroy(surface->wl_subsurface);
++        surface->wl_subsurface = NULL;
++    }
++
++    if (surface->parent_weak_ref)
++    {
++        wayland_surface_release_weak_ref(surface->parent_weak_ref);
++        surface->parent_weak_ref = NULL;
++    }
++
+     memset(&surface->pending, 0, sizeof(surface->pending));
+     memset(&surface->requested, 0, sizeof(surface->requested));
+     memset(&surface->processing, 0, sizeof(surface->processing));
+@@ -507,6 +610,7 @@ static void wayland_surface_reconfigure_
+     TRACE("hwnd=%p subsurface=%d,%d+%dx%d\n", surface->hwnd, x, y, width, height);
+ 
+     wl_subsurface_set_position(surface->client->wl_subsurface, x, y);
++    wl_subsurface_place_above(surface->client->wl_subsurface, surface->wl_surface);
+ 
+     if (surface->client->wp_viewport)
+     {
+@@ -528,29 +632,15 @@ static void wayland_surface_reconfigure_
+ }
+ 
+ /**********************************************************************
+- *          wayland_surface_reconfigure
++ *          wayland_surface_reconfigure_xdg
+  *
+- * Reconfigures the wayland surface as needed to match the latest requested
++ * Reconfigures the xdg surface as needed to match the latest requested
+  * state.
+  */
+-BOOL wayland_surface_reconfigure(struct wayland_surface *surface)
++static BOOL wayland_surface_reconfigure_xdg(struct wayland_surface *surface,
++                                            int width, int height)
+ {
+     struct wayland_window_config *window = &surface->window;
+-    int win_width, win_height, width, height;
+-
+-    if (!surface->xdg_toplevel) return TRUE;
+-
+-    win_width = surface->window.rect.right - surface->window.rect.left;
+-    win_height = surface->window.rect.bottom - surface->window.rect.top;
+-
+-    wayland_surface_coords_from_window(surface, win_width, win_height,
+-                                       &width, &height);
+-
+-    TRACE("hwnd=%p window=%dx%d,%#x processing=%dx%d,%#x current=%dx%d,%#x\n",
+-          surface->hwnd, win_width, win_height, window->state,
+-          surface->processing.width, surface->processing.height,
+-          surface->processing.state, surface->current.width,
+-          surface->current.height, surface->current.state);
+ 
+     /* Acknowledge any compatible processed config. */
+     if (surface->processing.serial && surface->processing.processed &&
+@@ -583,6 +673,79 @@ BOOL wayland_surface_reconfigure(struct
+     }
+ 
+     wayland_surface_reconfigure_geometry(surface, width, height);
++
++    return TRUE;
++}
++
++/**********************************************************************
++ *          wayland_surface_reconfigure_subsurface
++ *
++ * Reconfigures the subsurface as needed to match the latest requested
++ * state.
++ */
++static void wayland_surface_reconfigure_subsurface(struct wayland_surface *surface)
++{
++    struct wayland_surface *parent;
++    int local_x, local_y, x, y;
++
++    if (surface->processing.serial && surface->processing.processed &&
++        surface->parent_weak_ref &&
++        (parent = wayland_surface_lock_weak_ref(surface->parent_weak_ref)))
++    {
++        /* For now we use a subsurface only for child windows, whose window
++         * coordinates are relative to the client area of their parent. */
++        local_x = surface->window.rect.left +
++                  (parent->window.client_rect.left - parent->window.rect.left);
++        local_y = surface->window.rect.top +
++                  (parent->window.client_rect.top - parent->window.rect.top);
++        wayland_surface_coords_from_window(surface, local_x, local_y, &x, &y);
++
++        TRACE("hwnd=%p pos=%d,%d\n", surface->hwnd, x, y);
++
++        wl_subsurface_set_position(surface->wl_subsurface, x, y);
++        if (parent->client)
++            wl_subsurface_place_above(surface->wl_subsurface, parent->client->wl_surface);
++        else
++            wl_subsurface_place_above(surface->wl_subsurface, parent->wl_surface);
++        wl_surface_commit(parent->wl_surface);
++
++        pthread_mutex_unlock(&parent->mutex);
++
++        memset(&surface->processing, 0, sizeof(surface->processing));
++    }
++}
++
++/**********************************************************************
++ *          wayland_surface_reconfigure
++ *
++ * Reconfigures the wayland surface as needed to match the latest requested
++ * state.
++ */
++BOOL wayland_surface_reconfigure(struct wayland_surface *surface)
++{
++    int win_width, win_height, width, height;
++
++    win_width = surface->window.rect.right - surface->window.rect.left;
++    win_height = surface->window.rect.bottom - surface->window.rect.top;
++
++    wayland_surface_coords_from_window(surface, win_width, win_height,
++                                       &width, &height);
++
++    TRACE("hwnd=%p window=%dx%d,%#x processing=%dx%d,%#x current=%dx%d,%#x\n",
++          surface->hwnd, win_width, win_height, surface->window.state,
++          surface->processing.width, surface->processing.height,
++          surface->processing.state, surface->current.width,
++          surface->current.height, surface->current.state);
++
++    if (surface->xdg_toplevel)
++    {
++        if (!wayland_surface_reconfigure_xdg(surface, width, height)) return FALSE;
++    }
++    else if (surface->wl_subsurface)
++    {
++        wayland_surface_reconfigure_subsurface(surface);
++    }
++
+     wayland_surface_reconfigure_size(surface, width, height);
+     wayland_surface_reconfigure_client(surface);
+ 
+@@ -842,6 +1005,37 @@ err:
+     return NULL;
+ }
+ 
++/**********************************************************************
++ *          wayland_surface_attach_client
++ */
++void wayland_surface_attach_client(struct wayland_surface *surface,
++                                   struct wayland_client_surface *client)
++{
++    assert(!surface->client && client);
++
++    if (client->wl_subsurface) wl_subsurface_destroy(client->wl_subsurface);
++
++    /* Create a new subsurface that it is attached to the proper parent. */
++    client->wl_subsurface =
++        wl_subcompositor_get_subsurface(process_wayland.wl_subcompositor,
++                                        client->wl_surface,
++                                        surface->wl_surface);
++    if (!client->wl_subsurface)
++    {
++        ERR("Failed to create client wl_subsurface\n");
++        return;
++    }
++    /* Present contents independently of the parent surface. */
++    wl_subsurface_set_desync(client->wl_subsurface);
++
++    InterlockedIncrement(&client->ref);
++    surface->client = client;
++
++    wayland_surface_reconfigure_client(surface);
++    /* Commit to apply subsurface positioning. */
++    wl_surface_commit(surface->wl_surface);
++}
++
+ static void dummy_buffer_release(void *data, struct wl_buffer *buffer)
+ {
+     struct wayland_shm_buffer *shm_buffer = data;
+diff -uarp a/dlls/winewayland.drv/window.c b/dlls/winewayland.drv/window.c
+--- a/dlls/winewayland.drv/window.c	2024-07-28 16:02:13.000000000 -0400
++++ b/dlls/winewayland.drv/window.c	2025-11-17 18:01:25.250908677 -0500
+@@ -36,6 +36,9 @@
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(waylanddrv);
+ 
++#define UWS_FORCE_ROLE_UPDATE  0x01
++#define UWS_FORCE_CREATE       0x02
++#define UWS_NO_UPDATE_CHILDREN 0x04
+ 
+ /**********************************************************************
+  *       get_win_monitor_dpi
+@@ -78,7 +81,8 @@ static struct rb_tree win_data_rb = { wa
+  */
+ static struct wayland_win_data *wayland_win_data_create(HWND hwnd,
+                                                         const RECT *window_rect,
+-                                                        const RECT *client_rect)
++                                                        const RECT *client_rect,
++                                                        const RECT *visible_rect)
+ {
+     struct wayland_win_data *data;
+     struct rb_entry *rb_entry;
+@@ -94,6 +98,7 @@ static struct wayland_win_data *wayland_
+     data->hwnd = hwnd;
+     data->window_rect = *window_rect;
+     data->client_rect = *client_rect;
++    data->visible_rect = *visible_rect;
+ 
+     pthread_mutex_lock(&win_data_mutex);
+ 
+@@ -132,19 +137,32 @@ static void wayland_win_data_destroy(str
+ }
+ 
+ /***********************************************************************
+- *           wayland_win_data_get
++ *           wayland_win_data_get_nolock
+  *
+- * Lock and return the data structure associated with a window.
++ * Return the data structure associated with a window. This function does
++ * not lock the win_data_mutex, so it must be externally synchronized.
+  */
+-struct wayland_win_data *wayland_win_data_get(HWND hwnd)
++static struct wayland_win_data *wayland_win_data_get_nolock(HWND hwnd)
+ {
+     struct rb_entry *rb_entry;
+ 
+-    pthread_mutex_lock(&win_data_mutex);
+-
+     if ((rb_entry = rb_get(&win_data_rb, hwnd)))
+         return RB_ENTRY_VALUE(rb_entry, struct wayland_win_data, entry);
+ 
++    return NULL;
++}
++
++/***********************************************************************
++ *           wayland_win_data_get
++ *
++ * Lock and return the data structure associated with a window.
++ */
++struct wayland_win_data *wayland_win_data_get(HWND hwnd)
++{
++    struct wayland_win_data *data;
++
++    pthread_mutex_lock(&win_data_mutex);
++    if ((data = wayland_win_data_get_nolock(hwnd))) return data;
+     pthread_mutex_unlock(&win_data_mutex);
+ 
+     return NULL;
+@@ -200,41 +218,124 @@ static void reapply_cursor_clipping(void
+     NtUserSetThreadDpiAwarenessContext(context);
+ }
+ 
+-static void wayland_win_data_update_wayland_surface(struct wayland_win_data *data, const RECT *visible_rect)
++static struct wayland_win_data *wayland_win_data_get_top_parent(struct wayland_win_data *data)
++{
++    HWND desktop = NtUserGetDesktopWindow(), cur = data->hwnd, parent;
++
++    while ((parent = NtUserGetAncestor(cur, GA_PARENT)) && parent != desktop)
++        cur = parent;
++
++    /* Don't return ourselves */
++    return cur == data->hwnd ? NULL : wayland_win_data_get_nolock(cur);
++}
++
++static BOOL wayland_win_data_needs_wayland_surface(struct wayland_win_data *data,
++                                                   struct wayland_win_data *parent_data)
+ {
+-    struct wayland_surface *surface = data->wayland_surface;
+     HWND parent = NtUserGetAncestor(data->hwnd, GA_PARENT);
+-    BOOL visible, xdg_visible;
++
++    /* We want a Wayland surface for toplevel windows. */
++    if (!parent || parent == NtUserGetDesktopWindow()) return TRUE;
++
++    /* We want to keep the Wayland surface if we have a client area subsurface. */
++    if (data->wayland_surface)
++    {
++        BOOL has_client;
++        pthread_mutex_lock(&data->wayland_surface->mutex);
++        has_client = !!data->wayland_surface->client;
++        pthread_mutex_unlock(&data->wayland_surface->mutex);
++        if (has_client) return TRUE;
++    }
++
++    /* We want a Wayland surface if the parent has a client area subsurface
++     * which may obscure our contents (as a child window of that parent). */
++    if (parent_data->wayland_surface)
++    {
++        BOOL parent_has_client;
++        pthread_mutex_lock(&parent_data->wayland_surface->mutex);
++        parent_has_client = !!parent_data->wayland_surface->client;
++        pthread_mutex_unlock(&parent_data->wayland_surface->mutex);
++        if (parent_has_client) return TRUE;
++    }
++
++    return FALSE;
++}
++
++static void wayland_win_data_update_wayland_state(struct wayland_win_data *data);
++
++static void wayland_win_data_update_wayland_surface(struct wayland_win_data *data, UINT flags)
++{
++    struct wayland_surface *surface = data->wayland_surface;
++    struct wayland_win_data *parent_data, *wwd;
++    enum wayland_surface_role role;
++    BOOL surface_changed = FALSE;
++    struct wayland_client_surface *client = NULL;
+     WCHAR text[1024];
+ 
+-    TRACE("hwnd=%p, rect=%s\n", data->hwnd, wine_dbgstr_rect(visible_rect));
++    TRACE("hwnd=%p flags=0x%x\n", data->hwnd, flags);
++
++    /* We anchor child windows to their toplevel parent window. */
++    parent_data = wayland_win_data_get_top_parent(data);
++
++    /* Destroy unused surfaces of child windows. */
++    if (!wayland_win_data_needs_wayland_surface(data, parent_data) &&
++        !(flags & UWS_FORCE_CREATE))
++    {
++        if (surface)
++        {
++            if (data->window_surface)
++                wayland_window_surface_update_wayland_surface(data->window_surface, NULL, NULL);
++            wayland_surface_destroy(surface);
++            surface = NULL;
++            surface_changed = TRUE;
++        }
++        goto out;
++    }
+ 
+-    /* We don't want wayland surfaces for child windows. */
+-    if (parent != NtUserGetDesktopWindow() && parent != 0)
++    if (NtUserIsWindowVisible(data->hwnd))
++    {
++        if (parent_data && parent_data->wayland_surface)
++            role = WAYLAND_SURFACE_ROLE_SUBSURFACE;
++        else
++            role = WAYLAND_SURFACE_ROLE_TOPLEVEL;
++    }
++    else
++        role = WAYLAND_SURFACE_ROLE_NONE;
++
++    /* We can temporarily remove a role from a wayland surface and add it back,
++     * but we can't change a surface's role. */
++    if (surface && role && surface->role && role != surface->role)
+     {
+         if (data->window_surface)
+             wayland_window_surface_update_wayland_surface(data->window_surface, NULL, NULL);
+-        if (surface) wayland_surface_destroy(surface);
++        pthread_mutex_lock(&surface->mutex);
++        if (surface->client) client = wayland_surface_get_client(surface);
++        pthread_mutex_unlock(&surface->mutex);
++        wayland_surface_destroy(surface);
+         surface = NULL;
+-        goto out;
+     }
+ 
+-    /* Otherwise ensure that we have a wayland surface. */
+-    if (!surface && !(surface = wayland_surface_create(data->hwnd))) return;
+-
+-    visible = (NtUserGetWindowLongW(data->hwnd, GWL_STYLE) & WS_VISIBLE) == WS_VISIBLE;
+-    xdg_visible = surface->xdg_toplevel != NULL;
++    /* Ensure that we have a wayland surface. */
++    if (!surface)
++    {
++        surface = wayland_surface_create(data->hwnd);
++        surface_changed = data->wayland_surface || surface;
++        if (!surface) goto out;
++    }
+ 
+     pthread_mutex_lock(&surface->mutex);
+ 
+-    if (visible != xdg_visible)
++    if ((role == WAYLAND_SURFACE_ROLE_TOPLEVEL) != !!(surface->xdg_toplevel) ||
++        (role == WAYLAND_SURFACE_ROLE_SUBSURFACE) != !!(surface->wl_subsurface) ||
++        (role == WAYLAND_SURFACE_ROLE_SUBSURFACE &&
++         surface->parent_weak_ref && surface->parent_weak_ref->hwnd != parent_data->hwnd) ||
++        (flags & UWS_FORCE_ROLE_UPDATE))
+     {
+         /* If we have a pre-existing surface ensure it has no role. */
+         if (data->wayland_surface) wayland_surface_clear_role(surface);
+-        /* If the window is a visible toplevel make it a wayland
+-         * xdg_toplevel. Otherwise keep it role-less to avoid polluting the
+-         * compositor with empty xdg_toplevels. */
+-        if (visible)
++        /* If the window is visible give it a role, otherwise keep it role-less
++         * to avoid polluting the compositor with unused role objects. */
++        if (role == WAYLAND_SURFACE_ROLE_TOPLEVEL)
+         {
+             wayland_surface_make_toplevel(surface);
+             if (surface->xdg_toplevel)
+@@ -244,14 +345,22 @@ static void wayland_win_data_update_wayl
+                 wayland_surface_set_title(surface, text);
+             }
+         }
++        else if (role == WAYLAND_SURFACE_ROLE_SUBSURFACE)
++        {
++            pthread_mutex_lock(&parent_data->wayland_surface->mutex);
++            wayland_surface_make_subsurface(surface, parent_data->wayland_surface);
++            pthread_mutex_unlock(&parent_data->wayland_surface->mutex);
++        }
+     }
+ 
+     wayland_win_data_get_config(data, &surface->window);
++    if (client) wayland_surface_attach_client(surface, client);
+ 
+     pthread_mutex_unlock(&surface->mutex);
+ 
+     if (data->window_surface)
+-        wayland_window_surface_update_wayland_surface(data->window_surface, visible_rect, surface);
++        wayland_window_surface_update_wayland_surface(data->window_surface,
++                                                      &data->visible_rect, surface);
+ 
+     /* Size/position changes affect the effective pointer constraint, so update
+      * it as needed. */
+@@ -260,6 +369,24 @@ static void wayland_win_data_update_wayl
+ out:
+     TRACE("hwnd=%p surface=%p=>%p\n", data->hwnd, data->wayland_surface, surface);
+     data->wayland_surface = surface;
++    if (client) wayland_client_surface_release(client);
++
++    if (!(flags & UWS_NO_UPDATE_CHILDREN))
++    {
++        /* Update child window surfaces, but do not allow recursive updates. */
++        UINT wwd_flags = UWS_NO_UPDATE_CHILDREN;
++        /* wayland_win_data_update_wayland_surface doesn't detect a surface
++         * change without a window change, so force a role update. */
++        if (surface_changed) wwd_flags |= UWS_FORCE_ROLE_UPDATE;
++        RB_FOR_EACH_ENTRY(wwd, &win_data_rb, struct wayland_win_data, entry)
++        {
++            if (wwd->wayland_surface && NtUserIsChild(data->hwnd, wwd->hwnd))
++            {
++                wayland_win_data_update_wayland_surface(wwd, wwd_flags);
++                if (wwd->wayland_surface) wayland_win_data_update_wayland_state(wwd);
++            }
++        }
++    }
+ }
+ 
+ static void wayland_win_data_update_wayland_state(struct wayland_win_data *data)
+@@ -269,7 +396,17 @@ static void wayland_win_data_update_wayl
+ 
+     pthread_mutex_lock(&surface->mutex);
+ 
+-    if (!surface->xdg_toplevel) goto out;
++    if (surface->wl_subsurface)
++    {
++        TRACE("hwnd=%p subsurface parent=%p\n", surface->hwnd,
++              surface->parent_weak_ref ? surface->parent_weak_ref->hwnd : 0);
++        /* Although subsurfaces don't have a dedicated surface config mechanism,
++         * we use the config fields to mark them as updated. */
++        surface->processing.serial = 1;
++        surface->processing.processed = TRUE;
++        goto out;
++    }
++    else if (!surface->xdg_toplevel) goto out;
+ 
+     processing_config = surface->processing.serial &&
+                         !surface->processing.processed;
+@@ -438,10 +575,15 @@ BOOL WAYLAND_WindowPosChanging(HWND hwnd
+           hwnd, swp_flags, shaped, wine_dbgstr_rect(window_rect), wine_dbgstr_rect(client_rect),
+           wine_dbgstr_rect(visible_rect));
+ 
+-    if (!data && !(data = wayland_win_data_create(hwnd, window_rect, client_rect))) return FALSE; /* use default surface */
++    if (!data && !(data = wayland_win_data_create(hwnd, window_rect, client_rect, visible_rect)))
++        return FALSE; /* use default surface */
+ 
+-    parent = NtUserGetAncestor(hwnd, GA_PARENT);
+-    if ((parent && parent != NtUserGetDesktopWindow())) goto done; /* use default surface */
++    /* Use the default surface for child windows, unless we need a dedicated
++     * wayland surface in which case use a dedicated window surface. */
++     parent = NtUserGetAncestor(hwnd, GA_PARENT);
++     if (parent && parent != NtUserGetDesktopWindow() &&
++         !wayland_win_data_needs_wayland_surface(data, wayland_win_data_get_top_parent(data)))
++        goto done; /* use default surface */
+ 
+     ret = TRUE;
+ 
+@@ -475,13 +617,14 @@ void WAYLAND_WindowPosChanged(HWND hwnd,
+ 
+     data->window_rect = *window_rect;
+     data->client_rect = *client_rect;
++    data->visible_rect = *visible_rect;
+     data->managed = managed;
+ 
+     if (surface) window_surface_add_ref(surface);
+     if (data->window_surface) window_surface_release(data->window_surface);
+     data->window_surface = surface;
+ 
+-    wayland_win_data_update_wayland_surface(data, visible_rect);
++    wayland_win_data_update_wayland_surface(data, 0);
+     if (data->wayland_surface) wayland_win_data_update_wayland_state(data);
+ 
+     wayland_win_data_release(data);
+@@ -730,6 +873,8 @@ void wayland_window_flush(HWND hwnd)
+ 
+ /**********************************************************************
+  *           wayland_surface_lock_hwnd
++ *
++ *  Get the locked surface for a window.
+  */
+ struct wayland_surface *wayland_surface_lock_hwnd(HWND hwnd)
+ {
+@@ -740,6 +885,35 @@ struct wayland_surface *wayland_surface_
+ 
+     if ((surface = data->wayland_surface)) pthread_mutex_lock(&surface->mutex);
+ 
++    wayland_win_data_release(data);
++
++    return surface;
++}
++
++/**********************************************************************
++ *           wayland_surface_lock_accel_hwnd
++ *
++ *  Get the locked surface for a window, creating the surface for a child
++ *  on demand if needed, so accelerated content can be presented into it.
++ */
++struct wayland_surface *wayland_surface_lock_accel_hwnd(HWND hwnd)
++{
++    struct wayland_win_data *data = wayland_win_data_get(hwnd);
++    struct wayland_surface *surface;
++
++    if (!data) return NULL;
++
++    /* If the hwnd is a child window we can anchor to some toplevel,
++     * create a wayland surface for it to be the target of accelerated
++     * rendering. */
++    if (!data->wayland_surface && wayland_win_data_get_top_parent(data))
++    {
++        wayland_win_data_update_wayland_surface(data, UWS_FORCE_CREATE);
++        if (data->wayland_surface) wayland_win_data_update_wayland_state(data);
++    }
++
++    if ((surface = data->wayland_surface)) pthread_mutex_lock(&surface->mutex);
++
+     wayland_win_data_release(data);
+ 
+     return surface;
+diff -uarp a/dlls/winewayland.drv/window_surface.c b/dlls/winewayland.drv/window_surface.c
+--- a/dlls/winewayland.drv/window_surface.c	2024-07-28 16:02:13.000000000 -0400
++++ b/dlls/winewayland.drv/window_surface.c	2025-11-17 18:01:34.838728943 -0500
+@@ -154,7 +154,7 @@ static struct wayland_shm_buffer *waylan
+         if (nbuffers < 3)
+         {
+             shm_buffer = wayland_shm_buffer_create(queue->width, queue->height,
+-                                                   WL_SHM_FORMAT_XRGB8888);
++                                                   WL_SHM_FORMAT_ARGB8888);
+             if (shm_buffer)
+             {
+                 /* Buffer events go to their own queue so that we can dispatch
+@@ -262,7 +262,7 @@ static void copy_pixel_region(const char
+     {
+         const char *src;
+         char *dst;
+-        int y, width_bytes, height;
++        int x, y, width_bytes, height;
+         RECT rc;
+ 
+         TRACE("rect %s\n", wine_dbgstr_rect(rgn_rect));
+@@ -279,12 +279,14 @@ static void copy_pixel_region(const char
+         if (width_bytes == src_stride && width_bytes == dst_stride)
+         {
+             memcpy(dst, src, height * width_bytes);
++            for (x = 3; x < height * width_bytes; x += bpp) dst[x] = 0xff;
+             continue;
+         }
+ 
+         for (y = 0; y < height; y++)
+         {
+             memcpy(dst, src, width_bytes);
++            for (x = 3; x < width_bytes; x += bpp) dst[x] = 0xff;
+             src += src_stride;
+             dst += dst_stride;
+         }
+@@ -315,6 +317,34 @@ static void wayland_shm_buffer_copy(stru
+     copy_pixel_region(src->map_data, &src_rect, dst->map_data, &dst_rect, region);
+ }
+ 
++/**********************************************************************
++ *          wayland_shm_buffer_copy_data
++ */
++static void wayland_shm_buffer_copy_shape(struct wayland_shm_buffer *buffer, const RECT *dirty,
++                                          const BITMAPINFO *shape_info, const void *shape_bits)
++{
++    RECT dst_rect = {0, 0, buffer->width, buffer->height};
++    UINT32 *color, shape_stride, color_stride, x, y;
++    const BYTE *shape;
++    RECT rect;
++
++    shape_stride = shape_info->bmiHeader.biSizeImage / abs(shape_info->bmiHeader.biHeight);
++    color_stride = dst_rect.right - dst_rect.left;
++
++    if (!intersect_rect(&rect, &dst_rect, dirty)) return;
++
++    color = (UINT32 *)buffer->map_data + rect.top * color_stride;
++    shape = (const BYTE *)shape_bits + rect.top * shape_stride;
++
++    for (y = rect.top; y < rect.bottom; y++, color += color_stride, shape += shape_stride)
++    {
++        for (x = rect.left; x < rect.right; x++)
++        {
++            if (!(shape[x / 8] & (1 << (7 - (x & 7))))) color[x] = 0;
++        }
++    }
++}
++
+ /***********************************************************************
+  *           wayland_window_surface_flush
+  */
+@@ -385,6 +415,7 @@ static BOOL wayland_window_surface_flush
+     }
+ 
+     wayland_shm_buffer_copy_data(shm_buffer, color_bits, &surface_rect, copy_from_window_region);
++    if (shape_bits) wayland_shm_buffer_copy_shape(shm_buffer, rect, shape_info, shape_bits);
+ 
+     pthread_mutex_lock(&wws->wayland_surface->mutex);
+     if (wayland_surface_reconfigure(wws->wayland_surface))
+-- 
+2.47.1
+

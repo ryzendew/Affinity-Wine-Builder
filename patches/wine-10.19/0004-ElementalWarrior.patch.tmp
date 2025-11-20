@@ -1,0 +1,29 @@
+--- dlls/win32u/vulkan.c.backup	2025-11-20 00:24:42.771757762 -0400
++++ dlls/win32u/vulkan.c	2025-11-20 00:24:49.893781277 -0400
+@@ -119,6 +119,8 @@
+ {
+     struct vulkan_surface obj;
+     struct client_surface *client;
++    HDC offscreen_dc;
++    HRGN region;
+     HWND hwnd;
+ };
+ 
+@@ -966,6 +968,8 @@
+ 
+     TRACE( "client_instance %p, create_info %p, allocator %p, ret %p\n", client_instance, create_info, allocator, ret );
+     if (allocator) FIXME( "Support for allocation callbacks not implemented yet\n" );
++    if (surface->offscreen_dc) NtGdiDeleteObjectApp( surface->offscreen_dc );
++    if (surface->region) NtGdiDeleteObjectApp( surface->region );
+ 
+     if (!(surface = calloc( 1, sizeof(*surface) ))) return VK_ERROR_OUT_OF_HOST_MEMORY;
+ 
+@@ -989,6 +993,8 @@
+ 
+     vulkan_object_init( &surface->obj.obj, host_surface );
+     surface->obj.instance = instance;
++    surface->offscreen_dc = NULL;
++    surface->region = NtGdiCreateRectRgn( 0, 0, 0, 0 );
+     instance->p_insert_object( instance, &surface->obj.obj );
+ 
+     if (dummy) NtUserDestroyWindow( dummy );

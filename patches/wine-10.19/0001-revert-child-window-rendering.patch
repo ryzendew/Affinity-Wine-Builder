@@ -1,0 +1,16 @@
+Revert winehq PR 6467
+https://gitlab.winehq.org/wine/wine/-/merge_requests/6467/commits
+
+Note: In Wine 10.19, the vulkan_surface_presented callback has been removed from the interface.
+This patch is a no-op for 10.19 as the functionality it was reverting no longer exists.
+The code structure has changed significantly and the revert is not applicable.
+
+diff -uarp a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
+--- a/dlls/win32u/vulkan.c
++++ b/dlls/win32u/vulkan.c
+@@ -2500,6 +2500,6 @@ static void vulkan_init_once(void)
+     }
+ }
+ 
+-#endif /* SONAME_LIBVULKAN */
++#endif /* SONAME_LIBVULKAN - patch 0001 no-op */

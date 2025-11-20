@@ -1,0 +1,16 @@
+ElementalWarrior wine patch series
+https://gitlab.winehq.org/ElementalWarrior/wine/-/commits/affinity-photo3-wine9.13-part3
+
+Note: The offscreen_dc and region fields are already present in Wine 10.19.
+This patch is a no-op for 10.19 as the changes are already in the codebase.
+
+diff -uarp a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
+--- a/dlls/win32u/vulkan.c
++++ b/dlls/win32u/vulkan.c
+@@ -2457,6 +2457,6 @@ static void vulkan_init_once(void)
+     if (!vulkan_init()) return NULL;
+     return &vulkan_funcs;
+ }
+ 
+-#endif /* SONAME_LIBVULKAN - patch 0001, 0002 no-op */
++#endif /* SONAME_LIBVULKAN - patch 0001, 0002, 0004 no-op */

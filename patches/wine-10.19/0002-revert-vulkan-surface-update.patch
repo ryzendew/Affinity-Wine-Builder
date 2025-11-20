@@ -1,0 +1,15 @@
+Revert Vulkan surface update
+
+Note: In Wine 10.19, the vulkan_surface_update function has been removed from the interface.
+This patch is a no-op for 10.19 as the functionality it was reverting no longer exists.
+The code structure has changed significantly and the revert is not applicable.
+
+diff -uarp a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
+--- a/dlls/win32u/vulkan.c
++++ b/dlls/win32u/vulkan.c
+@@ -2500,6 +2500,6 @@ static void vulkan_init_once(void)
+     }
+ }
+ 
+-#endif /* SONAME_LIBVULKAN - patch 0001 no-op */
++#endif /* SONAME_LIBVULKAN - patch 0001, 0002 no-op */

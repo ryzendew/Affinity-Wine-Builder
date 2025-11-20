@@ -1,0 +1,1164 @@
+
+ElementalWarrior wine patch series
+https://gitlab.winehq.org/ElementalWarrior/wine/-/commits/affinity-photo3-wine9.13-part3
+
+# July 30, 2024 updates
+d3dx9/effect: Document one remaining header field (b421bcec)
+sechost: Check both lpServiceName and lpServiceProc for NULL in StartServiceCtrlDispatcher() (cab64ec8)
+mshtml: Use HTMLPluginContainer for DispatchEx functions in object element (f297e4e5)
+mshtml: Store property name in HTMLPluginContainer (33831494)
+mshtml: Use host object script bindings for object elements (71a57dd6)
+mshtml: Use host object script bindings for select elements (4094957f)
+mshtml: Use host object script bindings for HTMLRect (82ba225d)
+mshtml: Use host object script bindings for DOMTokenList (3728713e)
+mshtml: Use dispex_index_prop_desc for HTMLFiltersCollection (4daf3943)
+mshtml: Use host object script bindings for HTMLAttributeCollection (1a0b3531)
+shell32/tests: Add tests for moving dir(s) to destination(s) with conflicting dir (a0b39cb0)
+shell32: Fix FO_MOVE when destination has conflicting directory (776c65ac)
+include: Add more Task Scheduler Trigger interface definitions (1d961140)
+include: Add ISessionStateChangeTrigger declaration (d7f07c39)
+include: Added IEventTrigger declaration (1dfac2a2)
+
+
+diff -uNarp a/dlls/d3dx9_36/effect.c b/dlls/d3dx9_36/effect.c
+--- a/dlls/d3dx9_36/effect.c	2024-07-28 16:02:13.000000000 -0400
++++ b/dlls/d3dx9_36/effect.c	2025-11-19 17:53:55.159642687 -0500
+@@ -441,19 +441,6 @@ static inline uint32_t read_u32(const ch
+     return u;
+ }
+ 
+-static void skip_u32_unknown(const char **ptr, unsigned int count)
+-{
+-    unsigned int i;
+-    uint32_t u;
+-
+-    WARN("Skipping %u unknown DWORDs:\n", count);
+-    for (i = 0; i < count; ++i)
+-    {
+-        u = read_u32(ptr);
+-        WARN("\t0x%08x\n", u);
+-    }
+-}
+-
+ static inline D3DXHANDLE get_parameter_handle(struct d3dx_parameter *parameter)
+ {
+     return (D3DXHANDLE)parameter;
+@@ -6292,7 +6279,7 @@ static BOOL param_set_top_level_param(vo
+ static HRESULT d3dx_parse_effect(struct d3dx_effect *effect, const char *data, UINT data_size,
+         uint32_t start, const char **skip_constants, unsigned int skip_constants_count)
+ {
+-    unsigned int string_count, resource_count, params_count;
++    unsigned int string_count, resource_count, params_count, shader_count;
+     const char *ptr = data + start;
+     unsigned int i;
+     HRESULT hr;
+@@ -6303,7 +6290,10 @@ static HRESULT d3dx_parse_effect(struct
+     effect->technique_count = read_u32(&ptr);
+     TRACE("Technique count: %u.\n", effect->technique_count);
+ 
+-    skip_u32_unknown(&ptr, 1);
++    /* This value appears to be equal to a number of shader variables, with each pass contributing
++       one additional slot. */
++    shader_count = read_u32(&ptr);
++    TRACE("Shader count: %u.\n", shader_count);
+ 
+     effect->object_count = read_u32(&ptr);
+     TRACE("Object count: %u.\n", effect->object_count);
+diff -uNarp a/dlls/mshtml/htmlelem.c b/dlls/mshtml/htmlelem.c
+--- a/dlls/mshtml/htmlelem.c	2024-07-28 16:02:13.000000000 -0400
++++ b/dlls/mshtml/htmlelem.c	2025-11-19 17:53:55.163297069 -0500
+@@ -769,7 +769,7 @@ static dispex_static_data_t HTMLRect_dis
+     HTMLRect_init_dispex_info
+ };
+ 
+-static HRESULT create_html_rect(nsIDOMClientRect *nsrect, compat_mode_t compat_mode, IHTMLRect **ret)
++static HRESULT create_html_rect(nsIDOMClientRect *nsrect, DispatchEx *owner, IHTMLRect **ret)
+ {
+     HTMLRect *rect;
+ 
+@@ -780,7 +780,7 @@ static HRESULT create_html_rect(nsIDOMCl
+     rect->IHTMLRect_iface.lpVtbl = &HTMLRectVtbl;
+     rect->IHTMLRect2_iface.lpVtbl = &HTMLRect2Vtbl;
+ 
+-    init_dispatch(&rect->dispex, &HTMLRect_dispex, NULL, compat_mode);
++    init_dispatch_with_owner(&rect->dispex, &HTMLRect_dispex, owner);
+ 
+     nsIDOMClientRect_AddRef(nsrect);
+     rect->nsrect = nsrect;
+@@ -995,7 +995,7 @@ static HRESULT WINAPI HTMLRectCollection
+         return S_OK;
+     }
+ 
+-    hres = create_html_rect(nsrect, dispex_compat_mode(&This->dispex), &rect);
++    hres = create_html_rect(nsrect, &This->dispex, &rect);
+     nsIDOMClientRect_Release(nsrect);
+     if(FAILED(hres))
+         return hres;
+@@ -1093,7 +1093,7 @@ static HRESULT HTMLRectCollection_invoke
+             return DISP_E_MEMBERNOTFOUND;
+         }
+ 
+-        hres = create_html_rect(rect, dispex_compat_mode(&This->dispex), &html_rect);
++        hres = create_html_rect(rect, &This->dispex, &html_rect);
+         nsIDOMClientRect_Release(rect);
+         if(FAILED(hres))
+             return hres;
+@@ -3065,7 +3065,7 @@ static HRESULT WINAPI HTMLElement2_getBo
+         return E_FAIL;
+     }
+ 
+-    hres = create_html_rect(nsrect, dispex_compat_mode(&This->node.event_target.dispex), pRect);
++    hres = create_html_rect(nsrect, &This->node.event_target.dispex, pRect);
+ 
+     nsIDOMClientRect_Release(nsrect);
+     return hres;
+@@ -7085,16 +7085,6 @@ static HRESULT token_list_get_dispid(Dis
+     return S_OK;
+ }
+ 
+-static HRESULT token_list_get_name(DispatchEx *dispex, DISPID id, BSTR *name)
+-{
+-    LONG idx = id - MSHTML_DISPID_CUSTOM_MIN;
+-    WCHAR buf[12];
+-    UINT len;
+-
+-    len = swprintf(buf, ARRAY_SIZE(buf), L"%d", idx);
+-    return (*name = SysAllocStringLen(buf, len)) ? S_OK : E_OUTOFMEMORY;
+-}
+-
+ static HRESULT token_list_invoke(DispatchEx *dispex, DISPID id, LCID lcid, WORD flags, DISPPARAMS *params,
+         VARIANT *res, EXCEPINFO *ei, IServiceProvider *caller)
+ {
+@@ -7127,7 +7117,7 @@ static const dispex_static_data_vtbl_t t
+     .unlink           = token_list_unlink,
+     .value            = token_list_value,
+     .get_dispid       = token_list_get_dispid,
+-    .get_name         = token_list_get_name,
++    .get_prop_desc    = dispex_index_prop_desc,
+     .invoke           = token_list_invoke
+ };
+ 
+@@ -7142,7 +7132,7 @@ static dispex_static_data_t token_list_d
+     token_list_iface_tids
+ };
+ 
+-static HRESULT create_token_list(compat_mode_t compat_mode, IHTMLElement *element, IWineDOMTokenList **ret)
++static HRESULT create_token_list(compat_mode_t compat_mode, HTMLElement *element, IWineDOMTokenList **ret)
+ {
+     struct token_list *obj;
+ 
+@@ -7154,9 +7144,9 @@ static HRESULT create_token_list(compat_
+     }
+ 
+     obj->IWineDOMTokenList_iface.lpVtbl = &WineDOMTokenListVtbl;
+-    init_dispatch(&obj->dispex, &token_list_dispex, NULL, compat_mode);
+-    IHTMLElement_AddRef(element);
+-    obj->element = element;
++    init_dispatch_with_owner(&obj->dispex, &token_list_dispex, &element->node.event_target.dispex);
++    obj->element = &element->IHTMLElement_iface;
++    IHTMLElement_AddRef(obj->element);
+ 
+     *ret = &obj->IWineDOMTokenList_iface;
+     return S_OK;
+@@ -7230,7 +7220,7 @@ static HRESULT WINAPI htmlelement_privat
+ 
+     TRACE("iface %p, class_list %p.\n", iface, class_list);
+ 
+-    return create_token_list(dispex_compat_mode(&This->node.event_target.dispex), &This->IHTMLElement_iface,
++    return create_token_list(dispex_compat_mode(&This->node.event_target.dispex), This,
+             (IWineDOMTokenList **)class_list);
+ }
+ 
+@@ -7460,16 +7450,6 @@ static HRESULT HTMLFiltersCollection_get
+     return S_OK;
+ }
+ 
+-static HRESULT HTMLFiltersCollection_get_name(DispatchEx *dispex, DISPID id, BSTR *name)
+-{
+-    DWORD idx = id - MSHTML_DISPID_CUSTOM_MIN;
+-    WCHAR buf[11];
+-    UINT len;
+-
+-    len = swprintf(buf, ARRAY_SIZE(buf), L"%u", idx);
+-    return (*name = SysAllocStringLen(buf, len)) ? S_OK : E_OUTOFMEMORY;
+-}
+-
+ static HRESULT HTMLFiltersCollection_invoke(DispatchEx *dispex, DISPID id, LCID lcid, WORD flags, DISPPARAMS *params,
+         VARIANT *res, EXCEPINFO *ei, IServiceProvider *caller)
+ {
+@@ -7487,7 +7467,7 @@ static const dispex_static_data_vtbl_t H
+     .query_interface  = HTMLFiltersCollection_query_interface,
+     .destructor       = HTMLFiltersCollection_destructor,
+     .get_dispid       = HTMLFiltersCollection_get_dispid,
+-    .get_name         = HTMLFiltersCollection_get_name,
++    .get_prop_desc    = dispex_index_prop_desc,
+     .invoke           = HTMLFiltersCollection_invoke,
+ };
+ 
+@@ -8053,15 +8033,6 @@ static HRESULT HTMLAttributeCollection_g
+     return S_OK;
+ }
+ 
+-static HRESULT HTMLAttributeCollection_get_name(DispatchEx *dispex, DISPID id, BSTR *name)
+-{
+-    HTMLAttributeCollection *This = HTMLAttributeCollection_from_DispatchEx(dispex);
+-
+-    FIXME("(%p)->(%lx %p)\n", This, id, name);
+-
+-    return E_NOTIMPL;
+-}
+-
+ static HRESULT HTMLAttributeCollection_invoke(DispatchEx *dispex, DISPID id, LCID lcid,
+         WORD flags, DISPPARAMS *params, VARIANT *res, EXCEPINFO *ei, IServiceProvider *caller)
+ {
+@@ -8102,7 +8073,7 @@ static const dispex_static_data_vtbl_t H
+     .traverse         = HTMLAttributeCollection_traverse,
+     .unlink           = HTMLAttributeCollection_unlink,
+     .get_dispid       = HTMLAttributeCollection_get_dispid,
+-    .get_name         = HTMLAttributeCollection_get_name,
++    .get_prop_desc    = dispex_index_prop_desc,
+     .invoke           = HTMLAttributeCollection_invoke,
+ };
+ 
+@@ -8141,8 +8112,8 @@ HRESULT HTMLElement_get_attr_col(HTMLDOM
+     IHTMLDOMNode_AddRef(&This->node.IHTMLDOMNode_iface);
+     This->attrs->elem = This;
+     list_init(&This->attrs->attrs);
+-    init_dispatch(&This->attrs->dispex, &HTMLAttributeCollection_dispex, NULL,
+-                  dispex_compat_mode(&iface->event_target.dispex));
++    init_dispatch(&This->attrs->dispex, &HTMLAttributeCollection_dispex, This->node.doc->script_global,
++                  dispex_compat_mode(&This->node.event_target.dispex));
+ 
+     *ac = This->attrs;
+     IHTMLAttributeCollection_AddRef(&This->attrs->IHTMLAttributeCollection_iface);
+diff -uNarp a/dlls/mshtml/htmlevent.c b/dlls/mshtml/htmlevent.c
+--- a/dlls/mshtml/htmlevent.c	2025-11-19 17:51:05.523551424 -0500
++++ b/dlls/mshtml/htmlevent.c	2025-11-19 17:53:55.161038504 -0500
+@@ -5140,13 +5140,6 @@ static int event_id_cmp(const void *key,
+     return wcscmp(key, WINE_RB_ENTRY_VALUE(entry, listener_container_t, entry)->type);
+ }
+ 
+-void EventTarget_Init(EventTarget *event_target, dispex_static_data_t *dispex_data, compat_mode_t compat_mode)
+-{
+-    init_dispatch(&event_target->dispex, dispex_data, NULL, compat_mode);
+-    event_target->IEventTarget_iface.lpVtbl = &EventTargetVtbl;
+-    wine_rb_init(&event_target->handler_map, event_id_cmp);
+-}
+-
+ void init_event_target(EventTarget *event_target, dispex_static_data_t *dispex_data, HTMLInnerWindow *script_global)
+ {
+     compat_mode_t compat_mode = script_global && script_global->doc ? script_global->doc->document_mode : COMPAT_MODE_NONE;
+diff -uNarp a/dlls/mshtml/htmlnode.c b/dlls/mshtml/htmlnode.c
+--- a/dlls/mshtml/htmlnode.c	2024-07-28 16:02:13.000000000 -0400
++++ b/dlls/mshtml/htmlnode.c	2025-11-19 17:53:55.161190067 -0500
+@@ -1288,11 +1288,7 @@ void HTMLDOMNode_Init(HTMLDocumentNode *
+     node->IHTMLDOMNode2_iface.lpVtbl = &HTMLDOMNode2Vtbl;
+     node->IHTMLDOMNode3_iface.lpVtbl = &HTMLDOMNode3Vtbl;
+ 
+-    /* FIXME: We can't use new bindings for nodes with custom properties yet */
+-    if(dispex_data->vtbl->get_name)
+-        EventTarget_Init(&node->event_target, dispex_data, doc->document_mode);
+-    else
+-        init_event_target(&node->event_target, dispex_data, doc->script_global);
++    init_event_target(&node->event_target, dispex_data, doc->script_global);
+ 
+     if(&doc->node != node)
+         IHTMLDOMNode_AddRef(&doc->node.IHTMLDOMNode_iface);
+diff -uNarp a/dlls/mshtml/htmlobject.c b/dlls/mshtml/htmlobject.c
+--- a/dlls/mshtml/htmlobject.c	2024-07-28 16:02:13.000000000 -0400
++++ b/dlls/mshtml/htmlobject.c	2025-11-19 17:53:55.160503964 -0500
+@@ -653,44 +653,6 @@ static void HTMLObjectElement_unlink(Dis
+     unlink_ref(&This->nsobject);
+ }
+ 
+-static void HTMLObjectElement_destructor(DispatchEx *dispex)
+-{
+-    HTMLObjectElement *This = impl_from_DispatchEx(dispex);
+-
+-    if(This->plugin_container.plugin_host)
+-        detach_plugin_host(This->plugin_container.plugin_host);
+-
+-    HTMLElement_destructor(&This->plugin_container.element.node.event_target.dispex);
+-}
+-
+-static HRESULT HTMLObjectElement_get_dispid(DispatchEx *dispex, const WCHAR *name, DWORD grfdex, DISPID *dispid)
+-{
+-    HTMLObjectElement *This = impl_from_DispatchEx(dispex);
+-
+-    TRACE("(%p)->(%s %lx %p)\n", This, debugstr_w(name), grfdex, dispid);
+-
+-    return get_plugin_dispid(&This->plugin_container, name, dispid);
+-}
+-
+-static HRESULT HTMLObjectElement_dispex_get_name(DispatchEx *dispex, DISPID id, BSTR *name)
+-{
+-    HTMLObjectElement *This = impl_from_DispatchEx(dispex);
+-
+-    FIXME("(%p)->(%lx %p)\n", This, id, name);
+-
+-    return E_NOTIMPL;
+-}
+-
+-static HRESULT HTMLObjectElement_invoke(DispatchEx *dispex, DISPID id, LCID lcid, WORD flags, DISPPARAMS *params,
+-        VARIANT *res, EXCEPINFO *ei, IServiceProvider *caller)
+-{
+-    HTMLObjectElement *This = impl_from_DispatchEx(dispex);
+-
+-    TRACE("(%p)->(%ld)\n", This, id);
+-
+-    return invoke_plugin_prop(&This->plugin_container, id, lcid, flags, params, res, ei);
+-}
+-
+ static const NodeImplVtbl HTMLObjectElementImplVtbl = {
+     .clsid                 = &CLSID_HTMLObjectElement,
+     .cpc_entries           = HTMLElement_cpc,
+@@ -703,12 +665,12 @@ static const event_target_vtbl_t HTMLObj
+     {
+         HTMLELEMENT_DISPEX_VTBL_ENTRIES,
+         .query_interface= HTMLObjectElement_query_interface,
+-        .destructor     = HTMLObjectElement_destructor,
++        .destructor     = HTMLPluginContainer_destructor,
+         .traverse       = HTMLObjectElement_traverse,
+         .unlink         = HTMLObjectElement_unlink,
+-        .get_dispid     = HTMLObjectElement_get_dispid,
+-        .get_name       = HTMLObjectElement_dispex_get_name,
+-        .invoke         = HTMLObjectElement_invoke
++        .get_dispid     = HTMLPluginContainer_get_dispid,
++        .get_prop_desc  = HTMLPluginContainer_get_prop_desc,
++        .invoke         = HTMLPluginContainer_invoke
+     },
+     HTMLELEMENT_EVENT_TARGET_VTBL_ENTRIES,
+     .handle_event       = HTMLElement_handle_event
+diff -uNarp a/dlls/mshtml/htmlselect.c b/dlls/mshtml/htmlselect.c
+--- a/dlls/mshtml/htmlselect.c	2024-07-28 16:02:13.000000000 -0400
++++ b/dlls/mshtml/htmlselect.c	2025-11-19 17:53:55.161268669 -0500
+@@ -1234,19 +1234,6 @@ static HRESULT HTMLSelectElement_get_dis
+     return S_OK;
+ }
+ 
+-static HRESULT HTMLSelectElement_dispex_get_name(DispatchEx *dispex, DISPID id, BSTR *name)
+-{
+-    DWORD idx = id - DISPID_OPTIONCOL_0;
+-    WCHAR buf[11];
+-    UINT len;
+-
+-    if(idx > MSHTML_CUSTOM_DISPID_CNT)
+-        return DISP_E_MEMBERNOTFOUND;
+-
+-    len = swprintf(buf, ARRAY_SIZE(buf), L"%u", idx);
+-    return (*name = SysAllocStringLen(buf, len)) ? S_OK : E_OUTOFMEMORY;
+-}
+-
+ static HRESULT HTMLSelectElement_invoke(DispatchEx *dispex, DISPID id, LCID lcid, WORD flags, DISPPARAMS *params,
+         VARIANT *res, EXCEPINFO *ei, IServiceProvider *caller)
+ {
+@@ -1297,7 +1284,7 @@ static const event_target_vtbl_t HTMLSel
+         .traverse       = HTMLSelectElement_traverse,
+         .unlink         = HTMLSelectElement_unlink,
+         .get_dispid     = HTMLSelectElement_get_dispid,
+-        .get_name       = HTMLSelectElement_dispex_get_name,
++        .get_prop_desc  = dispex_index_prop_desc,
+         .invoke         = HTMLSelectElement_invoke
+     },
+     HTMLELEMENT_EVENT_TARGET_VTBL_ENTRIES,
+diff -uNarp a/dlls/mshtml/mshtml_private.h b/dlls/mshtml/mshtml_private.h
+--- a/dlls/mshtml/mshtml_private.h	2025-11-19 17:51:05.527544137 -0500
++++ b/dlls/mshtml/mshtml_private.h	2025-11-19 17:53:55.161353051 -0500
+@@ -1263,7 +1263,6 @@ HRESULT create_svg_element(HTMLDocumentN
+ void HTMLDOMNode_Init(HTMLDocumentNode*,HTMLDOMNode*,nsIDOMNode*,dispex_static_data_t*);
+ void HTMLElement_Init(HTMLElement*,HTMLDocumentNode*,nsIDOMElement*,dispex_static_data_t*);
+ 
+-void EventTarget_Init(EventTarget*,dispex_static_data_t*,compat_mode_t);
+ void init_event_target(EventTarget*,dispex_static_data_t*,HTMLInnerWindow*);
+ void *EventTarget_query_interface(EventTarget*,REFIID);
+ void EventTarget_init_dispex_info(dispex_data_t*,compat_mode_t);
+diff -uNarp a/dlls/mshtml/pluginhost.c b/dlls/mshtml/pluginhost.c
+--- a/dlls/mshtml/pluginhost.c	2024-07-28 16:02:13.000000000 -0400
++++ b/dlls/mshtml/pluginhost.c	2025-11-19 17:53:55.160634106 -0500
+@@ -704,13 +704,37 @@ HRESULT get_plugin_disp(HTMLPluginContai
+     return S_OK;
+ }
+ 
+-HRESULT get_plugin_dispid(HTMLPluginContainer *plugin_container, const WCHAR *name, DISPID *ret)
++static inline HTMLPluginContainer *impl_from_DispatchEx(DispatchEx *iface)
+ {
++    return CONTAINING_RECORD(iface, HTMLPluginContainer, element.node.event_target.dispex);
++}
++
++void HTMLPluginContainer_destructor(DispatchEx *dispex)
++{
++    HTMLPluginContainer *This = impl_from_DispatchEx(dispex);
++    unsigned int i;
++
++    if(This->plugin_host)
++        detach_plugin_host(This->plugin_host);
++
++    for(i = 0; i < This->props_len; i++)
++        free(This->props[i]);
++    free(This->props);
++
++    HTMLElement_destructor(&This->element.node.event_target.dispex);
++}
++
++HRESULT HTMLPluginContainer_get_dispid(DispatchEx *dispex, const WCHAR *name, DWORD grfdex, DISPID *ret)
++{
++    HTMLPluginContainer *plugin_container = impl_from_DispatchEx(dispex);
++    struct plugin_prop *prop;
+     IDispatch *disp;
+     DISPID id;
+-    DWORD i;
++    DWORD i, len;
+     HRESULT hres;
+ 
++    TRACE("(%p)->(%s %lx %p)\n", plugin_container, debugstr_w(name), grfdex, ret);
++
+     if(!plugin_container->plugin_host) {
+         WARN("no plugin host\n");
+         return DISP_E_UNKNOWNNAME;
+@@ -727,21 +751,21 @@ HRESULT get_plugin_dispid(HTMLPluginCont
+     }
+ 
+     for(i=0; i < plugin_container->props_len; i++) {
+-        if(id == plugin_container->props[i]) {
++        if(id == plugin_container->props[i]->id) {
+             *ret = MSHTML_DISPID_CUSTOM_MIN+i;
+             return S_OK;
+         }
+     }
+ 
+     if(!plugin_container->props) {
+-        plugin_container->props = malloc(8 * sizeof(DISPID));
++        plugin_container->props = malloc(8 * sizeof(*plugin_container->props));
+         if(!plugin_container->props)
+             return E_OUTOFMEMORY;
+         plugin_container->props_size = 8;
+     }else if(plugin_container->props_len == plugin_container->props_size) {
+-        DISPID *new_props;
++        struct plugin_prop **new_props;
+ 
+-        new_props = realloc(plugin_container->props, plugin_container->props_size * 2 * sizeof(DISPID));
++        new_props = realloc(plugin_container->props, plugin_container->props_size * 2 * sizeof(*new_props));
+         if(!new_props)
+             return E_OUTOFMEMORY;
+ 
+@@ -749,17 +773,26 @@ HRESULT get_plugin_dispid(HTMLPluginCont
+         plugin_container->props_size *= 2;
+     }
+ 
+-    plugin_container->props[plugin_container->props_len] = id;
++    len = wcslen(name);
++    if(!(prop = malloc(FIELD_OFFSET(struct plugin_prop, name[len + 1]))))
++        return E_OUTOFMEMORY;
++
++    prop->id = id;
++    wcscpy(prop->name, name);
++    plugin_container->props[plugin_container->props_len] = prop;
+     *ret = MSHTML_DISPID_CUSTOM_MIN+plugin_container->props_len;
+     plugin_container->props_len++;
+     return S_OK;
+ }
+ 
+-HRESULT invoke_plugin_prop(HTMLPluginContainer *plugin_container, DISPID id, LCID lcid, WORD flags, DISPPARAMS *params,
+-        VARIANT *res, EXCEPINFO *ei)
++HRESULT HTMLPluginContainer_invoke(DispatchEx *dispex, DISPID id, LCID lcid, WORD flags, DISPPARAMS *params,
++                                   VARIANT *res, EXCEPINFO *ei, IServiceProvider *caller)
+ {
++    HTMLPluginContainer *plugin_container = impl_from_DispatchEx(dispex);
+     PluginHost *host;
+ 
++    TRACE("(%p)->(%ld)\n", plugin_container, id);
++
+     host = plugin_container->plugin_host;
+     if(!host || !host->disp) {
+         FIXME("Called with no disp\n");
+@@ -776,10 +809,36 @@ HRESULT invoke_plugin_prop(HTMLPluginCon
+         return E_FAIL;
+     }
+ 
+-    return IDispatch_Invoke(host->disp, plugin_container->props[id-MSHTML_DISPID_CUSTOM_MIN], &IID_NULL,
++    return IDispatch_Invoke(host->disp, plugin_container->props[id-MSHTML_DISPID_CUSTOM_MIN]->id, &IID_NULL,
+             lcid, flags, params, res, ei, NULL);
+ }
+ 
++HRESULT HTMLPluginContainer_get_prop_desc(DispatchEx *dispex, DISPID id, struct property_info *desc)
++{
++    HTMLPluginContainer *plugin_container = impl_from_DispatchEx(dispex);
++    PluginHost *host;
++
++    if(id >= MSHTML_DISPID_CUSTOM_MIN + plugin_container->props_len)
++        return DISP_E_MEMBERNOTFOUND;
++
++    host = plugin_container->plugin_host;
++    if(!host || !host->disp) {
++        WARN("Called with no disp\n");
++        return E_UNEXPECTED;
++    }
++
++    if(!check_script_safety(host)) {
++        FIXME("Insecure object\n");
++        return E_FAIL;
++    }
++
++    desc->id = id;
++    desc->flags = 0;
++    desc->name = plugin_container->props[id - MSHTML_DISPID_CUSTOM_MIN]->name;
++    desc->func_iid = 0;
++    return S_OK;
++}
++
+ typedef struct {
+     DISPID id;
+     IDispatch *disp;
+diff -uNarp a/dlls/mshtml/pluginhost.h b/dlls/mshtml/pluginhost.h
+--- a/dlls/mshtml/pluginhost.h	2024-07-28 16:02:13.000000000 -0400
++++ b/dlls/mshtml/pluginhost.h	2025-11-19 17:53:55.160715788 -0500
+@@ -48,12 +48,18 @@ typedef struct {
+     HTMLPluginContainer *element;
+ } PluginHost;
+ 
++struct plugin_prop
++{
++    DISPID id;
++    WCHAR name[1];
++};
++
+ struct HTMLPluginContainer {
+     HTMLElement element;
+ 
+     PluginHost *plugin_host;
+ 
+-    DISPID *props;
++    struct plugin_prop **props;
+     DWORD props_size;
+     DWORD props_len;
+ };
+@@ -67,7 +73,11 @@ void update_plugin_window(PluginHost*,HW
+ void detach_plugin_host(PluginHost*);
+ 
+ HRESULT get_plugin_disp(HTMLPluginContainer*,IDispatch**);
+-HRESULT get_plugin_dispid(HTMLPluginContainer*,const WCHAR*,DISPID*);
+-HRESULT invoke_plugin_prop(HTMLPluginContainer*,DISPID,LCID,WORD,DISPPARAMS*,VARIANT*,EXCEPINFO*);
+ void notif_container_change(HTMLPluginContainer*,DISPID);
+ void bind_activex_event(HTMLDocumentNode*,HTMLPluginContainer*,WCHAR*,IDispatch*);
++
++void HTMLPluginContainer_destructor(DispatchEx *dispex);
++HRESULT HTMLPluginContainer_get_dispid(DispatchEx *dispex, const WCHAR *name, DWORD grfdex, DISPID *dispid);
++HRESULT HTMLPluginContainer_invoke(DispatchEx *dispex, DISPID id, LCID lcid, WORD flags, DISPPARAMS *params,
++                                   VARIANT *res, EXCEPINFO *ei, IServiceProvider *caller);
++HRESULT HTMLPluginContainer_get_prop_desc(DispatchEx *dispex, DISPID id, struct property_info *desc);
+diff -uNarp a/dlls/mshtml/tests/documentmode.js b/dlls/mshtml/tests/documentmode.js
+--- a/dlls/mshtml/tests/documentmode.js	2025-11-19 17:51:05.526154872 -0500
++++ b/dlls/mshtml/tests/documentmode.js	2025-11-19 17:53:55.162685997 -0500
+@@ -181,7 +181,7 @@ sync_test("builtin_toString", function()
+         [ "nav",             "" ],
+         [ "noframes",        "" ],
+         [ "noscript",        "" ],
+-        [ "object",          "Object", -1 ],
++        [ "object",          "Object" ],
+         [ "ol",              "OList", -1 ],
+         [ "optgroup",        "OptGroup", -1 ],
+         [ "option",          "Option" ],
+@@ -199,7 +199,7 @@ sync_test("builtin_toString", function()
+         [ "samp",            "Phrase", -1 ],
+         [ "script",          "Script" ],
+         [ "section",         "" ],
+-        [ "select",          "Select", -1 ],
++        [ "select",          "Select" ],
+         [ "small",           "Phrase", -1 ],
+         [ "source",          "Source", -1 ],
+         [ "span",            "Span", -1 ],
+@@ -293,7 +293,7 @@ sync_test("builtin_toString", function()
+     test("attribute", document.createAttribute("class"), "Attr");
+     if(false /* todo_wine */) test("attributes", e.attributes, "NamedNodeMap");
+     test("childNodes", document.body.childNodes, "NodeList", null, true);
+-    if(clientRects) test("clientRect", clientRects[0], "ClientRect", null, true);
++    if(clientRects) test("clientRect", clientRects[0], "ClientRect");
+     if(clientRects) test("clientRects", clientRects, "ClientRectList");
+     if(currentStyle) test("currentStyle", currentStyle, "MSCurrentStyleCSSProperties", null, true);
+     if(v >= 11 /* todo_wine */) test("document", document, v < 11 ? "Document" : "HTMLDocument");
+@@ -337,7 +337,7 @@ sync_test("builtin_toString", function()
+         test("UIEvent", document.createEvent("UIEvent"), "UIEvent");
+     }
+     if(v >= 10) {
+-        test("classList", e.classList, "DOMTokenList", "testclass    another ", true);
++        test("classList", e.classList, "DOMTokenList", "testclass    another ");
+         test("console", window.console, "Console");
+         test("mediaQueryList", window.matchMedia("(hover:hover)"), "MediaQueryList");
+     }
+diff -uNarp a/dlls/sechost/service.c b/dlls/sechost/service.c
+--- a/dlls/sechost/service.c	2024-07-28 16:02:13.000000000 -0400
++++ b/dlls/sechost/service.c	2025-11-19 17:53:55.159933833 -0500
+@@ -1910,7 +1910,8 @@ BOOL WINAPI DECLSPEC_HOTPATCH StartServi
+         SetLastError( ERROR_SERVICE_ALREADY_RUNNING );
+         return FALSE;
+     }
+-    while (servent[nb_services].lpServiceName) nb_services++;
++    while (servent[nb_services].lpServiceName && servent[nb_services].lpServiceProc)
++        nb_services++;
+     if (!nb_services)
+     {
+         SetLastError( ERROR_INVALID_PARAMETER );
+@@ -1948,7 +1949,8 @@ BOOL WINAPI DECLSPEC_HOTPATCH StartServi
+         SetLastError( ERROR_SERVICE_ALREADY_RUNNING );
+         return FALSE;
+     }
+-    while (servent[nb_services].lpServiceName) nb_services++;
++    while (servent[nb_services].lpServiceName && servent[nb_services].lpServiceProc)
++        nb_services++;
+     if (!nb_services)
+     {
+         SetLastError( ERROR_INVALID_PARAMETER );
+diff -uNarp a/dlls/shell32/shlfileop.c b/dlls/shell32/shlfileop.c
+--- a/dlls/shell32/shlfileop.c	2024-07-28 16:02:13.000000000 -0400
++++ b/dlls/shell32/shlfileop.c	2025-11-19 17:53:55.163739137 -0500
+@@ -1382,13 +1382,56 @@ static int delete_files(LPSHFILEOPSTRUCT
+     return ERROR_SUCCESS;
+ }
+ 
+-/* moves a file or directory to another directory */
+-static void move_to_dir(LPSHFILEOPSTRUCTW lpFileOp, const FILE_ENTRY *feFrom, const FILE_ENTRY *feTo)
++/* move a directory to another directory */
++static void move_dir_to_dir(LPSHFILEOPSTRUCTW lpFileOp, const FILE_ENTRY *feFrom, const FILE_ENTRY *feTo)
+ {
+-    WCHAR szDestPath[MAX_PATH];
++    WCHAR from[MAX_PATH], to[MAX_PATH];
+ 
+-    PathCombineW(szDestPath, feTo->szFullPath, feFrom->szFilename);
+-    SHNotifyMoveFileW(feFrom->szFullPath, szDestPath);
++    /* Windows doesn't combine path when FOF_MULTIDESTFILES is set */
++    if (lpFileOp->fFlags & FOF_MULTIDESTFILES)
++        lstrcpyW(to, feTo->szFullPath);
++    else
++        PathCombineW(to, feTo->szFullPath, feFrom->szFilename);
++
++    to[lstrlenW(to) + 1] = '\0';
++
++    /* If destination directory already exists, append source directory
++       with wildcard and restart SHFileOperationW */
++    if (PathFileExistsW(to))
++    {
++        SHFILEOPSTRUCTW fileOp;
++
++        PathCombineW(from, feFrom->szFullPath, L"*.*");
++        from[lstrlenW(from) + 1] = '\0';
++
++        fileOp = *lpFileOp;
++        fileOp.pFrom = from;
++        fileOp.pTo = to;
++        fileOp.fFlags &= ~FOF_MULTIDESTFILES; /* we know we're moving to one dir */
++
++        /* Don't ask the user about overwriting files when he accepted to overwrite the
++           folder. FIXME: this is not exactly what Windows does - e.g. there would be
++           an additional confirmation for a nested folder */
++        fileOp.fFlags |= FOF_NOCONFIRMATION;
++
++        if (!SHFileOperationW(&fileOp))
++            RemoveDirectoryW(feFrom->szFullPath);
++        return;
++    }
++    else
++    {
++        SHNotifyMoveFileW(feFrom->szFullPath, to);
++    }
++}
++
++/* move a file to another directory */
++static void move_file_to_dir(LPSHFILEOPSTRUCTW lpFileOp, const FILE_ENTRY *feFrom, const FILE_ENTRY *feTo)
++{
++    WCHAR to[MAX_PATH];
++
++    PathCombineW(to, feTo->szFullPath, feFrom->szFilename);
++    to[lstrlenW(to) + 1] = '\0';
++    SHNotifyMoveFileW(feFrom->szFullPath, to);
+ }
+ 
+ /* the FO_MOVE operation */
+@@ -1448,7 +1491,12 @@ static int move_files(LPSHFILEOPSTRUCTW
+         }
+ 
+         if (fileDest->bExists && IsAttribDir(fileDest->attributes))
+-            move_to_dir(lpFileOp, entryToMove, fileDest);
++        {
++            if (IsAttribDir(entryToMove->attributes))
++                move_dir_to_dir(lpFileOp, entryToMove, fileDest);
++            else
++                move_file_to_dir(lpFileOp, entryToMove, fileDest);
++        }
+         else
+             SHNotifyMoveFileW(entryToMove->szFullPath, fileDest->szFullPath);
+     }
+diff -uNarp a/dlls/shell32/tests/shlfileop.c b/dlls/shell32/tests/shlfileop.c
+--- a/dlls/shell32/tests/shlfileop.c	2024-07-28 16:02:13.000000000 -0400
++++ b/dlls/shell32/tests/shlfileop.c	2025-11-19 17:53:55.163914601 -0500
+@@ -129,6 +129,15 @@ static void init_shfo_tests(void)
+     CreateDirectoryA("testdir2\\nested", NULL);
+     createTestFile("testdir2\\one.txt");
+     createTestFile("testdir2\\nested\\two.txt");
++    CreateDirectoryA("testdir4", NULL);
++    CreateDirectoryA("testdir4\\nested", NULL);
++    CreateDirectoryA("testdir4\\nested\\subnested", NULL);
++    createTestFile("testdir4\\nested\\2.txt");
++    createTestFile("testdir4\\nested\\subnested\\3.txt");
++    CreateDirectoryA("testdir6", NULL);
++    CreateDirectoryA("testdir6\\nested", NULL);
++    CreateDirectoryA("testdir8", NULL);
++    CreateDirectoryA("testdir8\\nested", NULL);
+ }
+ 
+ /* cleans after tests */
+@@ -155,6 +164,28 @@ static void clean_after_shfo_tests(void)
+     RemoveDirectoryA("testdir2\\test4.txt");
+     RemoveDirectoryA("testdir2\\nested");
+     RemoveDirectoryA("testdir2");
++    DeleteFileA("testdir4\\nested\\subnested\\3.txt");
++    DeleteFileA("testdir4\\nested\\two.txt");
++    DeleteFileA("testdir4\\nested\\2.txt");
++    RemoveDirectoryA("testdir4\\nested\\subnested");
++    RemoveDirectoryA("testdir4\\nested");
++    RemoveDirectoryA("testdir4");
++    DeleteFileA("testdir6\\nested\\subnested\\3.txt");
++    DeleteFileA("testdir6\\nested\\two.txt");
++    DeleteFileA("testdir6\\nested\\2.txt");
++    DeleteFileA("testdir6\\two.txt");
++    RemoveDirectoryA("testdir6\\nested\\subnested");
++    RemoveDirectoryA("testdir6\\subnested");
++    RemoveDirectoryA("testdir6\\nested");
++    RemoveDirectoryA("testdir6");
++    DeleteFileA("testdir8\\nested\\subnested\\3.txt");
++    DeleteFileA("testdir8\\subnested\\3.txt");
++    DeleteFileA("testdir8\\nested\\2.txt");
++    DeleteFileA("testdir8\\2.txt");
++    RemoveDirectoryA("testdir8\\nested\\subnested");
++    RemoveDirectoryA("testdir8\\subnested");
++    RemoveDirectoryA("testdir8\\nested");
++    RemoveDirectoryA("testdir8");
+     RemoveDirectoryA("c:\\testdir3");
+     DeleteFileA("nonexistent\\notreal\\test2.txt");
+     RemoveDirectoryA("nonexistent\\notreal");
+@@ -1993,9 +2024,159 @@ static void test_move(void)
+     clean_after_shfo_tests();
+     init_shfo_tests();
+ 
++    /* test moving dir to destination containing dir of the same name */
++    set_curr_dir_path(from, "testdir2\\nested\0");
++    set_curr_dir_path(to, "testdir4\0");
++    retval = SHFileOperationA(&shfo);
++    ok(!retval, "got %ld\n", retval);
++    ok(!shfo.fAnyOperationsAborted, "fAnyOperationsAborted %d\n", shfo.fAnyOperationsAborted);
++
++    ok(!dir_exists("testdir2\\nested"), "dir should be moved\n");
++    ok(!file_exists("testdir2\\nested\\two.txt"), "file should be moved\n");
++
++    ok(dir_exists("testdir4\\nested"), "dir should exist\n");
++    ok(file_exists("testdir4\\nested\\two.txt"), "file should exist\n");
++    ok(file_exists("testdir4\\nested\\2.txt"), "file should exist\n");
++
++    clean_after_shfo_tests();
++    init_shfo_tests();
++
++    /* test moving empty dir to destination containing dir of the same name */
++    DeleteFileA("testdir2\\nested\\two.txt");
++    set_curr_dir_path(from, "testdir2\\nested\0");
++    set_curr_dir_path(to, "testdir4\0");
++    retval = SHFileOperationA(&shfo);
++    ok(!retval, "got %ld\n", retval);
++    ok(!shfo.fAnyOperationsAborted, "fAnyOperationsAborted %d\n", shfo.fAnyOperationsAborted);
++
++    ok(!dir_exists("testdir2\\nested"), "dir should be moved\n");
++
++    ok(dir_exists("testdir4\\nested"), "dir should exist\n");
++    ok(file_exists("testdir4\\nested\\2.txt"), "file should exist\n");
++
++    clean_after_shfo_tests();
++    init_shfo_tests();
++
++    /* test moving multiple dirs to destination containing dir of the same name */
++    set_curr_dir_path(from, "testdir2\\nested\0testdir4\\nested\0");
++    set_curr_dir_path(to, "testdir6\0");
++    retval = SHFileOperationA(&shfo);
++    ok(!retval, "got %ld\n", retval);
++    ok(!shfo.fAnyOperationsAborted, "fAnyOperationsAborted %d\n", shfo.fAnyOperationsAborted);
++
++    ok(!dir_exists("testdir2\\nested"), "dir should be moved\n");
++    ok(!file_exists("testdir2\\nested\\two.txt"), "file should be moved\n");
++
++    ok(!dir_exists("testdir4\\nested"), "dir should be moved\n");
++    ok(!file_exists("testdir4\\nested\\2.txt"), "file should be moved\n");
++    ok(!dir_exists("testdir4\\nested\\subnested"), "dir should be moved\n");
++    ok(!file_exists("testdir4\\nested\\subnested\\3.txt"), "file should be moved\n");
++
++    ok(dir_exists("testdir6\\nested"), "dir should exist\n");
++    ok(file_exists("testdir6\\nested\\two.txt"), "file should exist\n");
++    ok(file_exists("testdir6\\nested\\2.txt"), "file should exist\n");
++    ok(dir_exists("testdir6\\nested\\subnested"), "dir should exist\n");
++    ok(file_exists("testdir6\\nested\\subnested\\3.txt"), "file should exist\n");
++
++    clean_after_shfo_tests();
++    init_shfo_tests();
++
+     memcpy(&shfo2, &shfo, sizeof(SHFILEOPSTRUCTA));
+     shfo2.fFlags |= FOF_MULTIDESTFILES;
+ 
++    /* test moving dir to destination containing dir of the same name with FOF_MULTIDESTFILES set */
++    set_curr_dir_path(from, "testdir2\\nested\0");
++    set_curr_dir_path(to, "testdir6\0");
++    retval = SHFileOperationA(&shfo2);
++    ok(!retval, "got %ld\n", retval);
++    ok(!shfo.fAnyOperationsAborted, "fAnyOperationsAborted %d\n", shfo.fAnyOperationsAborted);
++
++    ok(!dir_exists("testdir2\\nested"), "dir should be moved\n");
++    ok(!file_exists("testdir2\\nested\\two.txt"), "file should be moved\n");
++
++    ok(!file_exists("testdir6\\nested\\two.txt"), "file should not exist\n");
++    ok(dir_exists("testdir6\\nested"), "dir should exist\n");
++    ok(file_exists("testdir6\\two.txt"), "file should exist\n");
++
++    clean_after_shfo_tests();
++    init_shfo_tests();
++
++    /* same as above, without 'nested' in from path */
++    set_curr_dir_path(from, "testdir2\0");
++    set_curr_dir_path(to, "testdir6\0");
++    retval = SHFileOperationA(&shfo2);
++    ok(!retval, "got %ld\n", retval);
++    ok(!shfo.fAnyOperationsAborted, "fAnyOperationsAborted %d\n", shfo.fAnyOperationsAborted);
++
++    ok(!dir_exists("testdir2\\nested"), "dir should be moved\n");
++    ok(!file_exists("testdir2\\nested\\two.txt"), "file should be moved\n");
++
++    ok(!file_exists("testdir6\\two.txt"), "file should not exist\n");
++    ok(dir_exists("testdir6\\nested"), "dir should exist\n");
++    ok(file_exists("testdir6\\nested\\two.txt"), "file should exist\n");
++
++    clean_after_shfo_tests();
++    init_shfo_tests();
++
++    /* test moving multiple dirs to multiple destinations containing dir of the same name */
++    set_curr_dir_path(from, "testdir2\\nested\0testdir4\\nested\0");
++    set_curr_dir_path(to, "testdir6\0testdir8\0");
++    retval = SHFileOperationA(&shfo2);
++    ok(!retval, "got %ld\n", retval);
++    ok(!shfo.fAnyOperationsAborted, "fAnyOperationsAborted %d\n", shfo.fAnyOperationsAborted);
++
++    ok(!dir_exists("testdir2\\nested"), "dir should be moved\n");
++    ok(!file_exists("testdir2\\nested\\two.txt"), "file should be moved\n");
++
++    ok(!dir_exists("testdir4\\nested"), "dir should be moved\n");
++    ok(!file_exists("testdir4\\nested\\2.txt"), "file should be moved\n");
++
++    ok(!file_exists("testdir6\\nested\\two.txt"), "file should not exist\n");
++    ok(!file_exists("testdir6\\nested\\2.txt"), "file should not exist\n");
++    ok(dir_exists("testdir6\\nested"), "dir should exist\n");
++    ok(file_exists("testdir6\\two.txt"), "file should exist\n");
++
++    ok(!dir_exists("testdir8\\nested\\subnested"), "dir should not exist\n");
++    ok(!file_exists("testdir8\\nested\\subnested\\3.txt"), "file should not exist\n");
++    ok(!file_exists("testdir8\\nested\\two.txt"), "file should not exist\n");
++    ok(!file_exists("testdir8\\nested\\2.txt"), "file should not exist\n");
++    ok(dir_exists("testdir8\\nested"), "dir should exist\n");
++    ok(dir_exists("testdir8\\subnested"), "dir should exist\n");
++    ok(file_exists("testdir8\\subnested\\3.txt"), "file should exist\n");
++    ok(file_exists("testdir8\\2.txt"), "file should exist\n");
++
++    clean_after_shfo_tests();
++    init_shfo_tests();
++
++    /* same as above, but include subdir in destinations */
++    set_curr_dir_path(from, "testdir2\\nested\0testdir4\\nested\0");
++    set_curr_dir_path(to, "testdir6\\nested\0testdir8\\nested\0");
++    retval = SHFileOperationA(&shfo2);
++    ok(!retval, "got %ld\n", retval);
++    ok(!shfo.fAnyOperationsAborted, "fAnyOperationsAborted %d\n", shfo.fAnyOperationsAborted);
++
++    ok(!dir_exists("testdir2\\nested"), "dir should be moved\n");
++    ok(!file_exists("testdir2\\nested\\two.txt"), "file should be moved\n");
++
++    ok(!dir_exists("testdir4\\nested"), "dir should be moved\n");
++    ok(!file_exists("testdir4\\nested\\2.txt"), "file should be moved\n");
++
++    ok(dir_exists("testdir6\\nested"), "dir should exist\n");
++    ok(file_exists("testdir6\\nested\\two.txt"), "file should exist\n");
++    ok(!file_exists("testdir6\\nested\\2.txt"), "file should not exist\n");
++    ok(!file_exists("testdir6\\two.txt"), "file should not exist\n");
++
++    ok(!dir_exists("testdir8\\subnested"), "dir should not exist\n");
++    ok(!file_exists("testdir8\\2.txt"), "file should not exist\n");
++    ok(!file_exists("testdir8\\nested\\two.txt"), "file should not exist\n");
++    ok(dir_exists("testdir8\\nested"), "dir should exist\n");
++    ok(file_exists("testdir8\\nested\\2.txt"), "file should exist\n");
++    ok(dir_exists("testdir8\\nested\\subnested"), "dir should exist\n");
++    ok(file_exists("testdir8\\nested\\subnested\\3.txt"), "file should exist\n");
++
++    clean_after_shfo_tests();
++    init_shfo_tests();
++
+     set_curr_dir_path(from, "test1.txt\0test2.txt\0test4.txt\0");
+     set_curr_dir_path(to, "test6.txt\0test7.txt\0test8.txt\0");
+     ok(!SHFileOperationA(&shfo2), "Move many files\n");
+diff -uNarp a/include/taskschd.idl b/include/taskschd.idl
+--- a/include/taskschd.idl	2024-07-28 16:02:13.000000000 -0400
++++ b/include/taskschd.idl	2025-11-19 17:53:55.164223977 -0500
+@@ -72,9 +72,20 @@ typedef enum _TASK_TRIGGER_TYPE2
+     TASK_TRIGGER_REGISTRATION,
+     TASK_TRIGGER_BOOT,
+     TASK_TRIGGER_LOGON,
+-    TASK_TRIGGER_SESSION_STATE_CHANGE = 11
++    TASK_TRIGGER_SESSION_STATE_CHANGE = 11,
++    TASK_TRIGGER_CUSTOM_TRIGGER_01
+ } TASK_TRIGGER_TYPE2;
+ 
++typedef enum _TASK_SESSION_STATE_CHANGE_TYPE
++{
++    TASK_CONSOLE_CONNECT = 1,
++    TASK_CONSOLE_DISCONNECT,
++    TASK_REMOTE_CONNECT,
++    TASK_REMOTE_DISCONNECT,
++    TASK_SESSION_LOCK = 7,
++    TASK_SESSION_UNLOCK
++} TASK_SESSION_STATE_CHANGE_TYPE;
++
+ typedef enum _TASK_ACTION_TYPE
+ {
+     TASK_ACTION_EXEC = 0,
+@@ -96,7 +107,10 @@ typedef enum _TASK_COMPATIBILITY
+     TASK_COMPATIBILITY_AT,
+     TASK_COMPATIBILITY_V1,
+     TASK_COMPATIBILITY_V2,
+-    TASK_COMPATIBILITY_V2_1
++    TASK_COMPATIBILITY_V2_1,
++    TASK_COMPATIBILITY_V2_2,
++    TASK_COMPATIBILITY_V2_3,
++    TASK_COMPATIBILITY_V2_4
+ } TASK_COMPATIBILITY;
+ 
+ typedef enum _TASK_CREATION
+@@ -121,9 +135,21 @@ interface ITaskSettings;
+ interface IIdleSettings;
+ interface IRunningTask;
+ interface IRunningTaskCollection;
++interface ITaskNamedValuePair;
++interface ITaskNamedValueCollection;
+ interface ITrigger;
+ interface ITriggerCollection;
++interface IIdleTrigger;
++interface ILogonTrigger;
++interface ISessionStateChangeTrigger;
++interface IEventTrigger;
+ interface ITimeTrigger;
++interface IDailyTrigger;
++interface IWeeklyTrigger;
++interface IMonthlyTrigger;
++interface IMonthlyDOWTrigger;
++interface IBootTrigger;
++interface IRegistrationTrigger;
+ interface IRepetitionPattern;
+ interface IAction;
+ interface IActionCollection;
+@@ -373,6 +399,38 @@ interface IRunningTaskCollection : IDisp
+ [
+     object,
+     oleautomation,
++    dual,
++    nonextensible,
++    uuid(39038068-2b46-4afd-8662-7bb6f868d221)
++]
++interface ITaskNamedValuePair : IDispatch
++{
++    [propget] HRESULT Name([out, retval] BSTR *pName);
++    [propput] HRESULT Name([in] BSTR name);
++    [propget] HRESULT Value([out, retval] BSTR *pValue);
++    [propput] HRESULT Value([in] BSTR value);
++}
++
++[
++    object,
++    oleautomation,
++    dual,
++    nonextensible,
++    uuid(b4ef826b-63c3-46e4-a504-ef69e4f7ea4d)
++]
++interface ITaskNamedValueCollection : IDispatch
++{
++    [propget] HRESULT Count([out, retval] LONG *count);
++    [propget] HRESULT Item([in] VARIANT index, [out, retval] ITaskNamedValuePair **pair);
++    [propget] HRESULT _NewEnum([out, retval] IUnknown **penum);
++    HRESULT Create([in] BSTR name, [in] BSTR value, [out, retval] ITaskNamedValuePair **pair);
++    HRESULT Remove([in] LONG index);
++    HRESULT Clear();
++}
++
++[
++    object,
++    oleautomation,
+     uuid(09941815-ea89-4b5b-89e0-2a773801fac3)
+ ]
+ interface ITrigger : IDispatch
+@@ -393,6 +451,74 @@ interface ITrigger : IDispatch
+ }
+ 
+ [
++    uuid(d537d2b0-9fb3-4d34-9739-1ff5ce7b1ef3),
++    oleautomation,
++    dual,
++    nonextensible
++]
++interface IIdleTrigger : ITrigger
++{
++}
++
++[
++    uuid(72dade38-fae4-4b3e-baf4-5d009af02b1c),
++    oleautomation,
++    dual,
++    nonextensible
++]
++interface ILogonTrigger : ITrigger
++{
++    [propget] HRESULT Delay([out, retval] BSTR *pDelay);
++    [propput] HRESULT Delay([in] BSTR delay);
++    [propget] HRESULT UserId([out, retval] BSTR *pUser);
++    [propput] HRESULT UserId([in] BSTR user);
++}
++
++[
++    uuid(754da71b-4385-4475-9dd9-598294fa3641),
++    oleautomation,
++    dual,
++    nonextensible
++]
++interface ISessionStateChangeTrigger : ITrigger
++{
++    [propget] HRESULT Delay([out, retval] BSTR *pDelay);
++    [propput] HRESULT Delay([in] BSTR delay);
++    [propget] HRESULT UserId([out, retval] BSTR *pUser);
++    [propput] HRESULT UserId([in] BSTR user);
++    [propget] HRESULT StateChange([out, retval] TASK_SESSION_STATE_CHANGE_TYPE *pType);
++    [propput] HRESULT StateChange([in] TASK_SESSION_STATE_CHANGE_TYPE type);
++}
++
++[
++    uuid(d45b0167-9653-4eef-b94f-0732ca7af251),
++    oleautomation,
++    dual,
++    nonextensible
++]
++interface IEventTrigger : ITrigger
++{
++    [propget] HRESULT Subscription([out, retval] BSTR *pQuery);
++    [propput] HRESULT Subscription([in] BSTR query);
++    [propget] HRESULT Delay([out, retval] BSTR *pDelay);
++    [propput] HRESULT Delay([in] BSTR delay);
++    [propget] HRESULT ValueQueries([out, retval] ITaskNamedValueCollection **ppNamedXPaths);
++    [propput] HRESULT ValueQueries([in] ITaskNamedValueCollection *pNamedXPaths);
++}
++
++[
++    uuid(b45747e0-eba7-4276-9f29-85c5bb300006),
++    object,
++    oleautomation,
++    nonextensible
++]
++interface ITimeTrigger : ITrigger
++{
++    [propget] HRESULT RandomDelay([out, retval] BSTR *delay);
++    [propput] HRESULT RandomDelay([in] BSTR delay);
++}
++
++[
+     odl,
+     uuid(126c5cd8-b288-41d5-8dbf-e491446adc5c),
+     oleautomation,
+@@ -408,6 +534,72 @@ interface IDailyTrigger : ITrigger
+ }
+ 
+ [
++    uuid(5038fc98-82ff-436d-8728-a512a57c9dc1),
++    oleautomation,
++    dual,
++    nonextensible
++]
++interface IWeeklyTrigger : ITrigger
++{
++    [propget] HRESULT DaysOfWeek([out, retval] short *pDays);
++    [propput] HRESULT DaysOfWeek([in] short days);
++    [propget] HRESULT WeeksInterval([out, retval] short *pWeeks);
++    [propput] HRESULT WeeksInterval([in] short weeks);
++    [propget] HRESULT RandomDelay([out, retval] BSTR *pRandomDelay);
++    [propput] HRESULT RandomDelay([in] BSTR randomDelay);
++}
++
++[
++    uuid(97c45ef1-6b02-4a1a-9c0e-1ebfba1500ac),
++    oleautomation,
++    dual,
++    nonextensible
++]
++interface IMonthlyTrigger : ITrigger
++{
++    [propget] HRESULT DaysOfMonth([out, retval] short *pDays);
++    [propput] HRESULT DaysOfMonth([in] short days);
++    [propget] HRESULT MonthsOfYear([out, retval] short *pMonths);
++    [propput] HRESULT MonthsOfYear([in] short months);
++    [propget] HRESULT RunOnLastDayOfMonth([out, retval] VARIANT_BOOL *pLastDay);
++    [propput] HRESULT RunOnLastDayOfMonth([in] VARIANT_BOOL lastDay);
++    [propget] HRESULT RandomDelay([out, retval] BSTR *pRandomDelay);
++    [propput] HRESULT RandomDelay([in] BSTR randomDelay);
++}
++
++[
++    uuid(77d025a3-90fa-43aa-b52e-cda5499b946a),
++    oleautomation,
++    dual,
++    nonextensible
++]
++interface IMonthlyDOWTrigger : ITrigger
++{
++    [propget] HRESULT DaysOfWeek([out, retval] short *pDays);
++    [propput] HRESULT DaysOfWeek([in] short days);
++    [propget] HRESULT WeeksOfMonth([out, retval] short *pWeeks);
++    [propput] HRESULT WeeksOfMonth([in] short weeks);
++    [propget] HRESULT MonthsOfYear([out, retval] short *pMonths);
++    [propput] HRESULT MonthsOfYear([in] short months);
++    [propget] HRESULT RunOnLastWeekOfMonth([out, retval] VARIANT_BOOL *pLastWeek);
++    [propput] HRESULT RunOnLastWeekOfMonth([in] VARIANT_BOOL lastWeek);
++    [propget] HRESULT RandomDelay([out, retval] BSTR *pRandomDelay);
++    [propput] HRESULT RandomDelay([in] BSTR randomDelay);
++}
++
++[
++    uuid(2a9c35da-d357-41f4-bbc1-207ac1b1f3cb),
++    oleautomation,
++    dual,
++    nonextensible
++]
++interface IBootTrigger : ITrigger
++{
++    [propget] HRESULT Delay([out, retval] BSTR *pDelay);
++    [propput] HRESULT Delay([in] BSTR delay);
++}
++
++[
+     uuid(4c8fec3a-c218-4e0c-b23d-629024db91a2),
+     oleautomation,
+     dual,
+@@ -435,17 +627,6 @@ interface ITriggerCollection : IDispatch
+ }
+ 
+ [
+-    object,
+-    oleautomation,
+-    uuid(b45747e0-eba7-4276-9f29-85c5bb300006)
+-]
+-interface ITimeTrigger : ITrigger
+-{
+-    [propget] HRESULT RandomDelay([out, retval] BSTR *delay);
+-    [propput] HRESULT RandomDelay([in] BSTR delay);
+-}
+-
+-[
+     object,
+     oleautomation,
+     uuid(7fb9acf1-26be-400e-85b5-294b9c75dfd6)
+-- 
+2.47.1
+
