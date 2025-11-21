@@ -1511,24 +1511,130 @@ if [ "$CONFIGURE_EXIT" -ne 0 ]; then
   exit 1
 fi
 
-echo "Building Wine (64-bit only)..."
-echo
+echo -e "${CYAN}${BOLD}Building Wine${NC}"
+echo -e "${BLUE}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo ""
+echo -e "${YELLOW}This may take a while... Would you like to play Tetris while waiting?${NC}"
+echo ""
+
+# Check for available Tetris games and auto-install if needed
+find_tetris_game() {
+  local games=("vitetris" "bastet" "tetris" "tint" "ntris")
+  for game in "${games[@]}"; do
+    if command -v "$game" >/dev/null 2>&1; then
+      echo "$game"
+      return 0
+    fi
+  done
+  return 1
+}
+
+install_tetris_game() {
+  echo -e "${CYAN}Installing Tetris game for your entertainment...${NC}"
+  case "$PKG_MGR" in
+    apt)
+      # Try vitetris first, fallback to bastet
+      if sudo apt install -y vitetris 2>/dev/null; then
+        echo "vitetris"
+        return 0
+      elif sudo apt install -y bastet 2>/dev/null; then
+        echo "bastet"
+        return 0
+      fi
+      ;;
+    dnf)
+      if sudo dnf install -y vitetris 2>/dev/null; then
+        echo "vitetris"
+        return 0
+      elif sudo dnf install -y bastet 2>/dev/null; then
+        echo "bastet"
+        return 0
+      fi
+      ;;
+    pacman)
+      if sudo pacman -S --noconfirm vitetris 2>/dev/null; then
+        echo "vitetris"
+        return 0
+      elif sudo pacman -S --noconfirm bastet 2>/dev/null; then
+        echo "bastet"
+        return 0
+      fi
+      ;;
+  esac
+  return 1
+}
+
+TETRIS_GAME=$(find_tetris_game)
+PLAY_TETRIS=false
+
+if [ -z "$TETRIS_GAME" ]; then
+  echo -e "${YELLOW}No Tetris game found. Auto-installing one for you...${NC}"
+  TETRIS_GAME=$(install_tetris_game)
+  if [ -n "$TETRIS_GAME" ]; then
+    echo -e "${GREEN}✓ Tetris installed: $TETRIS_GAME${NC}"
+  else
+    echo -e "${YELLOW}⚠ Could not auto-install Tetris, but build will continue${NC}"
+  fi
+  echo ""
+fi
+
+if [ -n "$TETRIS_GAME" ]; then
+  if prompt_yes_no "Play Tetris while building? (Game: $TETRIS_GAME)" "y"; then
+    PLAY_TETRIS=true
+  fi
+fi
 
 # Build Wine and capture errors
 BUILD_LOG="wine-build.log"
-if ! make -j$BUILD_THREADS >"$BUILD_LOG" 2>&1; then
-  BUILD_FAILED=1
+
+if [ "$PLAY_TETRIS" = "true" ] && [ -n "$TETRIS_GAME" ]; then
   echo ""
-  echo "❌ ERROR: Wine build failed!"
+  echo -e "${GREEN}Starting build in background...${NC}"
+  echo -e "${CYAN}Launching $TETRIS_GAME - enjoy!${NC}"
+  echo -e "${YELLOW}When you're done playing, the build will continue...${NC}"
+  echo ""
+  
+  # Start build in background
+  (make -j$BUILD_THREADS >"$BUILD_LOG" 2>&1) &
+  BUILD_PID=$!
+  
+  # Launch Tetris
+  $TETRIS_GAME 2>/dev/null || true
+  
+  # Wait for build to complete
+  echo ""
+  echo -e "${CYAN}Waiting for build to complete...${NC}"
+  wait $BUILD_PID
+  BUILD_EXIT=$?
+  
+  if [ $BUILD_EXIT -ne 0 ]; then
+    BUILD_FAILED=1
+  fi
+else
+  # Normal build without Tetris
+  echo -e "${CYAN}Building... (this may take 10-30 minutes)${NC}"
+  echo ""
+  if ! make -j$BUILD_THREADS >"$BUILD_LOG" 2>&1; then
+    BUILD_FAILED=1
+  else
+    BUILD_FAILED=0
+  fi
+fi
+
+# Check build result
+if [ "${BUILD_FAILED:-0}" = "1" ]; then
+  echo ""
+  echo -e "${RED}${BOLD}❌ ERROR: Wine build failed!${NC}"
   echo "Build log saved to: $BUILD_LOG"
   echo ""
-  echo "Last 20 lines of build log:"
+  echo -e "${YELLOW}Last 20 lines of build log:${NC}"
   tail -20 "$BUILD_LOG"
   echo ""
 else
   # Filter out parser/sql warnings from output
   grep -Ev "(parser|sql)\.y: (warning|note):" "$BUILD_LOG" || true
-  echo "✓ Wine build completed successfully"
+  echo ""
+  echo -e "${GREEN}${BOLD}✓ Wine build completed successfully!${NC}"
 fi
 
 # Install Wine (only if build succeeded)
