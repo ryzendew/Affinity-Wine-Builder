@@ -1,15 +1,16 @@
 #!/bin/bash
 #
 # Wine Build Script
-# Builds 64-bit Wine from source with automatic patch application (OpenCL required)
-# Can be run standalone (without containers) or in a container environment
+# Builds Wine from source with automatic patch application
+# Professional, user-friendly interactive build system
 #
 # Features:
 #   - Interactive menu to select Wine version (from available patches)
 #   - Automatic download of Wine source code
 #   - Automatic patch application
-#   - Multi-distro support (Arch, Fedora, Debian/Ubuntu)
+#   - Multi-distro support (Arch, Fedora, Debian/Ubuntu/Mint/Zorin)
 #   - Auto-detects CPU threads and package manager
+#   - User-friendly prompts and dependency management
 #
 # Usage:
 #   ./build-wine.sh                           # Interactive menu to select version
@@ -19,27 +20,130 @@
 #   BUILD_WAYLAND=0 ./build-wine.sh           # Disable Wayland support
 #
 
-# Auto-detect CPU threads
-if command -v nproc >/dev/null 2>&1; then
-  DETECTED_THREADS=$(nproc)
-elif [ -f /proc/cpuinfo ]; then
-  DETECTED_THREADS=$(grep -c processor /proc/cpuinfo)
-else
-  DETECTED_THREADS=4
-fi
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+NC='\033[0m' # No Color
+BOLD='\033[1m'
 
-BUILD_THREADS="${BUILD_THREADS:-$DETECTED_THREADS}"
-echo "Using $BUILD_THREADS threads for build (detected: $DETECTED_THREADS)."
+# Print banner
+print_banner() {
+  clear
+  echo -e "${CYAN}${BOLD}"
+  echo "╔════════════════════════════════════════════════════════════════╗"
+  echo "║                                                                ║"
+  echo "║           Wine Build Script - Professional Edition          ║"
+  echo "║                                                                ║"
+  echo "║     Automated Wine compilation with patch support             ║"
+  echo "║                                                                ║"
+  echo "╚════════════════════════════════════════════════════════════════╝"
+  echo -e "${NC}"
+}
 
+# Detect distribution information
+detect_distribution() {
+  local distro_id=""
+  local distro_name=""
+  local distro_version=""
+  local distro_pretty=""
+  
+  if [ -f /etc/os-release ]; then
+    distro_id=$(grep "^ID=" /etc/os-release | cut -d= -f2 | tr -d '"' | tr '[:upper:]' '[:lower:]')
+    distro_name=$(grep "^NAME=" /etc/os-release | cut -d= -f2 | tr -d '"')
+    distro_version=$(grep "^VERSION_ID=" /etc/os-release | cut -d= -f2 | tr -d '"')
+    distro_pretty=$(grep "^PRETTY_NAME=" /etc/os-release | cut -d= -f2 | tr -d '"')
+  fi
+  
+  # Map common distro IDs to friendly names
+  case "$distro_id" in
+    ubuntu)
+      distro_name="Ubuntu"
+      ;;
+    linuxmint|mint)
+      distro_name="Linux Mint"
+      ;;
+    zorin)
+      distro_name="Zorin OS"
+      ;;
+    debian)
+      distro_name="Debian"
+      ;;
+    fedora)
+      distro_name="Fedora"
+      ;;
+    arch|archlinux)
+      distro_name="Arch Linux"
+      ;;
+    pikaos)
+      distro_name="PikaOS"
+      ;;
+  esac
+  
+  echo "$distro_name|$distro_version|$distro_pretty"
+}
+
+# Display system information
+display_system_info() {
+  local distro_info=$(detect_distribution)
+  local distro_name=$(echo "$distro_info" | cut -d'|' -f1)
+  local distro_version=$(echo "$distro_info" | cut -d'|' -f2)
+  local distro_pretty=$(echo "$distro_info" | cut -d'|' -f3)
+  
+  # Auto-detect CPU threads
+  if command -v nproc >/dev/null 2>&1; then
+    DETECTED_THREADS=$(nproc)
+  elif [ -f /proc/cpuinfo ]; then
+    DETECTED_THREADS=$(grep -c processor /proc/cpuinfo)
+  else
+    DETECTED_THREADS=4
+  fi
+  
+  BUILD_THREADS="${BUILD_THREADS:-$DETECTED_THREADS}"
+  
+  echo -e "${BLUE}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+  echo -e "${CYAN}${BOLD}System Information:${NC}"
+  echo -e "${BLUE}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+  echo -e "  ${BOLD}Distribution:${NC}     ${GREEN}${distro_pretty:-${distro_name} ${distro_version}}${NC}"
+  echo -e "  ${BOLD}Package Manager:${NC} ${GREEN}${PKG_MGR}${NC}"
+  echo -e "  ${BOLD}CPU Threads:${NC}     ${GREEN}${DETECTED_THREADS} (using ${BUILD_THREADS} for build)${NC}"
+  echo -e "${BLUE}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+  echo ""
+}
+
+# Prompt for yes/no
+prompt_yes_no() {
+  local prompt_text="$1"
+  local default="${2:-n}"
+  local response
+  
+  while true; do
+    if [ "$default" = "y" ]; then
+      echo -ne "${YELLOW}${prompt_text} [Y/n]: ${NC}"
+    else
+      echo -ne "${YELLOW}${prompt_text} [y/N]: ${NC}"
+    fi
+    read -r response
+    response=${response:-$default}
+    case "$response" in
+      [Yy]|[Yy][Ee][Ss])
+        return 0
+        ;;
+      [Nn]|[Nn][Oo])
+        return 1
+        ;;
+      *)
+        echo -e "${RED}Please answer yes or no.${NC}"
+        ;;
+    esac
+  done
+}
+
+# Initialize variables
 BUILD_DEBUG="${BUILD_DEBUG:-0}"
-if [ "$BUILD_DEBUG" = "1" ]; then
-  echo "The build will produce debugging information."
-fi
-
 BUILD_WAYLAND="${BUILD_WAYLAND:-1}"
-if [ "$BUILD_WAYLAND" = "0" ]; then
-  echo "The build will skip the Wine Wayland driver."
-fi
 
 # Detect package manager and distribution
 detect_package_manager() {
@@ -63,8 +167,28 @@ is_pikaos() {
   fi
 }
 
+# Detect package manager
 PKG_MGR=$(detect_package_manager)
-echo "Detected package manager: $PKG_MGR"
+
+# Show banner and system info
+print_banner
+display_system_info
+
+# Welcome message and confirmation
+echo -e "${CYAN}${BOLD}Welcome to the Wine Build Script!${NC}"
+echo ""
+echo -e "This script will help you build Wine from source with the following features:"
+echo -e "  • Automatic dependency detection and installation"
+echo -e "  • Wine version selection from available patches"
+echo -e "  • Automatic patch application"
+echo -e "  • Optimized build configuration"
+echo ""
+
+if ! prompt_yes_no "Do you wish to continue?" "y"; then
+  echo -e "${YELLOW}Build cancelled by user.${NC}"
+  exit 0
+fi
+echo ""
 
 # Check if OpenCL headers are available (mandatory)
 check_opencl_headers() {
@@ -91,73 +215,265 @@ check_package_installed_pacman() {
 
 # Install packages based on package manager (only missing ones)
 install_packages_64bit() {
-  echo "Checking required development packages..."
+  echo -e "${BLUE}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+  echo -e "${CYAN}${BOLD}Checking Build Dependencies${NC}"
+  echo -e "${BLUE}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+  echo ""
   local packages_to_install=()
+  local missing_packages=()
   
   case "$PKG_MGR" in
     apt)
-      # Check if we're on PikaOS or regular Ubuntu/Debian
-      if is_pikaos; then
-        echo "Detected PikaOS (Ubuntu-based)"
+      # Detect Ubuntu/Debian-based distributions (Ubuntu, Mint, Zorin, Debian, PikaOS, etc.)
+      local distro_name=""
+      local distro_version=""
+      if [ -f /etc/os-release ]; then
+        distro_name=$(grep "^ID=" /etc/os-release | cut -d= -f2 | tr -d '"' | tr '[:upper:]' '[:lower:]')
+        distro_version=$(grep "^VERSION_ID=" /etc/os-release | cut -d= -f2 | tr -d '"')
+      fi
+      
+      echo "Detected distribution: ${distro_name:-unknown} ${distro_version:-unknown}"
+      
+      # Enable multiarch for 32-bit packages (required for Wine 32-bit support)
+      if ! dpkg --print-architecture | grep -q i386 2>/dev/null; then
+        echo "Enabling i386 architecture for 32-bit Wine support..."
+        sudo dpkg --add-architecture i386 2>/dev/null || true
+        sudo apt update 2>/dev/null || true
       fi
       
       # First, try to use apt build-dep which automatically installs all build dependencies
+      # This works on Ubuntu, Debian, Mint, Zorin and other Debian-based distros
       echo "Attempting to install Wine build dependencies using 'apt build-dep wine'..."
       if sudo apt build-dep -y wine 2>/dev/null; then
         echo "  ✓ Wine build dependencies installed via build-dep"
+        # Still need to ensure MinGW cross-compiler is installed
+        if ! check_package_installed_apt "gcc-mingw-w64"; then
+          echo "  Installing MinGW cross-compiler..."
+          sudo apt install -y gcc-mingw-w64 2>/dev/null || true
+        fi
       else
         echo "  Note: 'apt build-dep wine' failed or wine package not available, installing packages manually..."
         local required_packages=(
-          # Build tools
-          "build-essential" "gcc" "g++" "make" "bison" "flex" "gettext" "perl"
-          # MinGW cross-compilers
+          # Essential build tools (works on all Ubuntu/Debian variants)
+          "build-essential"
+          "gcc"
+          "g++"
+          "make"
+          "bison"
+          "flex"
+          "gettext"
+          "perl"
+          "pkg-config"
+          
+          # MinGW cross-compilers (for PE binaries)
           "gcc-mingw-w64"
-          # Core development libraries
-          "samba-dev" "libcups2-dev" "ocl-icd-opencl-dev" "opencl-headers"
-          # Audio libraries
-          "libasound2-dev" "libpulse-dev"
-          # Font libraries
-          "libfontconfig1-dev" "libfreetype6-dev"
-          # X11 libraries
-          "libx11-dev" "libxext-dev" "libxrender-dev" "libxrandr-dev"
-          "libxinerama-dev" "libxi-dev" "libxcursor-dev" "libxfixes-dev"
-          "libxcomposite-dev" "libxkbcommon-dev" "x11proto-dev"
-          # Graphics libraries
-          "libgl-dev" "libglu1-mesa-dev" "vulkan-dev" "libvulkan-dev"
+          "mingw-w64"
+          
+          # Core Wine dependencies - 64-bit versions
+          # Note: samba-dev may not exist on all distros, Wine uses libsamba-dev or samba-libs-dev
+          # We'll try samba-dev first, fallback handled by apt
+          "samba-dev"
+          "libsamba-dev"
+          "libcups2-dev"
+          "ocl-icd-opencl-dev"
+          "opencl-headers"
+          
+          # Audio libraries - 64-bit
+          "libasound2-dev"
+          "libpulse-dev"
+          
+          # Font libraries - 64-bit
+          "libfontconfig1-dev"
+          "libfreetype6-dev"
+          
+          # X11 libraries - 64-bit
+          "libx11-dev"
+          "libxext-dev"
+          "libxrender-dev"
+          "libxrandr-dev"
+          "libxinerama-dev"
+          "libxi-dev"
+          "libxcursor-dev"
+          "libxfixes-dev"
+          "libxcomposite-dev"
+          "libxdamage-dev"
+          "libxxf86vm-dev"
+          "x11proto-dev"
+          "x11proto-xinerama-dev"
+          "x11proto-xf86vidmode-dev"
+          
+          # XKB support
+          "libxkbcommon-dev"
+          "libxkbcommon-x11-dev"
+          
+          # Graphics libraries - 64-bit
+          # libgl1-mesa-dev is the correct package (libgl-dev is a virtual package)
+          "libgl1-mesa-dev"
+          "libglu1-mesa-dev"
+          "mesa-common-dev"
           "libosmesa6-dev"
+          
+          # Vulkan support
+          # vulkan-dev may not exist, libvulkan-dev is the standard package
+          "libvulkan-dev"
+          "vulkan-tools"
+          "vulkan-validationlayers-dev"
+          
           # Wayland support
-          "libwayland-dev" "wayland-protocols"
-          # GStreamer
-          "libgstreamer1.0-dev" "libgstreamer-plugins-base1.0-dev"
-          # SDL
+          "libwayland-dev"
+          "wayland-protocols"
+          "libwayland-egl1-mesa-dev"
+          
+          # GStreamer - 64-bit
+          "libgstreamer1.0-dev"
+          "libgstreamer-plugins-base1.0-dev"
+          "gstreamer1.0-plugins-base"
+          
+          # SDL - 64-bit
           "libsdl2-dev"
-          # System libraries
-          "libdbus-1-dev" "libudev-dev" "libunwind-dev"
-          # Optional but recommended
-          "libxml2-dev" "libxslt1-dev" "libjpeg-dev" "libpng-dev"
-          "libtiff-dev" "liblcms2-dev" "libusb-1.0-0-dev" "libpcap-dev"
-          "libncurses5-dev" "libkrb5-dev" "unixodbc-dev" "libv4l-dev"
-          "libgphoto2-dev" "libsane-dev" "libpcsclite-dev"
-          # Multimedia (optional)
-          "libavcodec-dev" "libavformat-dev" "libavutil-dev" "libswscale-dev"
-          # ISDN (optional)
+          
+          # System libraries - 64-bit
+          "libdbus-1-dev"
+          "libudev-dev"
+          "libunwind-dev"
+          "libsystemd-dev"
+          
+          # GnuTLS for secure connections
+          "libgnutls28-dev"
+          
+          # Optional but recommended - 64-bit
+          "libxml2-dev"
+          "libxslt1-dev"
+          # JPEG support (libjpeg-turbo8-dev is preferred, libjpeg-dev is fallback)
+          "libjpeg-turbo8-dev"
+          "libjpeg-dev"
+          "libpng-dev"
+          # TIFF support (version may vary by distro)
+          "libtiff-dev"
+          "libtiff5-dev"
+          "libtiffxx5"
+          "liblcms2-dev"
+          "libusb-1.0-0-dev"
+          # pcap support (libpcap0.8-dev is the standard package)
+          "libpcap0.8-dev"
+          "libpcap-dev"
+          # ncurses support (libncurses5-dev is standard, libncurses-dev is virtual)
+          "libncurses5-dev"
+          "libncurses-dev"
+          "libncursesw5-dev"
+          "libkrb5-dev"
+          "unixodbc-dev"
+          "libv4l-dev"
+          "v4l-utils"
+          "libgphoto2-dev"
+          "libsane-dev"
+          "libpcsclite-dev"
+          "libgsm1-dev"
+          "libmpg123-dev"
+          "libopenal-dev"
+          "libopenal1"
+          
+          # Multimedia libraries (optional)
+          "libavcodec-dev"
+          "libavformat-dev"
+          "libavutil-dev"
+          "libswscale-dev"
+          "libswresample-dev"
+          "libavfilter-dev"
+          
+          # ISDN support (optional, may not be available on all distros)
           "libcapi20-dev"
         )
+        
+        # Add 32-bit (i386) packages for Wine 32-bit support
+        # These are required when building with --enable-archs=i386,x86_64
+        local required_packages_i386=(
+          "libasound2-dev:i386"
+          "libpulse-dev:i386"
+          "libdbus-1-dev:i386"
+          "libfontconfig1-dev:i386"
+          "libfreetype6-dev:i386"
+          "libgnutls28-dev:i386"
+          "libgl1-mesa-dev:i386"
+          "libglu1-mesa-dev:i386"
+          "libunwind-dev:i386"
+          "libx11-dev:i386"
+          "libxcomposite-dev:i386"
+          "libxcursor-dev:i386"
+          "libxfixes-dev:i386"
+          "libxi-dev:i386"
+          "libxrandr-dev:i386"
+          "libxrender-dev:i386"
+          "libxext-dev:i386"
+          "libxinerama-dev:i386"
+          "libgstreamer1.0-dev:i386"
+          "libgstreamer-plugins-base1.0-dev:i386"
+          "libosmesa6-dev:i386"
+          "libsdl2-dev:i386"
+          "libudev-dev:i386"
+          "libvulkan-dev:i386"
+          "libcapi20-dev:i386"
+          "libcups2-dev:i386"
+          "libgphoto2-dev:i386"
+          "libsane-dev:i386"
+          "libkrb5-dev:i386"
+          "libpcap-dev:i386"
+          "libusb-1.0-0-dev:i386"
+          "ocl-icd-opencl-dev:i386"
+        )
+        
+        # Check and collect missing 64-bit packages
         for pkg in "${required_packages[@]}"; do
           if check_package_installed_apt "$pkg"; then
-            echo "  ✓ $pkg is already installed"
+            echo -e "  ${GREEN}✓${NC} $pkg ${GREEN}(installed)${NC}"
           else
-            echo "  ✗ $pkg is missing"
+            echo -e "  ${RED}✗${NC} $pkg ${YELLOW}(missing)${NC}"
             packages_to_install+=("$pkg")
+            missing_packages+=("$pkg")
+          fi
+        done
+        
+        # Check and collect missing 32-bit packages
+        for pkg in "${required_packages_i386[@]}"; do
+          if check_package_installed_apt "$pkg"; then
+            echo -e "  ${GREEN}✓${NC} $pkg ${GREEN}(installed)${NC}"
+          else
+            echo -e "  ${RED}✗${NC} $pkg ${YELLOW}(missing - 32-bit)${NC}"
+            packages_to_install+=("$pkg")
+            missing_packages+=("$pkg")
           fi
         done
         
         if [ ${#packages_to_install[@]} -gt 0 ]; then
-          echo "Installing missing packages: ${packages_to_install[*]}"
-          sudo apt install -y "${packages_to_install[@]}"
-          echo "  ✓ Package installation complete"
+          echo ""
+          echo -e "${YELLOW}${BOLD}The following packages will be installed:${NC}"
+          echo -e "${BLUE}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+          local count=1
+          for pkg in "${missing_packages[@]}"; do
+            printf "  %3d. %s\n" "$count" "$pkg"
+            ((count++))
+          done
+          echo -e "${BLUE}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+          echo -e "${YELLOW}Total packages to install: ${#packages_to_install[@]}${NC}"
+          echo ""
+          
+          if ! prompt_yes_no "Do you want to install these dependencies now? (sudo required)" "y"; then
+            echo -e "${RED}Dependency installation cancelled. Cannot proceed without dependencies.${NC}"
+            exit 1
+          fi
+          
+          echo ""
+          echo -e "${CYAN}Installing packages...${NC}"
+          # Try to install all packages, some may fail if not available
+          if sudo apt install -y "${packages_to_install[@]}" 2>/dev/null || \
+             sudo apt install -y --fix-missing "${packages_to_install[@]}" 2>/dev/null; then
+            echo -e "${GREEN}✓ Package installation completed successfully${NC}"
+          else
+            echo -e "${YELLOW}⚠ Some packages may have failed to install, but continuing...${NC}"
+          fi
         else
-          echo "  ✓ All required packages are already installed"
+          echo ""
+          echo -e "${GREEN}${BOLD}✓ All required packages are already installed${NC}"
         fi
       fi
       ;;
@@ -457,7 +773,7 @@ select_wine_version() {
   local versions=($(get_available_versions))
   
   if [ ${#versions[@]} -eq 0 ]; then
-    echo "Error: No patch directories found. Cannot determine available Wine versions."
+    echo -e "${RED}Error: No patch directories found. Cannot determine available Wine versions.${NC}"
     exit 1
   fi
   
@@ -470,48 +786,73 @@ select_wine_version() {
         return
       fi
     done
-    echo "Warning: WINE_VERSION=$WINE_VERSION not found in patches. Available versions: ${versions[*]}" >&2
+    echo -e "${YELLOW}Warning: WINE_VERSION=$WINE_VERSION not found in patches. Available versions: ${versions[*]}${NC}" >&2
   fi
   
   # Output menu to stderr so it displays even when function output is captured
   echo "" >&2
-  echo "==========================================" >&2
-  echo "Available Wine versions (with patches):" >&2
-  echo "==========================================" >&2
+  echo -e "${BLUE}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}" >&2
+  echo -e "${CYAN}${BOLD}Wine Version Selection${NC}" >&2
+  echo -e "${BLUE}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}" >&2
+  echo "" >&2
+  echo -e "${BOLD}Available Wine versions (with patches):${NC}" >&2
   echo "" >&2
   local i=1
   for version in "${versions[@]}"; do
-    printf "  %d) Wine version %s\n" "$i" "$version" >&2
+    printf "  ${GREEN}%2d${NC}) ${CYAN}Wine version %s${NC}\n" "$i" "$version" >&2
     ((i++))
   done
-  printf "  %d) Exit\n" "$i" >&2
+  printf "  ${RED}%2d${NC}) ${YELLOW}Exit${NC}\n" "$i" >&2
   echo "" >&2
-  echo "==========================================" >&2
-  echo "" >&2
-  echo "Example: Enter '1' to build Wine 9.14, '2' for Wine 9.16, etc." >&2
+  echo -e "${BLUE}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}" >&2
   echo "" >&2
   
   while true; do
-    echo -n "Select Wine version to build [1-$i]: " >&2
+    echo -ne "${YELLOW}Select Wine version to build [1-$i]: ${NC}" >&2
     read choice
     
     if [ "$choice" = "$i" ] || [ -z "$choice" ]; then
-      echo "Exiting." >&2
+      echo -e "${YELLOW}Exiting.${NC}" >&2
       exit 0
     fi
     
     if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -lt "$i" ]; then
       local selected_version="${versions[$((choice-1))]}"
       echo "" >&2
-      echo "✓ Selected: Wine version $selected_version" >&2
+      echo -e "${GREEN}${BOLD}✓ Selected: Wine version $selected_version${NC}" >&2
       echo "" >&2
       # Output version to stdout for capture
       echo "$selected_version"
       return
     else
-      echo "Invalid choice. Please enter a number between 1 and $i." >&2
+      echo -e "${RED}Invalid choice. Please enter a number between 1 and $i.${NC}" >&2
     fi
   done
+}
+
+# Show build options menu
+show_build_options_menu() {
+  echo ""
+  echo -e "${BLUE}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+  echo -e "${CYAN}${BOLD}Build Configuration Options${NC}"
+  echo -e "${BLUE}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+  echo ""
+  echo -e "${BOLD}Current Configuration:${NC}"
+  echo -e "  ${BOLD}Wine Version:${NC}     ${GREEN}${SELECTED_VERSION:-Not selected}${NC}"
+  echo -e "  ${BOLD}Build Threads:${NC}   ${GREEN}${BUILD_THREADS}${NC}"
+  echo -e "  ${BOLD}Debug Symbols:${NC}   ${GREEN}$([ "$BUILD_DEBUG" = "1" ] && echo "Yes" || echo "No")${NC}"
+  echo -e "  ${BOLD}Wayland Support:${NC} ${GREEN}$([ "$BUILD_WAYLAND" = "0" ] && echo "Disabled" || echo "Enabled")${NC}"
+  echo -e "  ${BOLD}Install Prefix:${NC}   ${GREEN}${INSTALL_PREFIX}${NC}"
+  echo ""
+  echo -e "${BLUE}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+  echo ""
+  
+  if prompt_yes_no "Proceed with build using these settings?" "y"; then
+    return 0
+  else
+    echo -e "${YELLOW}Build cancelled by user.${NC}"
+    exit 0
+  fi
 }
 
 # Download Wine source code
@@ -711,17 +1052,25 @@ elif [ -d "wine-src" ] && [ -f "wine-src/configure" ]; then
   WINE_SRC_DIR="wine-src"
 fi
 
+# Determine install prefix early (needed for build options menu)
+INSTALL_PREFIX="$HOME/Documents/ElementalWarrior-wine"
+if [ -d "/wine-builder" ]; then
+  INSTALL_PREFIX="/wine-builder/wine-src/wine-install"
+fi
+
 # If wine source not found, show menu and download
 if [ -z "$WINE_SRC_DIR" ]; then
   echo ""
-  echo "Wine source directory not found."
+  echo -e "${CYAN}${BOLD}Wine Source Code${NC}"
+  echo -e "${BLUE}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+  echo -e "${YELLOW}Wine source directory not found.${NC}"
   echo ""
   
   # Show version selection menu
   SELECTED_VERSION=$(select_wine_version)
   
   if [ -z "$SELECTED_VERSION" ]; then
-    echo "No version selected. Exiting."
+    echo -e "${RED}No version selected. Exiting.${NC}"
     exit 1
   fi
   
@@ -749,18 +1098,22 @@ fi
 # Convert to absolute path for consistency
 WINE_SRC_DIR="$(cd "$WINE_SRC_DIR" && pwd)"
 echo ""
-echo "Using Wine source directory: $WINE_SRC_DIR"
+echo -e "${GREEN}✓${NC} Using Wine source directory: ${CYAN}$WINE_SRC_DIR${NC}"
 
 # If we downloaded a version, use it for patch matching
 if [ -n "$SELECTED_VERSION" ]; then
-  echo "Building Wine version: $SELECTED_VERSION"
+  echo -e "${GREEN}✓${NC} Building Wine version: ${CYAN}${SELECTED_VERSION}${NC}"
 fi
 
 # Prepare the build environment - create all necessary directories
+echo ""
+echo -e "${CYAN}${BOLD}Preparing Build Environment${NC}"
+echo -e "${BLUE}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo ""
 echo "Creating build directories..."
 mkdir -p wine64-build
 mkdir -p "$WINE_SRC_DIR/wine-install"
-echo "Build directories created"
+echo -e "${GREEN}✓${NC} Build directories created"
 
 # Delete old log files for fresh start
 rm -f wine-build.log wine64-build.log wine32-build.log Affinity.log 2>/dev/null || true
@@ -769,30 +1122,34 @@ rm -f wine-build.log wine64-build.log wine32-build.log Affinity.log 2>/dev/null 
 BUILD_FAILED=0
 
 # Apply patches before building
-echo
-echo "Applying patches to Wine source..."
-echo
+echo ""
+echo -e "${CYAN}${BOLD}Applying Patches${NC}"
+echo -e "${BLUE}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo ""
 apply_patches "$WINE_SRC_DIR"
+echo ""
+
+# Install packages (may require sudo password) - BEFORE build options menu
+echo ""
+install_packages_64bit
+echo ""
+
+# Show build options menu before proceeding with build
+show_build_options_menu
 
 ###############################################################################
 # Build Wine (64-bit)
 ###############################################################################
-echo
-echo "Preparing build environment for Wine..."
-echo
+echo ""
+echo -e "${CYAN}${BOLD}Starting Wine Build${NC}"
+echo -e "${BLUE}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo ""
 
 # Ensure build directory exists
 mkdir -p wine64-build
-cd wine64-build || { echo "Error: Failed to change to wine64-build directory"; exit 1; }
+cd wine64-build || { echo -e "${RED}Error: Failed to change to wine64-build directory${NC}"; exit 1; }
 
-# Install packages (may require sudo password)
-install_packages_64bit
-
-# Determine install prefix
-INSTALL_PREFIX="$HOME/Documents/ElementalWarrior-wine"
-if [ -d "/wine-builder" ]; then
-  INSTALL_PREFIX="/wine-builder/wine-src/wine-install"
-fi
+# Install prefix is already set above
 
 # Check if OpenCL headers are available (mandatory)
 if ! check_opencl_headers; then
