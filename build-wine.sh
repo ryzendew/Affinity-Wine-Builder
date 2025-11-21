@@ -106,28 +106,66 @@ install_packages_64bit() {
       fi
       ;;
     dnf)
-      local required_packages=("samba-devel" "cups-devel" "ocl-icd-devel" "opencl-headers" "mingw32-gcc" "mingw64-gcc")
-      for pkg in "${required_packages[@]}"; do
-        if check_package_installed_dnf "$pkg"; then
-          echo "  ✓ $pkg is already installed"
-        else
-          echo "  ✗ $pkg is missing"
-          packages_to_install+=("$pkg")
-        fi
-      done
-      
-      if [ ${#packages_to_install[@]} -gt 0 ]; then
-        echo "Installing missing packages: ${packages_to_install[*]}"
-        # Try with opencl-headers first, fallback if it fails
-        if [[ " ${packages_to_install[@]} " =~ " opencl-headers " ]]; then
-          sudo dnf install -y --allowerasing "${packages_to_install[@]}" 2>/dev/null || \
-          sudo dnf install -y --allowerasing samba-devel cups-devel ocl-icd-devel mingw32-gcc mingw64-gcc
-        else
-          sudo dnf install -y --allowerasing "${packages_to_install[@]}"
-        fi
-        echo "  ✓ Package installation complete"
+      # First, try to use dnf builddep which automatically installs all build dependencies
+      # This is the most reliable method as it uses the exact package names from the wine.spec
+      echo "Attempting to install Wine build dependencies using 'dnf builddep wine'..."
+      if sudo dnf builddep -y wine 2>/dev/null; then
+        echo "  ✓ Wine build dependencies installed via builddep"
       else
-        echo "  ✓ All required packages are already installed"
+        echo "  Note: 'dnf builddep wine' failed or wine package not available, installing packages manually..."
+        local required_packages=(
+          # Build tools
+          "gcc" "gcc-c++" "make" "bison" "flex" "gettext" "perl"
+          # MinGW cross-compilers
+          "mingw32-gcc" "mingw64-gcc"
+          # Core development libraries
+          "samba-devel" "cups-devel" "ocl-icd-devel" "opencl-headers"
+          # Audio libraries
+          "alsa-lib-devel" "pulseaudio-libs-devel"
+          # Font libraries
+          "fontconfig-devel" "freetype-devel"
+          # X11 libraries
+          "libX11-devel" "libXext-devel" "libXrender-devel" "libXrandr-devel"
+          "libXinerama-devel" "libXi-devel" "libXcursor-devel" "libXfixes-devel"
+          "libXcomposite-devel" "libxkbcommon-devel" "xorg-x11-proto-devel"
+          # Graphics libraries
+          "mesa-libGL-devel" "mesa-libGLU-devel" "vulkan-headers" "vulkan-loader-devel"
+          "mesa-libOSMesa-devel"
+          # Wayland support
+          "wayland-devel" "wayland-protocols-devel"
+          # GStreamer
+          "gstreamer1-devel" "gstreamer1-plugins-base-devel"
+          # SDL
+          "SDL2-devel"
+          # System libraries
+          "dbus-devel" "systemd-devel" "libunwind-devel"
+          # Optional but recommended
+          "libxml2-devel" "libxslt-devel" "libjpeg-turbo-devel" "libpng-devel"
+          "libtiff-devel" "lcms2-devel" "libusb-devel" "libpcap-devel"
+          "ncurses-devel" "krb5-devel" "unixODBC-devel" "libv4l-devel"
+          "gphoto2-devel" "sane-backends-devel" "pcsc-lite-devel"
+          # Multimedia (optional)
+          "ffmpeg-devel"
+          # ISDN (optional)
+          "capi20-devel"
+        )
+        for pkg in "${required_packages[@]}"; do
+          if check_package_installed_dnf "$pkg"; then
+            echo "  ✓ $pkg is already installed"
+          else
+            echo "  ✗ $pkg is missing"
+            packages_to_install+=("$pkg")
+          fi
+        done
+        
+        if [ ${#packages_to_install[@]} -gt 0 ]; then
+          echo "Installing missing packages: ${packages_to_install[*]}"
+          sudo dnf install -y --allowerasing "${packages_to_install[@]}" 2>/dev/null || \
+          sudo dnf install -y --allowerasing "${packages_to_install[@]}"
+          echo "  ✓ Package installation complete"
+        else
+          echo "  ✓ All required packages are already installed"
+        fi
       fi
       ;;
     pacman)
