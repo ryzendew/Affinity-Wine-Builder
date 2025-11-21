@@ -1121,6 +1121,44 @@ rm -f wine-build.log wine64-build.log wine32-build.log Affinity.log 2>/dev/null 
 # Initialize build failure flag
 BUILD_FAILED=0
 
+# Store original directory for cleanup
+ORIGINAL_DIR="$(pwd)"
+
+# Cleanup function for build failures
+cleanup_on_failure() {
+  if [ "${BUILD_FAILED:-0}" = "1" ]; then
+    echo ""
+    echo -e "${YELLOW}${BOLD}Cleaning up build directories...${NC}"
+    
+    # Return to original directory
+    cd "$ORIGINAL_DIR" 2>/dev/null || true
+    
+    # Remove wine64-build directory
+    if [ -d "wine64-build" ]; then
+      echo -e "${YELLOW}  Removing wine64-build directory...${NC}"
+      rm -rf wine64-build
+      echo -e "${GREEN}  ✓ wine64-build removed${NC}"
+    fi
+    
+    # Remove wine-src directory
+    if [ -d "wine-src" ]; then
+      echo -e "${YELLOW}  Removing wine-src directory...${NC}"
+      rm -rf wine-src
+      echo -e "${GREEN}  ✓ wine-src removed${NC}"
+    fi
+    
+    # Also check parent directory for wine-src
+    if [ -d "../wine-src" ]; then
+      echo -e "${YELLOW}  Removing ../wine-src directory...${NC}"
+      rm -rf ../wine-src
+      echo -e "${GREEN}  ✓ ../wine-src removed${NC}"
+    fi
+    
+    echo -e "${GREEN}${BOLD}✓ Cleanup complete${NC}"
+    echo ""
+  fi
+}
+
 # Apply patches before building
 echo ""
 echo -e "${CYAN}${BOLD}Applying Patches${NC}"
@@ -1203,7 +1241,7 @@ if ! check_opencl_headers; then
   # Check again after installation
   if ! check_opencl_headers; then
     echo ""
-    echo "❌ ERROR: OpenCL headers still not found after installation!"
+    echo -e "${RED}❌ ERROR: OpenCL headers still not found after installation!${NC}"
     echo "Please install OpenCL development packages manually:"
     case "$PKG_MGR" in
       dnf)
@@ -1216,6 +1254,8 @@ if ! check_opencl_headers; then
         echo "  sudo apt install ocl-icd-opencl-dev"
         ;;
     esac
+    BUILD_FAILED=1
+    cleanup_on_failure
     exit 1
   fi
 fi
@@ -1280,7 +1320,7 @@ if ! check_cross_compiler_i386; then
   # Check again after installation
   if ! check_cross_compiler_i386; then
     echo ""
-    echo "❌ ERROR: i386 PE cross-compiler still not found after installation!"
+    echo -e "${RED}❌ ERROR: i386 PE cross-compiler still not found after installation!${NC}"
     echo "Please install the MinGW cross-compiler manually:"
     case "$PKG_MGR" in
       dnf)
@@ -1293,6 +1333,8 @@ if ! check_cross_compiler_i386; then
         echo "  sudo apt install gcc-mingw-w64"
         ;;
     esac
+    BUILD_FAILED=1
+    cleanup_on_failure
     exit 1
   fi
 fi
@@ -1341,7 +1383,7 @@ if ! check_cross_compiler_x86_64; then
   # Check again after installation
   if ! check_cross_compiler_x86_64; then
     echo ""
-    echo "❌ ERROR: x86_64 PE cross-compiler still not found after installation!"
+    echo -e "${RED}❌ ERROR: x86_64 PE cross-compiler still not found after installation!${NC}"
     echo "Please install the MinGW cross-compiler manually:"
     case "$PKG_MGR" in
       dnf)
@@ -1354,6 +1396,8 @@ if ! check_cross_compiler_x86_64; then
         echo "  sudo apt install gcc-mingw-w64"
         ;;
     esac
+    BUILD_FAILED=1
+    cleanup_on_failure
     exit 1
   fi
 fi
@@ -1377,7 +1421,8 @@ fi
 # Check configure exit status (must check immediately after PIPESTATUS)
 if [ "$CONFIGURE_EXIT" -ne 0 ]; then
   BUILD_FAILED=1
-  echo "❌ ERROR: Wine configure failed!"
+  echo -e "${RED}❌ ERROR: Wine configure failed!${NC}"
+  cleanup_on_failure
   exit 1
 fi
 
@@ -1431,9 +1476,9 @@ fi
 
 echo
 if [ "${BUILD_FAILED:-0}" = "1" ]; then
-  echo "=========================================="
-  echo "❌ BUILD FAILED!"
-  echo "=========================================="
+  echo -e "${RED}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+  echo -e "${RED}${BOLD}❌ BUILD FAILED!${NC}"
+  echo -e "${RED}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
   echo ""
   echo "Build logs saved:"
   [ -f "wine-build.log" ] && echo "  - wine-build.log"
@@ -1443,6 +1488,10 @@ if [ "${BUILD_FAILED:-0}" = "1" ]; then
   echo "  - Missing development packages (run script again to auto-install)"
   echo "  - OpenCL headers not found (required - install ocl-icd-devel/opencl-headers)"
   echo ""
+  
+  # Cleanup on failure
+  cleanup_on_failure
+  
   exit 1
 else
   echo "=========================================="
