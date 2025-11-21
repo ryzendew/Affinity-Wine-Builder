@@ -281,16 +281,17 @@ silent_warnings=(
   "-Wno-misleading-indentation"
 )
 
-# Generic flags
-export CFLAGS="-O2 -std=gnu17 -pipe -ffat-lto-objects ${silent_warnings[*]}"
+# Generic flags for x86-64-v2 compatibility
+export CFLAGS="-march=x86-64-v2 -mtune=generic -O2 -pipe"
+export CXXFLAGS="$CFLAGS"
 
 # Flags for cross-compilation
-export CROSSCFLAGS="-O2 -std=gnu17 -pipe ${silent_warnings[*]}"
-export CROSSCXXFLAGS="-O2 -std=gnu17 -pipe ${silent_warnings[*]}"
+export CROSSCFLAGS="-march=x86-64-v2 -mtune=generic -O2 -pipe"
+export CROSSCXXFLAGS="$CROSSCFLAGS"
 export CROSSLDFLAGS="-Wl,-O1"
 
 if [ "$BUILD_DEBUG" = "1" ]; then
-  CFLAGS+=" -g"; CROSSCFLAGS+=" -g"; CROSSCXXFLAGS+=" -g"
+  CFLAGS+=" -g"; CXXFLAGS+=" -g"; CROSSCFLAGS+=" -g"; CROSSCXXFLAGS+=" -g"
 fi
 
 # Get available Wine versions from patches directory
