@@ -1,0 +1,22 @@
+# Wine build directories
+wine64-build/
+wine-src/
+wine32-build/
+
+# Build logs
+*.log
+wine-build.log
+wine64-build.log
+wine32-build.log
+Affinity.log
+
+# Temporary files
+*.tmp
+*.patch.tmp
+
+# Editor files
+*~
+.*.swp
+.*.swo
+.DS_Store
+

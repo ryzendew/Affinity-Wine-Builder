@@ -87,7 +87,7 @@ install_packages_64bit() {
   
   case "$PKG_MGR" in
     apt)
-      local required_packages=("samba-dev" "libcups2-dev" "ocl-icd-opencl-dev")
+      local required_packages=("samba-dev" "libcups2-dev" "ocl-icd-opencl-dev" "gcc-mingw-w64")
       for pkg in "${required_packages[@]}"; do
         if check_package_installed_apt "$pkg"; then
           echo "  ✓ $pkg is already installed"
@@ -106,7 +106,7 @@ install_packages_64bit() {
       fi
       ;;
     dnf)
-      local required_packages=("samba-devel" "cups-devel" "ocl-icd-devel" "opencl-headers")
+      local required_packages=("samba-devel" "cups-devel" "ocl-icd-devel" "opencl-headers" "mingw32-gcc" "mingw64-gcc")
       for pkg in "${required_packages[@]}"; do
         if check_package_installed_dnf "$pkg"; then
           echo "  ✓ $pkg is already installed"
@@ -121,7 +121,7 @@ install_packages_64bit() {
         # Try with opencl-headers first, fallback if it fails
         if [[ " ${packages_to_install[@]} " =~ " opencl-headers " ]]; then
           sudo dnf install -y --allowerasing "${packages_to_install[@]}" 2>/dev/null || \
-          sudo dnf install -y --allowerasing samba-devel cups-devel ocl-icd-devel
+          sudo dnf install -y --allowerasing samba-devel cups-devel ocl-icd-devel mingw32-gcc mingw64-gcc
         else
           sudo dnf install -y --allowerasing "${packages_to_install[@]}"
         fi
@@ -281,14 +281,19 @@ silent_warnings=(
   "-Wno-misleading-indentation"
 )
 
-# Generic flags for x86-64-v2 compatibility
+# Generic flags for x86-64-v2 compatibility (for native Wine binaries)
+# These run on the host Linux system, so they need v2 support for v2+ CPUs
 export CFLAGS="-march=x86-64-v2 -mtune=generic -O2 -pipe"
 export CXXFLAGS="$CFLAGS"
 
-# Flags for cross-compilation
-export CROSSCFLAGS="-march=x86-64-v2 -mtune=generic -O2 -pipe"
+# Flags for cross-compilation (for Windows PE binaries)
+# These don't need v2 flags - they just need correct architecture flags for i386/x86_64
+# Using v2 flags here causes build failures with i386 cross-compilation
+export CROSSCFLAGS="-O2 -pipe"
 export CROSSCXXFLAGS="$CROSSCFLAGS"
-export CROSSLDFLAGS="-Wl,-O1"
+# Add -lmingwex to link MinGW extended math library (needed for functions like truncf in GCC 15/MinGW)
+# MinGW uses libmingwex.a instead of libm.a for math functions
+export CROSSLDFLAGS="-Wl,-O1 -lmingwex"
 
 if [ "$BUILD_DEBUG" = "1" ]; then
   CFLAGS+=" -g"; CXXFLAGS+=" -g"; CROSSCFLAGS+=" -g"; CROSSCXXFLAGS+=" -g"
@@ -650,7 +655,7 @@ cd wine64-build || { echo "Error: Failed to change to wine64-build directory"; e
 install_packages_64bit
 
 # Determine install prefix
-INSTALL_PREFIX="$HOME/Documents/ElementalWarrior-wine/wine-install"
+INSTALL_PREFIX="$HOME/Documents/ElementalWarrior-wine"
 if [ -d "/wine-builder" ]; then
   INSTALL_PREFIX="/wine-builder/wine-src/wine-install"
 fi
@@ -727,14 +732,153 @@ fi
 echo "✓ OpenCL headers found, enabling OpenCL support"
 OPENCL_FLAG="--enable-opencl"
 
+# Check if PE cross-compilers are available (required for --enable-archs=i386,x86_64)
+check_cross_compiler_i386() {
+  if command -v i686-w64-mingw32-gcc >/dev/null 2>&1; then
+    return 0
+  fi
+  return 1
+}
+
+check_cross_compiler_x86_64() {
+  if command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then
+    return 0
+  fi
+  return 1
+}
+
+# Check and install i386 PE cross-compiler
+if ! check_cross_compiler_i386; then
+  echo ""
+  echo "❌ ERROR: i386 PE cross-compiler (i686-w64-mingw32-gcc) not found!"
+  echo "This is required when building with --enable-archs=i386"
+  echo ""
+  echo "Installing MinGW i386 cross-compiler..."
+  echo "  (This may require your sudo password)"
+  
+  case "$PKG_MGR" in
+    dnf)
+      if ! check_package_installed_dnf "mingw32-gcc"; then
+        echo "  Installing mingw32-gcc..."
+        sudo dnf install -y --allowerasing mingw32-gcc
+      else
+        echo "  ✓ mingw32-gcc package is installed, but compiler not found in PATH"
+        echo "  Please ensure mingw32-gcc is properly installed and in your PATH"
+      fi
+      ;;
+    pacman)
+      if ! check_package_installed_pacman "mingw-w64-gcc"; then
+        echo "  Installing mingw-w64-gcc..."
+        sudo pacman -S --noconfirm mingw-w64-gcc
+      else
+        echo "  ✓ mingw-w64-gcc package is installed, but compiler not found in PATH"
+        echo "  Please ensure mingw-w64-gcc is properly installed and in your PATH"
+      fi
+      ;;
+    apt)
+      if ! check_package_installed_apt "gcc-mingw-w64"; then
+        echo "  Installing gcc-mingw-w64..."
+        sudo apt install -y gcc-mingw-w64
+      else
+        echo "  ✓ gcc-mingw-w64 package is installed, but compiler not found in PATH"
+        echo "  Please ensure gcc-mingw-w64 is properly installed and in your PATH"
+      fi
+      ;;
+  esac
+  
+  # Check again after installation
+  if ! check_cross_compiler_i386; then
+    echo ""
+    echo "❌ ERROR: i386 PE cross-compiler still not found after installation!"
+    echo "Please install the MinGW cross-compiler manually:"
+    case "$PKG_MGR" in
+      dnf)
+        echo "  sudo dnf install --allowerasing mingw32-gcc"
+        ;;
+      pacman)
+        echo "  sudo pacman -S mingw-w64-gcc"
+        ;;
+      apt)
+        echo "  sudo apt install gcc-mingw-w64"
+        ;;
+    esac
+    exit 1
+  fi
+fi
+
+echo "✓ i386 PE cross-compiler found (i686-w64-mingw32-gcc)"
+
+# Check and install x86_64 PE cross-compiler
+if ! check_cross_compiler_x86_64; then
+  echo ""
+  echo "❌ ERROR: x86_64 PE cross-compiler (x86_64-w64-mingw32-gcc) not found!"
+  echo "This is required when building with --enable-archs=x86_64"
+  echo ""
+  echo "Installing MinGW x86_64 cross-compiler..."
+  echo "  (This may require your sudo password)"
+  
+  case "$PKG_MGR" in
+    dnf)
+      if ! check_package_installed_dnf "mingw64-gcc"; then
+        echo "  Installing mingw64-gcc..."
+        sudo dnf install -y --allowerasing mingw64-gcc
+      else
+        echo "  ✓ mingw64-gcc package is installed, but compiler not found in PATH"
+        echo "  Please ensure mingw64-gcc is properly installed and in your PATH"
+      fi
+      ;;
+    pacman)
+      if ! check_package_installed_pacman "mingw-w64-gcc"; then
+        echo "  Installing mingw-w64-gcc..."
+        sudo pacman -S --noconfirm mingw-w64-gcc
+      else
+        echo "  ✓ mingw-w64-gcc package is installed, but compiler not found in PATH"
+        echo "  Please ensure mingw-w64-gcc is properly installed and in your PATH"
+      fi
+      ;;
+    apt)
+      if ! check_package_installed_apt "gcc-mingw-w64"; then
+        echo "  Installing gcc-mingw-w64..."
+        sudo apt install -y gcc-mingw-w64
+      else
+        echo "  ✓ gcc-mingw-w64 package is installed, but compiler not found in PATH"
+        echo "  Please ensure gcc-mingw-w64 is properly installed and in your PATH"
+      fi
+      ;;
+  esac
+  
+  # Check again after installation
+  if ! check_cross_compiler_x86_64; then
+    echo ""
+    echo "❌ ERROR: x86_64 PE cross-compiler still not found after installation!"
+    echo "Please install the MinGW cross-compiler manually:"
+    case "$PKG_MGR" in
+      dnf)
+        echo "  sudo dnf install --allowerasing mingw64-gcc"
+        ;;
+      pacman)
+        echo "  sudo pacman -S mingw-w64-gcc"
+        ;;
+      apt)
+        echo "  sudo apt install gcc-mingw-w64"
+        ;;
+    esac
+    exit 1
+  fi
+fi
+
+echo "✓ x86_64 PE cross-compiler found (x86_64-w64-mingw32-gcc)"
+
 # Run configure and capture exit status
+# Note: --disable-tests is required due to truncf linking issues with GCC 15/MinGW
+# Test executables try to use truncf from ucrtbase but link against msvcrt instead
 if [ "$BUILD_WAYLAND" = "0" ]; then
   "$WINE_SRC_DIR/configure" --prefix="$INSTALL_PREFIX" \
-    $OPENCL_FLAG --enable-archs=i386,x86_64 --without-wayland 2>&1 | grep -v "configure: OSS sound system found but too old (OSSv4 needed)"
+    $OPENCL_FLAG --enable-archs=i386,x86_64 --disable-tests --without-wayland 2>&1 | grep -v "configure: OSS sound system found but too old (OSSv4 needed)"
   CONFIGURE_EXIT=${PIPESTATUS[0]}
 else
   "$WINE_SRC_DIR/configure" --prefix="$INSTALL_PREFIX" \
-    $OPENCL_FLAG --enable-archs=i386,x86_64 2>&1 | grep -v "configure: OSS sound system found but too old (OSSv4 needed)"
+    $OPENCL_FLAG --enable-archs=i386,x86_64 --disable-tests 2>&1 | grep -v "configure: OSS sound system found but too old (OSSv4 needed)"
   CONFIGURE_EXIT=${PIPESTATUS[0]}
   # Silent configure warning; sound support is via ALSA
 fi
@@ -774,6 +918,22 @@ if [ "${BUILD_FAILED:-0}" != "1" ]; then
     echo "❌ ERROR: Failed to install Wine"
   else
     echo "✓ Wine installed successfully"
+    
+    # Package Wine as .tar.xz
+    if [ -d "$INSTALL_PREFIX" ] && [ "$(basename "$INSTALL_PREFIX")" = "ElementalWarrior-wine" ]; then
+      echo ""
+      echo "Packaging Wine as .tar.xz..."
+      cd "$(dirname "$INSTALL_PREFIX")" || exit 1
+      WINE_VERSION="${SELECTED_VERSION:-unknown}"
+      PACKAGE_NAME="ElementalWarrior-wine-${WINE_VERSION}.tar.xz"
+      if tar -cJf "$PACKAGE_NAME" "$(basename "$INSTALL_PREFIX")" 2>/dev/null; then
+        echo "✓ Wine packaged successfully: $PACKAGE_NAME"
+        echo "  Location: $(pwd)/$PACKAGE_NAME"
+        echo "  Size: $(du -h "$PACKAGE_NAME" | cut -f1)"
+      else
+        echo "⚠ Warning: Failed to create package, but Wine is installed at: $INSTALL_PREFIX"
+      fi
+    fi
   fi
 fi
 
