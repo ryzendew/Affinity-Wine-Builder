@@ -54,6 +54,15 @@ detect_package_manager() {
   fi
 }
 
+# Detect if we're on PikaOS (Ubuntu-based)
+is_pikaos() {
+  if [ -f /etc/os-release ]; then
+    grep -qi "pikaos" /etc/os-release 2>/dev/null
+  else
+    return 1
+  fi
+}
+
 PKG_MGR=$(detect_package_manager)
 echo "Detected package manager: $PKG_MGR"
 
@@ -87,22 +96,69 @@ install_packages_64bit() {
   
   case "$PKG_MGR" in
     apt)
-      local required_packages=("samba-dev" "libcups2-dev" "ocl-icd-opencl-dev" "gcc-mingw-w64")
-      for pkg in "${required_packages[@]}"; do
-        if check_package_installed_apt "$pkg"; then
-          echo "  ✓ $pkg is already installed"
-        else
-          echo "  ✗ $pkg is missing"
-          packages_to_install+=("$pkg")
-        fi
-      done
+      # Check if we're on PikaOS or regular Ubuntu/Debian
+      if is_pikaos; then
+        echo "Detected PikaOS (Ubuntu-based)"
+      fi
       
-      if [ ${#packages_to_install[@]} -gt 0 ]; then
-        echo "Installing missing packages: ${packages_to_install[*]}"
-        sudo apt install -y "${packages_to_install[@]}"
-        echo "  ✓ Package installation complete"
+      # First, try to use apt build-dep which automatically installs all build dependencies
+      echo "Attempting to install Wine build dependencies using 'apt build-dep wine'..."
+      if sudo apt build-dep -y wine 2>/dev/null; then
+        echo "  ✓ Wine build dependencies installed via build-dep"
       else
-        echo "  ✓ All required packages are already installed"
+        echo "  Note: 'apt build-dep wine' failed or wine package not available, installing packages manually..."
+        local required_packages=(
+          # Build tools
+          "build-essential" "gcc" "g++" "make" "bison" "flex" "gettext" "perl"
+          # MinGW cross-compilers
+          "gcc-mingw-w64"
+          # Core development libraries
+          "samba-dev" "libcups2-dev" "ocl-icd-opencl-dev" "opencl-headers"
+          # Audio libraries
+          "libasound2-dev" "libpulse-dev"
+          # Font libraries
+          "libfontconfig1-dev" "libfreetype6-dev"
+          # X11 libraries
+          "libx11-dev" "libxext-dev" "libxrender-dev" "libxrandr-dev"
+          "libxinerama-dev" "libxi-dev" "libxcursor-dev" "libxfixes-dev"
+          "libxcomposite-dev" "libxkbcommon-dev" "x11proto-dev"
+          # Graphics libraries
+          "libgl-dev" "libglu1-mesa-dev" "vulkan-dev" "libvulkan-dev"
+          "libosmesa6-dev"
+          # Wayland support
+          "libwayland-dev" "wayland-protocols"
+          # GStreamer
+          "libgstreamer1.0-dev" "libgstreamer-plugins-base1.0-dev"
+          # SDL
+          "libsdl2-dev"
+          # System libraries
+          "libdbus-1-dev" "libudev-dev" "libunwind-dev"
+          # Optional but recommended
+          "libxml2-dev" "libxslt1-dev" "libjpeg-dev" "libpng-dev"
+          "libtiff-dev" "liblcms2-dev" "libusb-1.0-0-dev" "libpcap-dev"
+          "libncurses5-dev" "libkrb5-dev" "unixodbc-dev" "libv4l-dev"
+          "libgphoto2-dev" "libsane-dev" "libpcsclite-dev"
+          # Multimedia (optional)
+          "libavcodec-dev" "libavformat-dev" "libavutil-dev" "libswscale-dev"
+          # ISDN (optional)
+          "libcapi20-dev"
+        )
+        for pkg in "${required_packages[@]}"; do
+          if check_package_installed_apt "$pkg"; then
+            echo "  ✓ $pkg is already installed"
+          else
+            echo "  ✗ $pkg is missing"
+            packages_to_install+=("$pkg")
+          fi
+        done
+        
+        if [ ${#packages_to_install[@]} -gt 0 ]; then
+          echo "Installing missing packages: ${packages_to_install[*]}"
+          sudo apt install -y "${packages_to_install[@]}"
+          echo "  ✓ Package installation complete"
+        else
+          echo "  ✓ All required packages are already installed"
+        fi
       fi
       ;;
     dnf)
@@ -169,7 +225,46 @@ install_packages_64bit() {
       fi
       ;;
     pacman)
-      local required_packages=("samba" "libcups" "opencl-headers")
+      # Arch Linux: Most packages include development files in the base package
+      # Note: Arch doesn't have a direct builddep command like dnf/apt
+      echo "Installing Wine build dependencies for Arch Linux..."
+      echo "  Note: Ensure multilib repository is enabled for 32-bit libraries"
+      local required_packages=(
+        # Build tools (base-devel includes gcc, make, etc.)
+        "base-devel" "bison" "flex" "gettext" "perl"
+        # MinGW cross-compilers
+        "mingw-w64-gcc"
+        # Core development libraries (Arch packages include dev files)
+        "samba" "libcups" "opencl-headers" "ocl-icd"
+        # Audio libraries
+        "alsa-lib" "pulseaudio"
+        # Font libraries
+        "fontconfig" "freetype2"
+        # X11 libraries
+        "libx11" "libxext" "libxrender" "libxrandr"
+        "libxinerama" "libxi" "libxcursor" "libxfixes"
+        "libxcomposite" "libxkbcommon" "xorgproto"
+        # Graphics libraries
+        "mesa" "libgl" "vulkan-headers" "vulkan-icd-loader"
+        "lib32-mesa" "lib32-libgl"
+        # Wayland support
+        "wayland" "wayland-protocols"
+        # GStreamer
+        "gstreamer" "gst-plugins-base"
+        # SDL
+        "sdl2"
+        # System libraries
+        "dbus" "systemd" "libunwind"
+        # Optional but recommended
+        "libxml2" "libxslt" "libjpeg-turbo" "libpng"
+        "libtiff" "lcms2" "libusb" "libpcap"
+        "ncurses" "krb5" "unixodbc" "v4l-utils"
+        "libgphoto2" "sane" "pcsc-tools"
+        # Multimedia (optional)
+        "ffmpeg"
+        # ISDN (optional) - may not be available in all repos
+        "libcapi"
+      )
       for pkg in "${required_packages[@]}"; do
         if check_package_installed_pacman "$pkg"; then
           echo "  ✓ $pkg is already installed"
@@ -181,6 +276,7 @@ install_packages_64bit() {
       
       if [ ${#packages_to_install[@]} -gt 0 ]; then
         echo "Installing missing packages: ${packages_to_install[*]}"
+        sudo pacman -S --noconfirm "${packages_to_install[@]}" 2>/dev/null || \
         sudo pacman -S --noconfirm "${packages_to_install[@]}"
         echo "  ✓ Package installation complete"
       else
