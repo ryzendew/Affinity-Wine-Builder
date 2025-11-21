@@ -35,9 +35,9 @@ print_banner() {
   echo -e "${CYAN}${BOLD}"
   echo "╔════════════════════════════════════════════════════════════════╗"
   echo "║                                                                ║"
-  echo "║           Wine Build Script - Professional Edition          ║"
+  echo "║           Wine Build Script - Professional Edition             ║"
   echo "║                                                                ║"
-  echo "║     Automated Wine compilation with patch support             ║"
+  echo "║     Automated Wine compilation with patch support              ║"
   echo "║                                                                ║"
   echo "╚════════════════════════════════════════════════════════════════╝"
   echo -e "${NC}"
@@ -250,6 +250,19 @@ install_packages_64bit() {
         if ! check_package_installed_apt "gcc-mingw-w64"; then
           echo "  Installing MinGW cross-compiler..."
           sudo apt install -y gcc-mingw-w64 2>/dev/null || true
+        fi
+        # Verify critical packages are actually installed (sometimes build-dep misses some)
+        local critical_packages=("libfreetype6-dev" "libfontconfig1-dev" "pkg-config")
+        local missing_critical=()
+        for pkg in "${critical_packages[@]}"; do
+          if ! check_package_installed_apt "$pkg"; then
+            echo -e "  ${YELLOW}⚠ $pkg not found after build-dep, installing...${NC}"
+            missing_critical+=("$pkg")
+          fi
+        done
+        if [ ${#missing_critical[@]} -gt 0 ]; then
+          echo "  Installing missing critical packages: ${missing_critical[*]}"
+          sudo apt install -y "${missing_critical[@]}" 2>/dev/null || true
         fi
       else
         echo "  Note: 'apt build-dep wine' failed or wine package not available, installing packages manually..."
@@ -1403,6 +1416,78 @@ if ! check_cross_compiler_x86_64; then
 fi
 
 echo "✓ x86_64 PE cross-compiler found (x86_64-w64-mingw32-gcc)"
+
+# Check for FreeType development files (required for font support)
+check_freetype() {
+  # Check for FreeType headers
+  if [ -f "/usr/include/freetype2/freetype/freetype.h" ] || \
+     [ -f "/usr/include/freetype/freetype.h" ] || \
+     [ -f "/usr/local/include/freetype2/freetype/freetype.h" ]; then
+    return 0
+  fi
+  # Also check if pkg-config can find it
+  if pkg-config --exists freetype2 2>/dev/null; then
+    return 0
+  fi
+  return 1
+}
+
+if ! check_freetype; then
+  echo ""
+  echo -e "${YELLOW}⚠ Warning: FreeType development files not found!${NC}"
+  echo "FreeType is required for font support in Wine."
+  echo ""
+  echo "Attempting to install FreeType development packages..."
+  
+  case "$PKG_MGR" in
+    apt)
+      if ! check_package_installed_apt "libfreetype6-dev"; then
+        echo "  Installing libfreetype6-dev..."
+        sudo apt install -y libfreetype6-dev 2>/dev/null || true
+      fi
+      # Also ensure pkg-config is available
+      if ! command -v pkg-config >/dev/null 2>&1; then
+        echo "  Installing pkg-config..."
+        sudo apt install -y pkg-config 2>/dev/null || true
+      fi
+      ;;
+    dnf)
+      if ! check_package_installed_dnf "freetype-devel"; then
+        echo "  Installing freetype-devel..."
+        sudo dnf install -y freetype-devel 2>/dev/null || true
+      fi
+      ;;
+    pacman)
+      if ! check_package_installed_pacman "freetype2"; then
+        echo "  Installing freetype2..."
+        sudo pacman -S --noconfirm freetype2 2>/dev/null || true
+      fi
+      ;;
+  esac
+  
+  # Check again after installation
+  if ! check_freetype; then
+    echo ""
+    echo -e "${RED}❌ ERROR: FreeType development files still not found after installation!${NC}"
+    echo "Please install FreeType development packages manually:"
+    case "$PKG_MGR" in
+      dnf)
+        echo "  sudo dnf install freetype-devel"
+        ;;
+      pacman)
+        echo "  sudo pacman -S freetype2"
+        ;;
+      apt)
+        echo "  sudo apt install libfreetype6-dev pkg-config"
+        ;;
+    esac
+    BUILD_FAILED=1
+    cleanup_on_failure
+    exit 1
+  fi
+fi
+
+echo -e "${GREEN}✓${NC} FreeType development files found"
 
 # Run configure and capture exit status
 # Note: --disable-tests is required due to truncf linking issues with GCC 15/MinGW
