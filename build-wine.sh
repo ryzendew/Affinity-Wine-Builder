@@ -1631,8 +1631,8 @@ if [ "${BUILD_FAILED:-0}" = "1" ]; then
   tail -20 "$BUILD_LOG"
   echo ""
 else
-  # Filter out parser/sql warnings from output
-  grep -Ev "(parser|sql)\.y: (warning|note):" "$BUILD_LOG" || true
+  # Filter out aqs/parser/sql warnings from output
+  grep -Ev "(aqs|parser|sql)\.y: (warning|note):" "$BUILD_LOG" || true
   echo ""
   echo -e "${GREEN}${BOLD}✓ Wine build completed successfully!${NC}"
 fi
