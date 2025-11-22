@@ -1,0 +1,140 @@
+
+Revert Vulkan surface update
+
+
+diff -uarp a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
+--- a/dlls/win32u/vulkan.c	2025-11-21 17:53:04.608913036 -0500
++++ b/dlls/win32u/vulkan.c	2025-11-21 18:00:27.616126264 -0500
+@@ -309,9 +309,6 @@ static VkResult win32u_vkCreateSwapchain
+     if (surface) create_info_host.surface = surface->obj.host.surface;
+     if (old_swapchain) create_info_host.oldSwapchain = old_swapchain->obj.host.swapchain;
+ 
+-    /* update the host surface to commit any pending size change */
+-    driver_funcs->p_vulkan_surface_update( surface->hwnd, surface->driver_private );
+-
+     /* Windows allows client rect to be empty, but host Vulkan often doesn't, adjust extents back to the host capabilities */
+     res = instance->p_vkGetPhysicalDeviceSurfaceCapabilitiesKHR( physical_device->host.physical_device, surface->obj.host.surface, &capabilities );
+     if (res) return res;
+@@ -521,10 +518,6 @@ static void nulldrv_vulkan_surface_detac
+ {
+ }
+ 
+-static void nulldrv_vulkan_surface_update( HWND hwnd, void *private )
+-{
+-}
+-
+ static void nulldrv_vulkan_surface_presented( HWND hwnd, VkResult result )
+ {
+ }
+@@ -544,7 +537,6 @@ static const struct vulkan_driver_funcs
+     .p_vulkan_surface_create = nulldrv_vulkan_surface_create,
+     .p_vulkan_surface_destroy = nulldrv_vulkan_surface_destroy,
+     .p_vulkan_surface_detach = nulldrv_vulkan_surface_detach,
+-    .p_vulkan_surface_update = nulldrv_vulkan_surface_update,
+     .p_vulkan_surface_presented = nulldrv_vulkan_surface_presented,
+     .p_vkGetPhysicalDeviceWin32PresentationSupportKHR = nulldrv_vkGetPhysicalDeviceWin32PresentationSupportKHR,
+     .p_get_host_surface_extension = nulldrv_get_host_surface_extension,
+@@ -589,12 +581,6 @@ static void lazydrv_vulkan_surface_detac
+     return driver_funcs->p_vulkan_surface_detach( hwnd, private );
+ }
+ 
+-static void lazydrv_vulkan_surface_update( HWND hwnd, void *private )
+-{
+-    vulkan_driver_load();
+-    return driver_funcs->p_vulkan_surface_update( hwnd, private );
+-}
+-
+ static void lazydrv_vulkan_surface_presented( HWND hwnd, VkResult result )
+ {
+     vulkan_driver_load();
+@@ -618,7 +604,6 @@ static const struct vulkan_driver_funcs
+     .p_vulkan_surface_create = lazydrv_vulkan_surface_create,
+     .p_vulkan_surface_destroy = lazydrv_vulkan_surface_destroy,
+     .p_vulkan_surface_detach = lazydrv_vulkan_surface_detach,
+-    .p_vulkan_surface_update = lazydrv_vulkan_surface_update,
+     .p_vulkan_surface_presented = lazydrv_vulkan_surface_presented,
+     .p_vkGetPhysicalDeviceWin32PresentationSupportKHR = lazydrv_vkGetPhysicalDeviceWin32PresentationSupportKHR,
+     .p_get_host_surface_extension = lazydrv_get_host_surface_extension,
+diff -uarp a/dlls/winemac.drv/vulkan.c b/dlls/winemac.drv/vulkan.c
+--- a/dlls/winemac.drv/vulkan.c	2025-11-21 17:53:04.609003008 -0500
++++ b/dlls/winemac.drv/vulkan.c	2025-11-21 18:00:27.616229476 -0500
+@@ -179,10 +179,6 @@ static void macdrv_vulkan_surface_detach
+ {
+ }
+ 
+-static void macdrv_vulkan_surface_update(HWND hwnd, void *private)
+-{
+-}
+-
+ static void macdrv_vulkan_surface_presented(HWND hwnd, VkResult result)
+ {
+ }
+@@ -205,7 +201,6 @@ static const struct vulkan_driver_funcs
+     .p_vulkan_surface_create = macdrv_vulkan_surface_create,
+     .p_vulkan_surface_destroy = macdrv_vulkan_surface_destroy,
+     .p_vulkan_surface_detach = macdrv_vulkan_surface_detach,
+-    .p_vulkan_surface_update = macdrv_vulkan_surface_update,
+     .p_vulkan_surface_presented = macdrv_vulkan_surface_presented,
+ 
+     .p_vkGetPhysicalDeviceWin32PresentationSupportKHR = macdrv_vkGetPhysicalDeviceWin32PresentationSupportKHR,
+diff -uarp a/dlls/winewayland.drv/vulkan.c b/dlls/winewayland.drv/vulkan.c
+--- a/dlls/winewayland.drv/vulkan.c	2025-11-21 17:57:07.384931944 -0500
++++ b/dlls/winewayland.drv/vulkan.c	2025-11-21 18:00:27.616288478 -0500
+@@ -116,10 +116,6 @@ static void wayland_vulkan_surface_detac
+ {
+ }
+ 
+-static void wayland_vulkan_surface_update(HWND hwnd, void *private)
+-{
+-}
+-
+ static void wayland_vulkan_surface_presented(HWND hwnd, VkResult result)
+ {
+     HWND toplevel = NtUserGetAncestor(hwnd, GA_ROOT);
+@@ -145,7 +141,6 @@ static const struct vulkan_driver_funcs
+     .p_vulkan_surface_create = wayland_vulkan_surface_create,
+     .p_vulkan_surface_destroy = wayland_vulkan_surface_destroy,
+     .p_vulkan_surface_detach = wayland_vulkan_surface_detach,
+-    .p_vulkan_surface_update = wayland_vulkan_surface_update,
+     .p_vulkan_surface_presented = wayland_vulkan_surface_presented,
+ 
+     .p_vkGetPhysicalDeviceWin32PresentationSupportKHR = wayland_vkGetPhysicalDeviceWin32PresentationSupportKHR,
+diff -uarp a/dlls/winex11.drv/vulkan.c b/dlls/winex11.drv/vulkan.c
+--- a/dlls/winex11.drv/vulkan.c	2025-11-21 17:55:16.289756933 -0500
++++ b/dlls/winex11.drv/vulkan.c	2025-11-21 18:00:27.616339259 -0500
+@@ -114,13 +114,6 @@ static void X11DRV_vulkan_surface_detach
+     }
+ }
+ 
+-static void X11DRV_vulkan_surface_update( HWND hwnd, void *private )
+-{
+-    struct x11drv_vulkan_surface *surface = private;
+-
+-    TRACE( "%p %p\n", hwnd, private );
+-}
+-
+ static void X11DRV_vulkan_surface_presented( HWND hwnd, VkResult result )
+ {
+ }
+@@ -144,7 +137,6 @@ static const struct vulkan_driver_funcs
+     .p_vulkan_surface_create = X11DRV_vulkan_surface_create,
+     .p_vulkan_surface_destroy = X11DRV_vulkan_surface_destroy,
+     .p_vulkan_surface_detach = X11DRV_vulkan_surface_detach,
+-    .p_vulkan_surface_update = X11DRV_vulkan_surface_update,
+     .p_vulkan_surface_presented = X11DRV_vulkan_surface_presented,
+ 
+     .p_vkGetPhysicalDeviceWin32PresentationSupportKHR = X11DRV_vkGetPhysicalDeviceWin32PresentationSupportKHR,
+diff -uarp a/include/wine/vulkan_driver.h b/include/wine/vulkan_driver.h
+--- a/include/wine/vulkan_driver.h	2025-11-21 17:53:04.609204003 -0500
++++ b/include/wine/vulkan_driver.h	2025-11-21 18:00:27.616405950 -0500
+@@ -178,7 +178,6 @@ struct vulkan_driver_funcs
+     VkResult (*p_vulkan_surface_create)(HWND, const struct vulkan_instance *, VkSurfaceKHR *, void **);
+     void (*p_vulkan_surface_destroy)(HWND, void *);
+     void (*p_vulkan_surface_detach)(HWND, void *);
+-    void (*p_vulkan_surface_update)(HWND, void *);
+     void (*p_vulkan_surface_presented)(HWND, VkResult);
+ 
+     VkBool32 (*p_vkGetPhysicalDeviceWin32PresentationSupportKHR)(VkPhysicalDevice, uint32_t);
+-- 
+2.47.1
+
