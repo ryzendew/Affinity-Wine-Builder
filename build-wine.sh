@@ -232,23 +232,23 @@ install_packages_64bit() {
         distro_version=$(grep "^VERSION_ID=" /etc/os-release | cut -d= -f2 | tr -d '"')
       fi
       
-      echo "Detected distribution: ${distro_name:-unknown} ${distro_version:-unknown}"
+      echo -e "${CYAN}Detected distribution: ${GREEN}${distro_name:-unknown} ${distro_version:-unknown}${NC}"
       
       # Enable multiarch for 32-bit packages (required for Wine 32-bit support)
       if ! dpkg --print-architecture | grep -q i386 2>/dev/null; then
-        echo "Enabling i386 architecture for 32-bit Wine support..."
+        echo -e "${CYAN}Enabling i386 architecture for 32-bit Wine support...${NC}"
         sudo dpkg --add-architecture i386 2>/dev/null || true
         sudo apt update 2>/dev/null || true
       fi
       
       # First, try to use apt build-dep which automatically installs all build dependencies
       # This works on Ubuntu, Debian, Mint, Zorin and other Debian-based distros
-      echo "Attempting to install Wine build dependencies using 'apt build-dep wine'..."
+      echo -e "${CYAN}Attempting to install Wine build dependencies using 'apt build-dep wine'...${NC}"
       if sudo apt build-dep -y wine 2>/dev/null; then
-        echo "  ✓ Wine build dependencies installed via build-dep"
+        echo -e "  ${GREEN}✓${NC} Wine build dependencies installed via build-dep"
         # Still need to ensure MinGW cross-compiler is installed
         if ! check_package_installed_apt "gcc-mingw-w64"; then
-          echo "  Installing MinGW cross-compiler..."
+          echo -e "${CYAN}  Installing MinGW cross-compiler...${NC}"
           sudo apt install -y gcc-mingw-w64 2>/dev/null || true
         fi
         # Verify critical packages are actually installed (sometimes build-dep misses some)
@@ -261,11 +261,11 @@ install_packages_64bit() {
           fi
         done
         if [ ${#missing_critical[@]} -gt 0 ]; then
-          echo "  Installing missing critical packages: ${missing_critical[*]}"
+          echo -e "${CYAN}  Installing missing critical packages: ${missing_critical[*]}${NC}"
           sudo apt install -y "${missing_critical[@]}" 2>/dev/null || true
         fi
       else
-        echo "  Note: 'apt build-dep wine' failed or wine package not available, installing packages manually..."
+        echo -e "${YELLOW}  Note: 'apt build-dep wine' failed or wine package not available, installing packages manually...${NC}"
         local required_packages=(
           # Essential build tools (works on all Ubuntu/Debian variants)
           "build-essential"
@@ -498,11 +498,11 @@ install_packages_64bit() {
     dnf)
       # First, try to use dnf builddep which automatically installs all build dependencies
       # This is the most reliable method as it uses the exact package names from the wine.spec
-      echo "Attempting to install Wine build dependencies using 'dnf builddep wine'..."
+      echo -e "${CYAN}Attempting to install Wine build dependencies using 'dnf builddep wine'...${NC}"
       if sudo dnf builddep -y wine 2>/dev/null; then
-        echo "  ✓ Wine build dependencies installed via builddep"
+        echo -e "  ${GREEN}✓${NC} Wine build dependencies installed via builddep"
       else
-        echo "  Note: 'dnf builddep wine' failed or wine package not available, installing packages manually..."
+        echo -e "${YELLOW}  Note: 'dnf builddep wine' failed or wine package not available, installing packages manually...${NC}"
         local required_packages=(
           # Build tools
           "gcc" "gcc-c++" "make" "bison" "flex" "gettext" "perl"
@@ -541,28 +541,28 @@ install_packages_64bit() {
         )
         for pkg in "${required_packages[@]}"; do
           if check_package_installed_dnf "$pkg"; then
-            echo "  ✓ $pkg is already installed"
+            echo -e "  ${GREEN}✓${NC} $pkg ${GREEN}(installed)${NC}"
           else
-            echo "  ✗ $pkg is missing"
+            echo -e "  ${RED}✗${NC} $pkg ${YELLOW}(missing)${NC}"
             packages_to_install+=("$pkg")
           fi
         done
         
         if [ ${#packages_to_install[@]} -gt 0 ]; then
-          echo "Installing missing packages: ${packages_to_install[*]}"
+          echo -e "${CYAN}Installing missing packages: ${packages_to_install[*]}${NC}"
           sudo dnf install -y --allowerasing "${packages_to_install[@]}" 2>/dev/null || \
           sudo dnf install -y --allowerasing "${packages_to_install[@]}"
-          echo "  ✓ Package installation complete"
+          echo -e "  ${GREEN}✓${NC} Package installation complete"
         else
-          echo "  ✓ All required packages are already installed"
+          echo -e "  ${GREEN}✓${NC} All required packages are already installed"
         fi
       fi
       ;;
     pacman)
       # Arch Linux: Most packages include development files in the base package
       # Note: Arch doesn't have a direct builddep command like dnf/apt
-      echo "Installing Wine build dependencies for Arch Linux..."
-      echo "  Note: Ensure multilib repository is enabled for 32-bit libraries"
+      echo -e "${CYAN}Installing Wine build dependencies for Arch Linux...${NC}"
+      echo -e "${YELLOW}  Note: Ensure multilib repository is enabled for 32-bit libraries${NC}"
       local required_packages=(
         # Build tools (base-devel includes gcc, make, etc.)
         "base-devel" "bison" "flex" "gettext" "perl"
@@ -601,24 +601,24 @@ install_packages_64bit() {
       )
       for pkg in "${required_packages[@]}"; do
         if check_package_installed_pacman "$pkg"; then
-          echo "  ✓ $pkg is already installed"
+          echo -e "  ${GREEN}✓${NC} $pkg ${GREEN}(installed)${NC}"
         else
-          echo "  ✗ $pkg is missing"
+          echo -e "  ${RED}✗${NC} $pkg ${YELLOW}(missing)${NC}"
           packages_to_install+=("$pkg")
         fi
       done
       
       if [ ${#packages_to_install[@]} -gt 0 ]; then
-        echo "Installing missing packages: ${packages_to_install[*]}"
+        echo -e "${CYAN}Installing missing packages: ${packages_to_install[*]}${NC}"
         sudo pacman -S --noconfirm "${packages_to_install[@]}" 2>/dev/null || \
         sudo pacman -S --noconfirm "${packages_to_install[@]}"
-        echo "  ✓ Package installation complete"
+        echo -e "  ${GREEN}✓${NC} Package installation complete"
       else
-        echo "  ✓ All required packages are already installed"
+        echo -e "  ${GREEN}✓${NC} All required packages are already installed"
       fi
       ;;
     *)
-      echo "Warning: Unknown package manager. Skipping package installation."
+      echo -e "${YELLOW}⚠ Warning: Unknown package manager. Skipping package installation.${NC}"
       ;;
   esac
 }
@@ -643,11 +643,11 @@ apply_patches() {
   fi
   
   if [ -z "$wine_version" ]; then
-    echo "Warning: Could not detect Wine version. Skipping patch application."
+    echo -e "${YELLOW}⚠ Warning: Could not detect Wine version. Skipping patch application.${NC}"
     return
   fi
   
-  echo "Detected Wine version: $wine_version"
+  echo -e "${CYAN}Detected Wine version: ${GREEN}$wine_version${NC}"
   
   # Find matching patch directory (e.g., wine-10.1, wine-9.22)
   local patch_dir=""
@@ -666,7 +666,7 @@ apply_patches() {
   elif [ -d "../patches" ]; then
     local patches_base="../patches"
   else
-    echo "Warning: Patches directory not found. Skipping patch application."
+    echo -e "${YELLOW}⚠ Warning: Patches directory not found. Skipping patch application.${NC}"
     return
   fi
   
@@ -683,17 +683,17 @@ apply_patches() {
       local found_dir=$(find "$patches_base" -maxdepth 1 -type d -name "wine-*" | head -n1)
       if [ -n "$found_dir" ]; then
         patch_dir="$found_dir"
-        echo "Using patch directory: $patch_dir (version may not match exactly)"
+        echo -e "${YELLOW}⚠ Using patch directory: $patch_dir (version may not match exactly)${NC}"
       fi
     fi
   fi
   
   if [ -z "$patch_dir" ] || [ ! -d "$patch_dir" ]; then
-    echo "Warning: No matching patch directory found for version $wine_version. Skipping patch application."
+    echo -e "${YELLOW}⚠ Warning: No matching patch directory found for version $wine_version. Skipping patch application.${NC}"
     return
   fi
   
-  echo "Applying patches from: $patch_dir"
+  echo -e "${CYAN}Applying patches from: ${GREEN}$patch_dir${NC}"
   
   # Apply all .patch files in the directory (excluding SHA256SUMS.txt)
   local patch_count=0
@@ -701,7 +701,7 @@ apply_patches() {
   
   # Change to wine source directory to apply patches
   if [ ! -d "$wine_src_dir" ]; then
-    echo "Warning: Wine source directory '$wine_src_dir' not found. Skipping patch application."
+    echo -e "${YELLOW}⚠ Warning: Wine source directory '$wine_src_dir' not found. Skipping patch application.${NC}"
     return
   fi
   
@@ -710,24 +710,24 @@ apply_patches() {
   # Sort patch files to apply in order
   for patch_file in $(ls "$patch_dir"/*.patch 2>/dev/null | sort); do
     if [ -f "$patch_file" ]; then
-      echo "Applying patch: $(basename "$patch_file")"
+      echo -e "${CYAN}Applying patch: ${BOLD}$(basename "$patch_file")${NC}"
       # Try normal apply first, then with fuzz if needed
       if patch -p1 --no-backup-if-mismatch -i "$patch_file" >/dev/null 2>&1; then
         ((patch_count++))
-        echo "  ✓ Successfully applied"
+        echo -e "  ${GREEN}✓${NC} Successfully applied"
       elif patch -p1 --no-backup-if-mismatch --fuzz=3 -i "$patch_file" >/dev/null 2>&1; then
         ((patch_count++))
-        echo "  ✓ Successfully applied (with fuzz)"
+        echo -e "  ${GREEN}✓${NC} Successfully applied (with fuzz)"
       elif patch -p1 --dry-run -i "$patch_file" 2>&1 | grep -q "Reversed (or previously applied)"; then
         # Patch is already applied (reversed), count as success
         ((patch_count++))
-        echo "  ✓ Already applied (skipped)"
+        echo -e "  ${GREEN}✓${NC} Already applied (skipped)"
       elif patch -p1 --dry-run -i "$patch_file" 2>&1 | grep -q "already exists"; then
         # Files already exist, patch likely already applied
         ((patch_count++))
-        echo "  ✓ Already applied (files exist)"
+        echo -e "  ${GREEN}✓${NC} Already applied (files exist)"
       else
-        echo "  ✗ Failed to apply (may already be applied or incompatible)"
+        echo -e "  ${RED}✗${NC} Failed to apply (may already be applied or incompatible)"
       fi
     fi
   done
@@ -736,9 +736,9 @@ apply_patches() {
   cd "$saved_dir" || return
   
   if [ $patch_count -eq 0 ]; then
-    echo "No patches were applied."
+    echo -e "${YELLOW}No patches were applied.${NC}"
   else
-    echo "Applied $patch_count patch(es)."
+    echo -e "${GREEN}✓${NC} Applied ${CYAN}$patch_count${NC} patch(es)."
   fi
 }
 
@@ -921,18 +921,18 @@ download_wine_source() {
   cd "$temp_dir" || exit 1
   
   echo ""
-  echo "Downloading Wine $version..."
-  echo "URL: $wine_url"
+  echo -e "${CYAN}${BOLD}Downloading Wine $version...${NC}"
+  echo -e "${BLUE}URL: ${NC}$wine_url"
   echo ""
-  echo "Download progress:"
-  echo "-------------------"
+  echo -e "${CYAN}Download progress:${NC}"
+  echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
   
   # Try to download with progress display
   if command -v wget >/dev/null 2>&1; then
     # wget shows progress on stderr, so we need to let it through
     if ! wget --progress=bar:force:noscroll "$wine_url" -O "$wine_file"; then
       echo ""
-      echo "Error: Failed to download Wine source."
+      echo -e "${RED}❌ ERROR: Failed to download Wine source.${NC}"
       cd - >/dev/null || exit 1
       rm -rf "$temp_dir"
       return 1
@@ -941,41 +941,41 @@ download_wine_source() {
     # curl --progress-bar shows a progress bar
     if ! curl -L --progress-bar --fail -o "$wine_file" "$wine_url"; then
       echo ""
-      echo "Error: Failed to download Wine source."
+      echo -e "${RED}❌ ERROR: Failed to download Wine source.${NC}"
       cd - >/dev/null || exit 1
       rm -rf "$temp_dir"
       return 1
     fi
     echo ""  # New line after curl progress bar
   else
-    echo "Error: Neither wget nor curl found. Please install one to download Wine source."
+    echo -e "${RED}❌ ERROR: Neither wget nor curl found. Please install one to download Wine source.${NC}"
     cd - >/dev/null || exit 1
     rm -rf "$temp_dir"
     return 1
   fi
   
-  echo "-------------------"
-  echo "Download complete!"
+  echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+  echo -e "${GREEN}✓${NC} Download complete!"
   echo ""
   
   echo ""
-  echo "Extracting Wine source..."
+  echo -e "${CYAN}Extracting Wine source...${NC}"
   if ! tar -xf "$wine_file"; then
-    echo "Error: Failed to extract Wine source."
+    echo -e "${RED}❌ ERROR: Failed to extract Wine source.${NC}"
     cd - >/dev/null || exit 1
     rm -rf "$temp_dir"
     return 1
   fi
   
   # Check what was extracted
-  echo "Checking extracted contents..."
+  echo -e "${CYAN}Checking extracted contents...${NC}"
   ls -la
   
   # Move extracted directory to target location
   if [ -d "$wine_dir" ]; then
     # Always remove target directory if it exists (even if empty)
     if [ -d "$download_dir" ]; then
-      echo "Removing existing $download_dir..."
+      echo -e "${YELLOW}Removing existing $download_dir...${NC}"
       rm -rf "$download_dir"
     fi
     
@@ -984,18 +984,18 @@ download_wine_source() {
     
     # Move the wine directory to the target location
     mv "$wine_dir" "$download_dir"
-    echo "Wine source extracted to: $download_dir"
+    echo -e "${GREEN}✓${NC} Wine source extracted to: ${CYAN}$download_dir${NC}"
     
     # Verify the move worked and configure exists
     if [ ! -d "$download_dir" ]; then
-      echo "Error: Failed to move extracted directory to $download_dir"
+      echo -e "${RED}❌ ERROR: Failed to move extracted directory to $download_dir${NC}"
       cd - >/dev/null || exit 1
       rm -rf "$temp_dir"
       return 1
     fi
   else
-    echo "Error: Extracted directory '$wine_dir' not found."
-    echo "Contents of extraction directory:"
+    echo -e "${RED}❌ ERROR: Extracted directory '$wine_dir' not found.${NC}"
+    echo -e "${YELLOW}Contents of extraction directory:${NC}"
     ls -la
     cd - >/dev/null || exit 1
     rm -rf "$temp_dir"
@@ -1018,8 +1018,8 @@ download_wine_source() {
     done
     
     if [ -n "$nested_dir" ]; then
-      echo "Found nested directory structure. Fixing..."
-      echo "Moving contents from $nested_dir to $download_dir..."
+      echo -e "${YELLOW}Found nested directory structure. Fixing...${NC}"
+      echo -e "${CYAN}Moving contents from $nested_dir to $download_dir...${NC}"
       
       # Create temp location
       local temp_fix=$(mktemp -d)
@@ -1030,26 +1030,26 @@ download_wine_source() {
       
       # Verify configure now exists
       if [ -f "$download_dir/configure" ]; then
-        echo "✓ Fixed nested structure. Configure script found."
+        echo -e "${GREEN}✓${NC} Fixed nested structure. Configure script found."
       else
-        echo "Error: Still could not find configure script after fix attempt."
+        echo -e "${RED}❌ ERROR: Still could not find configure script after fix attempt.${NC}"
         return 1
       fi
     else
-      echo "Error: configure script not found after extraction."
-      echo "Expected at: $download_dir/configure"
-      echo "Checking if directory exists:"
+      echo -e "${RED}❌ ERROR: configure script not found after extraction.${NC}"
+      echo -e "${YELLOW}Expected at: $download_dir/configure${NC}"
+      echo -e "${CYAN}Checking if directory exists:${NC}"
       if [ -d "$download_dir" ]; then
-        echo "Directory exists. Contents:"
+        echo -e "${YELLOW}Directory exists. Contents:${NC}"
         ls -la "$download_dir" | head -20
       else
-        echo "Directory does not exist: $download_dir"
+        echo -e "${RED}Directory does not exist: $download_dir${NC}"
       fi
       return 1
     fi
   fi
   
-  echo "✓ Configure script verified at: $download_dir/configure"
+  echo -e "${GREEN}✓${NC} Configure script verified at: ${CYAN}$download_dir/configure${NC}"
   
   return 0
 }
@@ -1096,18 +1096,18 @@ if [ -z "$WINE_SRC_DIR" ]; then
   download_location="./wine-src"
   
   echo ""
-  echo "Preparing to download Wine $SELECTED_VERSION source code..."
-  echo "This may take a few minutes depending on your internet connection."
+  echo -e "${CYAN}${BOLD}Preparing to download Wine $SELECTED_VERSION source code...${NC}"
+  echo -e "${YELLOW}This may take a few minutes depending on your internet connection.${NC}"
   echo ""
   
   # Download the selected version
   if ! download_wine_source "$SELECTED_VERSION" "$download_location"; then
-    echo "Error: Failed to download Wine source. Exiting."
+    echo -e "${RED}❌ ERROR: Failed to download Wine source. Exiting.${NC}"
     exit 1
   fi
   
   echo ""
-  echo "✓ Wine $SELECTED_VERSION source code downloaded and extracted successfully!"
+  echo -e "${GREEN}${BOLD}✓ Wine $SELECTED_VERSION source code downloaded and extracted successfully!${NC}"
   echo ""
   
   WINE_SRC_DIR="$download_location"
@@ -1128,7 +1128,7 @@ echo ""
 echo -e "${CYAN}${BOLD}Preparing Build Environment${NC}"
 echo -e "${BLUE}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo ""
-echo "Creating build directories..."
+echo -e "${CYAN}Creating build directories...${NC}"
 mkdir -p wine64-build
 mkdir -p "$WINE_SRC_DIR/wine-install"
 echo -e "${GREEN}✓${NC} Build directories created"
@@ -1210,11 +1210,11 @@ cd wine64-build || { echo -e "${RED}Error: Failed to change to wine64-build dire
 # Check if OpenCL headers are available (mandatory)
 if ! check_opencl_headers; then
   echo ""
-  echo "❌ ERROR: OpenCL headers not found!"
-  echo "OpenCL is required for this build."
+  echo -e "${RED}${BOLD}❌ ERROR: OpenCL headers not found!${NC}"
+  echo -e "${YELLOW}OpenCL is required for this build.${NC}"
   echo ""
-  echo "Installing OpenCL headers..."
-  echo "  (This may require your sudo password)"
+  echo -e "${CYAN}Installing OpenCL headers...${NC}"
+  echo -e "${YELLOW}  (This may require your sudo password)${NC}"
   
   opencl_packages=()
   case "$PKG_MGR" in
@@ -1226,10 +1226,10 @@ if ! check_opencl_headers; then
         opencl_packages+=("ocl-icd-devel")
       fi
       if [ ${#opencl_packages[@]} -gt 0 ]; then
-        echo "  Installing missing OpenCL packages: ${opencl_packages[*]}"
+        echo -e "${CYAN}  Installing missing OpenCL packages: ${opencl_packages[*]}${NC}"
         sudo dnf install -y --allowerasing "${opencl_packages[@]}"
       else
-        echo "  ✓ OpenCL packages are already installed"
+        echo -e "  ${GREEN}✓${NC} OpenCL packages are already installed"
       fi
       ;;
     pacman)
@@ -1237,10 +1237,10 @@ if ! check_opencl_headers; then
         opencl_packages+=("opencl-headers")
       fi
       if [ ${#opencl_packages[@]} -gt 0 ]; then
-        echo "  Installing missing OpenCL packages: ${opencl_packages[*]}"
+        echo -e "${CYAN}  Installing missing OpenCL packages: ${opencl_packages[*]}${NC}"
         sudo pacman -S --noconfirm "${opencl_packages[@]}"
       else
-        echo "  ✓ OpenCL packages are already installed"
+        echo -e "  ${GREEN}✓${NC} OpenCL packages are already installed"
       fi
       ;;
     apt)
@@ -1248,10 +1248,10 @@ if ! check_opencl_headers; then
         opencl_packages+=("ocl-icd-opencl-dev")
       fi
       if [ ${#opencl_packages[@]} -gt 0 ]; then
-        echo "  Installing missing OpenCL packages: ${opencl_packages[*]}"
+        echo -e "${CYAN}  Installing missing OpenCL packages: ${opencl_packages[*]}${NC}"
         sudo apt install -y "${opencl_packages[@]}"
       else
-        echo "  ✓ OpenCL packages are already installed"
+        echo -e "  ${GREEN}✓${NC} OpenCL packages are already installed"
       fi
       ;;
   esac
@@ -1259,17 +1259,17 @@ if ! check_opencl_headers; then
   # Check again after installation
   if ! check_opencl_headers; then
     echo ""
-    echo -e "${RED}❌ ERROR: OpenCL headers still not found after installation!${NC}"
-    echo "Please install OpenCL development packages manually:"
+    echo -e "${RED}${BOLD}❌ ERROR: OpenCL headers still not found after installation!${NC}"
+    echo -e "${YELLOW}Please install OpenCL development packages manually:${NC}"
     case "$PKG_MGR" in
       dnf)
-        echo "  sudo dnf install --allowerasing opencl-headers ocl-icd-devel"
+        echo -e "  ${CYAN}sudo dnf install --allowerasing opencl-headers ocl-icd-devel${NC}"
         ;;
       pacman)
-        echo "  sudo pacman -S opencl-headers"
+        echo -e "  ${CYAN}sudo pacman -S opencl-headers${NC}"
         ;;
       apt)
-        echo "  sudo apt install ocl-icd-opencl-dev"
+        echo -e "  ${CYAN}sudo apt install ocl-icd-opencl-dev${NC}"
         ;;
     esac
     BUILD_FAILED=1
@@ -1299,38 +1299,38 @@ check_cross_compiler_x86_64() {
 # Check and install i386 PE cross-compiler
 if ! check_cross_compiler_i386; then
   echo ""
-  echo "❌ ERROR: i386 PE cross-compiler (i686-w64-mingw32-gcc) not found!"
-  echo "This is required when building with --enable-archs=i386"
+  echo -e "${RED}${BOLD}❌ ERROR: i386 PE cross-compiler (i686-w64-mingw32-gcc) not found!${NC}"
+  echo -e "${YELLOW}This is required when building with --enable-archs=i386${NC}"
   echo ""
-  echo "Installing MinGW i386 cross-compiler..."
-  echo "  (This may require your sudo password)"
+  echo -e "${CYAN}Installing MinGW i386 cross-compiler...${NC}"
+  echo -e "${YELLOW}  (This may require your sudo password)${NC}"
   
   case "$PKG_MGR" in
     dnf)
       if ! check_package_installed_dnf "mingw32-gcc"; then
-        echo "  Installing mingw32-gcc..."
+        echo -e "${CYAN}  Installing mingw32-gcc...${NC}"
         sudo dnf install -y --allowerasing mingw32-gcc
       else
-        echo "  ✓ mingw32-gcc package is installed, but compiler not found in PATH"
-        echo "  Please ensure mingw32-gcc is properly installed and in your PATH"
+        echo -e "  ${GREEN}✓${NC} mingw32-gcc package is installed, but compiler not found in PATH"
+        echo -e "${YELLOW}  Please ensure mingw32-gcc is properly installed and in your PATH${NC}"
       fi
       ;;
     pacman)
       if ! check_package_installed_pacman "mingw-w64-gcc"; then
-        echo "  Installing mingw-w64-gcc..."
+        echo -e "${CYAN}  Installing mingw-w64-gcc...${NC}"
         sudo pacman -S --noconfirm mingw-w64-gcc
       else
-        echo "  ✓ mingw-w64-gcc package is installed, but compiler not found in PATH"
-        echo "  Please ensure mingw-w64-gcc is properly installed and in your PATH"
+        echo -e "  ${GREEN}✓${NC} mingw-w64-gcc package is installed, but compiler not found in PATH"
+        echo -e "${YELLOW}  Please ensure mingw-w64-gcc is properly installed and in your PATH${NC}"
       fi
       ;;
     apt)
       if ! check_package_installed_apt "gcc-mingw-w64"; then
-        echo "  Installing gcc-mingw-w64..."
+        echo -e "${CYAN}  Installing gcc-mingw-w64...${NC}"
         sudo apt install -y gcc-mingw-w64
       else
-        echo "  ✓ gcc-mingw-w64 package is installed, but compiler not found in PATH"
-        echo "  Please ensure gcc-mingw-w64 is properly installed and in your PATH"
+        echo -e "  ${GREEN}✓${NC} gcc-mingw-w64 package is installed, but compiler not found in PATH"
+        echo -e "${YELLOW}  Please ensure gcc-mingw-w64 is properly installed and in your PATH${NC}"
       fi
       ;;
   esac
@@ -1338,17 +1338,17 @@ if ! check_cross_compiler_i386; then
   # Check again after installation
   if ! check_cross_compiler_i386; then
     echo ""
-    echo -e "${RED}❌ ERROR: i386 PE cross-compiler still not found after installation!${NC}"
-    echo "Please install the MinGW cross-compiler manually:"
+    echo -e "${RED}${BOLD}❌ ERROR: i386 PE cross-compiler still not found after installation!${NC}"
+    echo -e "${YELLOW}Please install the MinGW cross-compiler manually:${NC}"
     case "$PKG_MGR" in
       dnf)
-        echo "  sudo dnf install --allowerasing mingw32-gcc"
+        echo -e "  ${CYAN}sudo dnf install --allowerasing mingw32-gcc${NC}"
         ;;
       pacman)
-        echo "  sudo pacman -S mingw-w64-gcc"
+        echo -e "  ${CYAN}sudo pacman -S mingw-w64-gcc${NC}"
         ;;
       apt)
-        echo "  sudo apt install gcc-mingw-w64"
+        echo -e "  ${CYAN}sudo apt install gcc-mingw-w64${NC}"
         ;;
     esac
     BUILD_FAILED=1
@@ -1357,43 +1357,43 @@ if ! check_cross_compiler_i386; then
   fi
 fi
 
-echo "✓ i386 PE cross-compiler found (i686-w64-mingw32-gcc)"
+echo -e "${GREEN}✓${NC} i386 PE cross-compiler found (i686-w64-mingw32-gcc)"
 
 # Check and install x86_64 PE cross-compiler
 if ! check_cross_compiler_x86_64; then
   echo ""
-  echo "❌ ERROR: x86_64 PE cross-compiler (x86_64-w64-mingw32-gcc) not found!"
-  echo "This is required when building with --enable-archs=x86_64"
+  echo -e "${RED}${BOLD}❌ ERROR: x86_64 PE cross-compiler (x86_64-w64-mingw32-gcc) not found!${NC}"
+  echo -e "${YELLOW}This is required when building with --enable-archs=x86_64${NC}"
   echo ""
-  echo "Installing MinGW x86_64 cross-compiler..."
-  echo "  (This may require your sudo password)"
+  echo -e "${CYAN}Installing MinGW x86_64 cross-compiler...${NC}"
+  echo -e "${YELLOW}  (This may require your sudo password)${NC}"
   
   case "$PKG_MGR" in
     dnf)
       if ! check_package_installed_dnf "mingw64-gcc"; then
-        echo "  Installing mingw64-gcc..."
+        echo -e "${CYAN}  Installing mingw64-gcc...${NC}"
         sudo dnf install -y --allowerasing mingw64-gcc
       else
-        echo "  ✓ mingw64-gcc package is installed, but compiler not found in PATH"
-        echo "  Please ensure mingw64-gcc is properly installed and in your PATH"
+        echo -e "  ${GREEN}✓${NC} mingw64-gcc package is installed, but compiler not found in PATH"
+        echo -e "${YELLOW}  Please ensure mingw64-gcc is properly installed and in your PATH${NC}"
       fi
       ;;
     pacman)
       if ! check_package_installed_pacman "mingw-w64-gcc"; then
-        echo "  Installing mingw-w64-gcc..."
+        echo -e "${CYAN}  Installing mingw-w64-gcc...${NC}"
         sudo pacman -S --noconfirm mingw-w64-gcc
       else
-        echo "  ✓ mingw-w64-gcc package is installed, but compiler not found in PATH"
-        echo "  Please ensure mingw-w64-gcc is properly installed and in your PATH"
+        echo -e "  ${GREEN}✓${NC} mingw-w64-gcc package is installed, but compiler not found in PATH"
+        echo -e "${YELLOW}  Please ensure mingw-w64-gcc is properly installed and in your PATH${NC}"
       fi
       ;;
     apt)
       if ! check_package_installed_apt "gcc-mingw-w64"; then
-        echo "  Installing gcc-mingw-w64..."
+        echo -e "${CYAN}  Installing gcc-mingw-w64...${NC}"
         sudo apt install -y gcc-mingw-w64
       else
-        echo "  ✓ gcc-mingw-w64 package is installed, but compiler not found in PATH"
-        echo "  Please ensure gcc-mingw-w64 is properly installed and in your PATH"
+        echo -e "  ${GREEN}✓${NC} gcc-mingw-w64 package is installed, but compiler not found in PATH"
+        echo -e "${YELLOW}  Please ensure gcc-mingw-w64 is properly installed and in your PATH${NC}"
       fi
       ;;
   esac
@@ -1401,17 +1401,17 @@ if ! check_cross_compiler_x86_64; then
   # Check again after installation
   if ! check_cross_compiler_x86_64; then
     echo ""
-    echo -e "${RED}❌ ERROR: x86_64 PE cross-compiler still not found after installation!${NC}"
-    echo "Please install the MinGW cross-compiler manually:"
+    echo -e "${RED}${BOLD}❌ ERROR: x86_64 PE cross-compiler still not found after installation!${NC}"
+    echo -e "${YELLOW}Please install the MinGW cross-compiler manually:${NC}"
     case "$PKG_MGR" in
       dnf)
-        echo "  sudo dnf install --allowerasing mingw64-gcc"
+        echo -e "  ${CYAN}sudo dnf install --allowerasing mingw64-gcc${NC}"
         ;;
       pacman)
-        echo "  sudo pacman -S mingw-w64-gcc"
+        echo -e "  ${CYAN}sudo pacman -S mingw-w64-gcc${NC}"
         ;;
       apt)
-        echo "  sudo apt install gcc-mingw-w64"
+        echo -e "  ${CYAN}sudo apt install gcc-mingw-w64${NC}"
         ;;
     esac
     BUILD_FAILED=1
@@ -1420,7 +1420,7 @@ if ! check_cross_compiler_x86_64; then
   fi
 fi
 
-echo "✓ x86_64 PE cross-compiler found (x86_64-w64-mingw32-gcc)"
+echo -e "${GREEN}✓${NC} x86_64 PE cross-compiler found (x86_64-w64-mingw32-gcc)"
 
 # Check for FreeType development files (required for font support)
 check_freetype() {
@@ -1473,17 +1473,17 @@ if ! check_freetype; then
   # Check again after installation
   if ! check_freetype; then
     echo ""
-    echo -e "${RED}❌ ERROR: FreeType development files still not found after installation!${NC}"
-    echo "Please install FreeType development packages manually:"
+    echo -e "${RED}${BOLD}❌ ERROR: FreeType development files still not found after installation!${NC}"
+    echo -e "${YELLOW}Please install FreeType development packages manually:${NC}"
     case "$PKG_MGR" in
       dnf)
-        echo "  sudo dnf install freetype-devel"
+        echo -e "  ${CYAN}sudo dnf install freetype-devel${NC}"
         ;;
       pacman)
-        echo "  sudo pacman -S freetype2"
+        echo -e "  ${CYAN}sudo pacman -S freetype2${NC}"
         ;;
       apt)
-        echo "  sudo apt install libfreetype6-dev pkg-config"
+        echo -e "  ${CYAN}sudo apt install libfreetype6-dev pkg-config${NC}"
         ;;
     esac
     BUILD_FAILED=1
@@ -1644,45 +1644,44 @@ fi
 
 # Install Wine (only if build succeeded)
 if [ "${BUILD_FAILED:-0}" != "1" ]; then
-  echo "Installing Wine (using $BUILD_THREADS threads)..."
+  echo -e "${CYAN}Installing Wine (using $BUILD_THREADS threads)...${NC}"
   if ! make install -j$BUILD_THREADS >/dev/null 2>&1; then
     BUILD_FAILED=1
-    echo "❌ ERROR: Failed to install Wine"
+    echo -e "${RED}${BOLD}❌ ERROR: Failed to install Wine${NC}"
   else
-    echo "✓ Wine installed successfully"
+    echo -e "${GREEN}${BOLD}✓ Wine installed successfully${NC}"
     
     # Package Wine as .tar.xz
     if [ -d "$INSTALL_PREFIX" ] && [ "$(basename "$INSTALL_PREFIX")" = "ElementalWarrior-wine" ]; then
       echo ""
-      echo "Packaging Wine as .tar.xz..."
+      echo -e "${CYAN}${BOLD}Packaging Wine as .tar.xz...${NC}"
       cd "$(dirname "$INSTALL_PREFIX")" || exit 1
       WINE_VERSION="${SELECTED_VERSION:-unknown}"
       PACKAGE_NAME="ElementalWarrior-wine-${WINE_VERSION}.tar.xz"
       if tar -cJf "$PACKAGE_NAME" "$(basename "$INSTALL_PREFIX")" 2>/dev/null; then
-        echo "✓ Wine packaged successfully: $PACKAGE_NAME"
-        echo "  Location: $(pwd)/$PACKAGE_NAME"
-        echo "  Size: $(du -h "$PACKAGE_NAME" | cut -f1)"
+        echo -e "${GREEN}${BOLD}✓ Wine packaged successfully: ${CYAN}$PACKAGE_NAME${NC}"
+        echo -e "  ${BOLD}Location:${NC} ${CYAN}$(pwd)/$PACKAGE_NAME${NC}"
+        echo -e "  ${BOLD}Size:${NC} ${CYAN}$(du -h "$PACKAGE_NAME" | cut -f1)${NC}"
       else
-        echo "⚠ Warning: Failed to create package, but Wine is installed at: $INSTALL_PREFIX"
+        echo -e "${YELLOW}⚠ Warning: Failed to create package, but Wine is installed at: ${CYAN}$INSTALL_PREFIX${NC}"
       fi
     fi
   fi
 fi
 
-
-echo
+echo ""
 if [ "${BUILD_FAILED:-0}" = "1" ]; then
   echo -e "${RED}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
   echo -e "${RED}${BOLD}❌ BUILD FAILED!${NC}"
   echo -e "${RED}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
   echo ""
-  echo "Build logs saved:"
-  [ -f "wine-build.log" ] && echo "  - wine-build.log"
+  echo -e "${BOLD}Build logs saved:${NC}"
+  [ -f "wine-build.log" ] && echo -e "  ${CYAN}- wine-build.log${NC}"
   echo ""
-  echo "Please check the logs above for error details."
-  echo "Common issues:"
-  echo "  - Missing development packages (run script again to auto-install)"
-  echo "  - OpenCL headers not found (required - install ocl-icd-devel/opencl-headers)"
+  echo -e "${YELLOW}Please check the logs above for error details.${NC}"
+  echo -e "${BOLD}Common issues:${NC}"
+  echo -e "  ${YELLOW}- Missing development packages (run script again to auto-install)${NC}"
+  echo -e "  ${YELLOW}- OpenCL headers not found (required - install ocl-icd-devel/opencl-headers)${NC}"
   echo ""
   
   # Cleanup on failure
@@ -1690,10 +1689,10 @@ if [ "${BUILD_FAILED:-0}" = "1" ]; then
   
   exit 1
 else
-  echo "=========================================="
-  echo "✓ BUILD COMPLETE!"
-  echo "=========================================="
+  echo -e "${GREEN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+  echo -e "${GREEN}${BOLD}✓ BUILD COMPLETE!${NC}"
+  echo -e "${GREEN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
   echo ""
-  echo "Final output is in: $INSTALL_PREFIX"
+  echo -e "${BOLD}Final output is in:${NC} ${CYAN}$INSTALL_PREFIX${NC}"
   echo ""
 fi
