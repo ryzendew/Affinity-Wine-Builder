@@ -298,6 +298,7 @@ install_packages_64bit() {
           # Font libraries - 64-bit
           "libfontconfig1-dev"
           "libfreetype6-dev"
+          "libfreetype-dev"
           
           # X11 libraries - 64-bit
           "libx11-dev"
@@ -331,6 +332,7 @@ install_packages_64bit() {
           "libvulkan-dev"
           "vulkan-tools"
           "vulkan-validationlayers-dev"
+          "vulkan-utility-libraries-dev"
           
           # Wayland support
           "libwayland-dev"
@@ -359,12 +361,15 @@ install_packages_64bit() {
           "libxslt1-dev"
           # JPEG support (libjpeg-turbo8-dev is preferred, libjpeg-dev is fallback)
           "libjpeg-turbo8-dev"
+          "libjpeg62-turbo-dev"
           "libjpeg-dev"
           "libpng-dev"
           # TIFF support (version may vary by distro)
           "libtiff-dev"
           "libtiff5-dev"
+          "libtiff6-dev"
           "libtiffxx5"
+          "libtiffxx6"
           "liblcms2-dev"
           "libusb-1.0-0-dev"
           # pcap support (libpcap0.8-dev is the standard package)
