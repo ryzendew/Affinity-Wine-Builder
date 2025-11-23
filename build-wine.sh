@@ -1499,13 +1499,12 @@ echo -e "${GREEN}✓${NC} FreeType development files found"
 # Test executables try to use truncf from ucrtbase but link against msvcrt instead
 if [ "$BUILD_WAYLAND" = "0" ]; then
   "$WINE_SRC_DIR/configure" --prefix="$INSTALL_PREFIX" \
-    $OPENCL_FLAG --enable-archs=i386,x86_64 --disable-tests --without-wayland 2>&1 | grep -v "configure: OSS sound system found but too old (OSSv4 needed)"
+    $OPENCL_FLAG --enable-archs=i386,x86_64 --disable-tests --without-oss --without-wayland
   CONFIGURE_EXIT=${PIPESTATUS[0]}
 else
   "$WINE_SRC_DIR/configure" --prefix="$INSTALL_PREFIX" \
-    $OPENCL_FLAG --enable-archs=i386,x86_64 --disable-tests 2>&1 | grep -v "configure: OSS sound system found but too old (OSSv4 needed)"
+    $OPENCL_FLAG --enable-archs=i386,x86_64 --disable-tests --without-oss
   CONFIGURE_EXIT=${PIPESTATUS[0]}
-  # Silent configure warning; sound support is via ALSA
 fi
 
 # Check configure exit status (must check immediately after PIPESTATUS)
