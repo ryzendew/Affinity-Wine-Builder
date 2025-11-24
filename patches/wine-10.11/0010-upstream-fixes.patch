@@ -1,0 +1,37 @@
+
+winewayland: Only detach/attach client surface if it is different
+https://gitlab.winehq.org/wine/wine/-/merge_requests/8468
+
+diff -uarp a/dlls/winewayland.drv/window.c b/dlls/winewayland.drv/window.c
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -786,15 +786,18 @@ void set_client_surface(HWND hwnd, struc
+ 
+     if (!(data = wayland_win_data_get(hwnd))) return;
+ 
+-    if ((old_client = data->client_surface))
+-        wayland_client_surface_detach(old_client);
+-
+-    if ((data->client_surface = new_client))
++    if (new_client != data->client_surface)
+     {
+-        if (toplevel && NtUserIsWindowVisible(hwnd))
+-            wayland_client_surface_attach(new_client, toplevel);
+-        else
+-            wayland_client_surface_detach(new_client);
++        if ((old_client = data->client_surface))
++            wayland_client_surface_detach(old_client);
++
++        if ((data->client_surface = new_client))
++        {
++            if (toplevel && NtUserIsWindowVisible(hwnd))
++                wayland_client_surface_attach(new_client, toplevel);
++            else
++                wayland_client_surface_detach(new_client);
++        }
+     }
+ 
+     wayland_win_data_release(data);
+-- 
+2.47.1
+
