@@ -2,6 +2,8 @@
 Legacy ntsync5-mainline-d945eb4d patch from wine-tkg-git
 https://github.com/Frogging-Family/wine-tkg-git/
 
+End of patch, add fix running 32-bit processes when using NTSYNC
+
 
 diff -uNarp a/configure b/configure
 --- a/configure	2025-06-27 17:21:15.000000000 -0400
@@ -4412,6 +4414,40 @@ diff -uNarp a/server/winstation.c b/server/winstation.c
      desktop_close_handle,         /* close_handle */
      desktop_destroy               /* destroy */
  };
+-- 
+2.47.1
+
+
+Fix running 32-bit processes when using NTSYNC
+https://github.com/Kron4ek/Wine-Builds/commit/206bc3b136e4571007b74cac6e6ecba68aa0a8c3
+
+Fixes running 32-bit processes in non-wow64 mode.
+Borrowed from proton-GE.
+
+diff -ruN a/dlls/ntdll/unix/sync.c b/dlls/ntdll/unix/sync.c
+--- a/dlls/ntdll/unix/sync.c
++++ b/dlls/ntdll/unix/sync.c
+@@ -958,7 +958,7 @@
+     else if (timeout->QuadPart <= 0)
+     {
+         clock_gettime( CLOCK_MONOTONIC, &now );
+-        args.timeout = (now.tv_sec * NSECPERSEC) + now.tv_nsec + (-timeout->QuadPart * 100);
++        args.timeout = ((__s64)now.tv_sec * NSECPERSEC) + now.tv_nsec + (-timeout->QuadPart * 100);
+     }
+     else
+     {
+diff -ruN a/dlls/ntdll/unix/unix_private.h b/dlls/ntdll/unix/unix_private.h
+--- a/dlls/ntdll/unix/unix_private.h
++++ b/dlls/ntdll/unix/unix_private.h
+@@ -402,7 +402,7 @@
+ #define IMAGE_DLLCHARACTERISTICS_PREFER_NATIVE 0x0010 /* Wine extension */
+ 
+ #define TICKSPERSEC 10000000
+-#define NSECPERSEC 1000000000
++#define NSECPERSEC (LONG64)1000000000
+ #define SECS_1601_TO_1970  ((369 * 365 + 89) * (ULONGLONG)86400)
+ 
+ static inline ULONGLONG ticks_from_time_t( time_t time )
 -- 
 2.47.1
 
