@@ -5,7 +5,7 @@ https://gitlab.winehq.org/wine/wine/-/merge_requests/8468
 diff -uarp a/dlls/winewayland.drv/window.c b/dlls/winewayland.drv/window.c
 --- a/dlls/winewayland.drv/window.c
 +++ b/dlls/winewayland.drv/window.c
-@@ -786,15 +786,18 @@ void set_client_surface(HWND hwnd, struc
+@@ -794,15 +794,18 @@ void set_client_surface(HWND hwnd, struc
  
      if (!(data = wayland_win_data_get(hwnd))) return;
  
