@@ -227,17 +227,24 @@ echo -e "${GREEN}✓${NC} OpenCL headers found"
 
 # Configure Wine (matching GitHub Actions workflow)
 echo -e "${CYAN}Configuring Wine...${NC}"
-"$WINE_SRC_DIR/configure" \
+if ! "$WINE_SRC_DIR/configure" \
   --prefix="$INSTALL_PREFIX" \
   --enable-opencl \
-  --enable-win64 \
+  --enable-archs=i386,x86_64 \
+  --disable-tests \
   --without-oss \
-  2>&1 | grep -v "configure: OSS sound system found but too old (OSSv4 needed)" || true
-
-if [ ${PIPESTATUS[0]} -ne 0 ]; then
+  >configure.log 2>&1; then
   echo -e "${RED}${BOLD}❌ ERROR: Wine configure failed!${NC}"
+  echo -e "${YELLOW}Last 100 lines of configure log:${NC}"
+  tail -100 configure.log
+  echo ""
+  echo -e "${YELLOW}Full configure log saved to: configure.log${NC}"
   exit 1
 fi
+
+# Show configure summary (filter out OSS warning)
+echo -e "${CYAN}Configure summary:${NC}"
+grep -v "configure: OSS sound system found but too old (OSSv4 needed)" configure.log | tail -30 || cat configure.log | tail -30
 
 echo -e "${GREEN}✓${NC} Wine configured successfully"
 echo ""

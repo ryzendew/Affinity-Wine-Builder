@@ -96,7 +96,13 @@ jobs:
             libgstreamer-plugins-base1.0-dev \
             samba-dev \
             ocl-icd-opencl-dev \
-            opencl-headers
+            opencl-headers \
+            gcc-mingw-w64 \
+            libwayland-dev \
+            wayland-protocols \
+            libpcap-dev \
+            libpcsclite-dev \
+            libvulkan-dev
 
       - name: Set up ccache
         uses: actions/cache@v4
@@ -142,7 +148,22 @@ jobs:
           CXX: ccache g++
         run: |
           echo "Running Build-Wine-10.10.sh..."
-          ./Build-Wine-10.10.sh
+          ./Build-Wine-10.10.sh || {
+            echo "❌ Build failed! Checking for error logs..."
+            if [ -f "wine64-build/configure.log" ]; then
+              echo "=== Configure log ==="
+              cat wine64-build/configure.log
+            fi
+            if [ -f "wine64-build/wine-build.log" ]; then
+              echo "=== Last 100 lines of build log ==="
+              tail -100 wine64-build/wine-build.log
+            fi
+            if [ -f "wine64-build/wine-install.log" ]; then
+              echo "=== Last 100 lines of install log ==="
+              tail -100 wine64-build/wine-install.log
+            fi
+            exit 1
+          }
           
           echo ""
           echo "ccache statistics:"
@@ -199,6 +220,17 @@ jobs:
           ls -lh "$PACKAGE_NAME"
           echo ""
           echo "Package size: $(du -h "$PACKAGE_NAME" | cut -f1)"
+
+      - name: Upload build logs (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            wine64-build/configure.log
+            wine64-build/wine-build.log
+            wine64-build/wine-install.log
+          retention-days: 7
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
