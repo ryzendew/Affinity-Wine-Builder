@@ -108,15 +108,19 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.ccache
-          key: ${{ runner.os }}-ccache-wine-10.10-${{ github.sha }}
+          key: ${{ runner.os }}-ccache-wine-10.10-${{ hashFiles('patches/wine-10.10/*.patch', 'Build-Wine-10.10.sh') }}
           restore-keys: |
             ${{ runner.os }}-ccache-wine-10.10-
 
       - name: Configure ccache
         run: |
-          ccache --set-config=max_size=2G
+          ccache --set-config=max_size=10G
           ccache --set-config=compression=true
-          ccache -s
+          ccache --set-config=compression_level=6
+          ccache --set-config=sloppiness=pch_defines,time_macros,include_file_mtime,include_file_ctime
+          ccache --set-config=hash_dir=false
+          ccache --zero-stats
+          ccache --show-stats
 
       - name: Verify OpenCL headers
         run: |
@@ -125,6 +129,32 @@ jobs:
             exit 1
           fi
           echo "✓ OpenCL headers found"
+
+      - name: Set up ccache for cross-compilers
+        run: |
+          # Configure ccache to work with MinGW cross-compilers
+          # Create wrapper scripts that ccache can use
+          mkdir -p ~/ccache-bin
+          cat > ~/ccache-bin/i686-w64-mingw32-gcc << 'EOF'
+          #!/bin/bash
+          exec ccache /usr/bin/i686-w64-mingw32-gcc "$@"
+          EOF
+          cat > ~/ccache-bin/x86_64-w64-mingw32-gcc << 'EOF'
+          #!/bin/bash
+          exec ccache /usr/bin/x86_64-w64-mingw32-gcc "$@"
+          EOF
+          cat > ~/ccache-bin/i686-w64-mingw32-g++ << 'EOF'
+          #!/bin/bash
+          exec ccache /usr/bin/i686-w64-mingw32-g++ "$@"
+          EOF
+          cat > ~/ccache-bin/x86_64-w64-mingw32-g++ << 'EOF'
+          #!/bin/bash
+          exec ccache /usr/bin/x86_64-w64-mingw32-g++ "$@"
+          EOF
+          chmod +x ~/ccache-bin/*
+          # Add to PATH (must be before /usr/bin)
+          echo "$HOME/ccache-bin:$PATH" >> $GITHUB_ENV
+          echo "✓ ccache wrappers created for MinGW cross-compilers"
 
       - name: Set build environment variables
         run: |
@@ -166,21 +196,26 @@ jobs:
           }
           
           echo ""
-          echo "ccache statistics:"
+          echo "=========================================="
+          echo "ccache statistics (after build):"
+          echo "=========================================="
           ccache -s
+          echo ""
+          echo "Cache hit rate:"
+          ccache -s | grep -E "(cache hit|cache miss|hit rate)" || true
 
       - name: Verify installation
         run: |
-          echo "Verifying installation at: ${{ env.INSTALL_PREFIX }}"
+          echo "Verifying installation at: $INSTALL_PREFIX"
           
-          if [ ! -d "${{ env.INSTALL_PREFIX }}" ]; then
-            echo "❌ ERROR: Installation directory not found at ${{ env.INSTALL_PREFIX }}"
+          if [ ! -d "$INSTALL_PREFIX" ]; then
+            echo "❌ ERROR: Installation directory not found at $INSTALL_PREFIX"
             exit 1
           fi
           
           echo "✓ Installation directory exists"
           echo "Installation directory contents:"
-          ls -la "${{ env.INSTALL_PREFIX }}" || true
+          ls -la "$INSTALL_PREFIX" || true
           echo ""
           
           # Verify all required directories exist (bin, include, lib, share)
@@ -188,9 +223,9 @@ jobs:
           MISSING_DIRS=()
           
           for dir in "${REQUIRED_DIRS[@]}"; do
-            if [ -d "${{ env.INSTALL_PREFIX }}/$dir" ]; then
+            if [ -d "$INSTALL_PREFIX/$dir" ]; then
               echo "✓ $dir/ directory found"
-              echo "  Contents: $(ls -1 "${{ env.INSTALL_PREFIX }}/$dir" | wc -l) items"
+              echo "  Contents: $(ls -1 "$INSTALL_PREFIX/$dir" | wc -l) items"
             else
               echo "❌ $dir/ directory MISSING!"
               MISSING_DIRS+=("$dir")
@@ -207,7 +242,7 @@ jobs:
           echo "✓ All required directories verified (bin, include, lib, share)"
           echo ""
           echo "Directory sizes:"
-          du -sh "${{ env.INSTALL_PREFIX }}"/* 2>/dev/null || true
+          du -sh "$INSTALL_PREFIX"/* 2>/dev/null || true
 
       - name: Verify package exists
         run: |
@@ -251,6 +286,6 @@ jobs:
           echo "=========================================="
           echo ""
           echo "Artifact: ElementalWarrior-wine-10.10.tar.xz"
-          echo "Installation prefix: ${{ env.INSTALL_PREFIX }}"
+          echo "Installation prefix: $INSTALL_PREFIX"
           echo ""
 
