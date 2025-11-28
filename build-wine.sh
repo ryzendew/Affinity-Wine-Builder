@@ -184,10 +184,331 @@ echo -e "  • Automatic patch application"
 echo -e "  • Optimized build configuration"
 echo ""
 
-if ! prompt_yes_no "Do you wish to continue?" "y"; then
-  echo -e "${YELLOW}Build cancelled by user.${NC}"
+# Main menu: Build or Prepare for GitHub
+show_main_menu() {
+  echo ""
+  echo -e "${BLUE}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+  echo -e "${CYAN}${BOLD}What would you like to do?${NC}"
+  echo -e "${BLUE}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+  echo ""
+  echo -e "  ${GREEN}1${NC}) ${CYAN}Build Wine${NC} (download, patch, compile, and install)"
+  echo -e "  ${GREEN}2${NC}) ${CYAN}Prepare Wine for GitHub${NC} (download, patch, initialize git repo)"
+  echo -e "  ${RED}3${NC}) ${YELLOW}Exit${NC}"
+  echo ""
+  echo -e "${BLUE}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+  echo ""
+  
+  while true; do
+    echo -ne "${YELLOW}Select an option [1-3]: ${NC}"
+    read choice
+    
+    case "$choice" in
+      1)
+        return 0  # Build mode
+        ;;
+      2)
+        return 1  # GitHub prep mode
+        ;;
+      3|"")
+        echo -e "${YELLOW}Exiting.${NC}"
+        exit 0
+        ;;
+      *)
+        echo -e "${RED}Invalid choice. Please enter 1, 2, or 3.${NC}"
+        ;;
+    esac
+  done
+}
+
+# Prepare Wine for GitHub
+prepare_wine_for_github() {
+  local version="$1"
+  local output_dir="${2:-./wine-patched}"
+  
+  echo ""
+  echo -e "${BLUE}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+  echo -e "${CYAN}${BOLD}Preparing Wine for GitHub${NC}"
+  echo -e "${BLUE}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+  echo ""
+  
+  # Select version if not provided
+  if [ -z "$version" ]; then
+    version=$(select_wine_version)
+    if [ -z "$version" ]; then
+      echo -e "${RED}No version selected. Exiting.${NC}"
+      exit 1
+    fi
+  fi
+  
+  # Ask for output directory
+  echo -e "${CYAN}Where should the patched Wine source be prepared?${NC}"
+  echo -ne "${YELLOW}Output directory [${output_dir}]: ${NC}"
+  read user_dir
+  if [ -n "$user_dir" ]; then
+    output_dir="$user_dir"
+  fi
+  
+  # Convert to absolute path
+  local current_dir="$(pwd)"
+  if [[ "$output_dir" != /* ]]; then
+    # Relative path - make it absolute based on current directory
+    if [[ "$output_dir" == ./* ]] || [[ "$output_dir" == ../* ]]; then
+      output_dir="$(cd "$(dirname "$output_dir")" 2>/dev/null && pwd)/$(basename "$output_dir")" || output_dir="$current_dir/$(basename "$output_dir")"
+    else
+      output_dir="$current_dir/$output_dir"
+    fi
+  fi
+  
+  echo ""
+  echo -e "${CYAN}Configuration:${NC}"
+  echo -e "  ${BOLD}Wine Version:${NC}     ${GREEN}$version${NC}"
+  echo -e "  ${BOLD}Output Directory:${NC} ${GREEN}$output_dir${NC}"
+  echo ""
+  
+  if ! prompt_yes_no "Proceed with preparing Wine for GitHub?" "y"; then
+    echo -e "${YELLOW}Operation cancelled.${NC}"
+    exit 0
+  fi
+  
+  # Step 1: Download Wine source
+  echo ""
+  echo -e "${CYAN}${BOLD}Step 1: Downloading Wine source...${NC}"
+  echo -e "${BLUE}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+  
+  if [ -d "$output_dir" ]; then
+    if ! prompt_yes_no "Directory '$output_dir' already exists. Remove it and start fresh?" "y"; then
+      echo -e "${YELLOW}Operation cancelled.${NC}"
+      exit 0
+    fi
+    echo -e "${CYAN}Removing existing directory...${NC}"
+    rm -rf "$output_dir"
+  fi
+  
+  if ! download_wine_source "$version" "$output_dir"; then
+    echo -e "${RED}${BOLD}❌ ERROR: Failed to download Wine source.${NC}"
+    exit 1
+  fi
+  
+  echo -e "${GREEN}${BOLD}✓ Wine source downloaded successfully!${NC}"
+  
+  # Step 2: Apply patches
+  echo ""
+  echo -e "${CYAN}${BOLD}Step 2: Applying patches...${NC}"
+  echo -e "${BLUE}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+  
+  apply_patches "$output_dir"
+  
+  # Step 3: Initialize git repository
+  echo ""
+  echo -e "${CYAN}${BOLD}Step 3: Initializing Git repository...${NC}"
+  echo -e "${BLUE}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+  
+  cd "$output_dir" || {
+    echo -e "${RED}${BOLD}❌ ERROR: Failed to change to output directory.${NC}"
+    exit 1
+  }
+  
+  # Check if git is installed
+  if ! command -v git >/dev/null 2>&1; then
+    echo -e "${YELLOW}⚠ Git is not installed. Skipping git repository initialization.${NC}"
+    echo -e "${YELLOW}  You can initialize git manually later with: ${CYAN}git init${NC}"
+  else
+    # Check if already a git repo
+    if [ -d ".git" ]; then
+      echo -e "${YELLOW}⚠ Directory is already a git repository.${NC}"
+      if ! prompt_yes_no "Re-initialize git repository? (This will remove existing git history)" "n"; then
+        echo -e "${YELLOW}Skipping git initialization.${NC}"
+      else
+        echo -e "${CYAN}Removing existing .git directory...${NC}"
+        rm -rf .git
+        git init
+        echo -e "${GREEN}${BOLD}✓ Git repository initialized.${NC}"
+      fi
+    else
+      git init
+      echo -e "${GREEN}${BOLD}✓ Git repository initialized.${NC}"
+    fi
+  fi
+  
+  # Step 4: Create .gitignore
+  echo ""
+  echo -e "${CYAN}${BOLD}Step 4: Creating .gitignore...${NC}"
+  echo -e "${BLUE}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+  
+  if [ -f ".gitignore" ]; then
+    echo -e "${YELLOW}⚠ .gitignore already exists.${NC}"
+    if ! prompt_yes_no "Overwrite existing .gitignore?" "n"; then
+      echo -e "${YELLOW}Skipping .gitignore creation.${NC}"
+    else
+      create_gitignore
+    fi
+  else
+    create_gitignore
+  fi
+  
+  # Step 5: Create README if it doesn't exist
+  echo ""
+  echo -e "${CYAN}${BOLD}Step 5: Creating README.md...${NC}"
+  echo -e "${BLUE}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+  
+  if [ -f "README.md" ]; then
+    echo -e "${YELLOW}⚠ README.md already exists.${NC}"
+    if ! prompt_yes_no "Create a new README.md? (Backup will be created)" "n"; then
+      echo -e "${YELLOW}Skipping README.md creation.${NC}"
+    else
+      mv README.md README.md.backup 2>/dev/null || true
+      create_readme "$version"
+    fi
+  else
+    create_readme "$version"
+  fi
+  
+  # Step 6: Stage and commit all files (only if git is available and initialized)
+  if command -v git >/dev/null 2>&1 && [ -d ".git" ]; then
+    echo ""
+    echo -e "${CYAN}${BOLD}Step 6: Staging files for commit...${NC}"
+    echo -e "${BLUE}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    
+    git add -A
+    local file_count=$(git status --short 2>/dev/null | wc -l)
+    echo -e "${GREEN}${BOLD}✓ Staged $file_count files.${NC}"
+    
+    echo ""
+    echo -e "${CYAN}${BOLD}Step 7: Creating initial commit...${NC}"
+    echo -e "${BLUE}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    
+    # Configure git user if not set (needed for commit)
+    if [ -z "$(git config user.name 2>/dev/null)" ]; then
+      git config user.name "Wine Patcher" 2>/dev/null || true
+      git config user.email "wine-patcher@localhost" 2>/dev/null || true
+    fi
+    
+    local commit_message="Wine $version with patches applied
+
+This is a patched version of Wine $version prepared for GitHub.
+Patches have been applied from the Affinity-Wine-Builder project."
+    
+    if git commit -m "$commit_message" >/dev/null 2>&1; then
+      echo -e "${GREEN}${BOLD}✓ Initial commit created successfully!${NC}"
+    else
+      echo -e "${YELLOW}⚠ No changes to commit (or commit failed).${NC}"
+    fi
+  else
+    echo ""
+    echo -e "${YELLOW}⚠ Skipping git commit (git not available or repository not initialized).${NC}"
+  fi
+  
+  # Final summary
+  echo ""
+  echo -e "${GREEN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+  echo -e "${GREEN}${BOLD}✓ Wine prepared for GitHub successfully!${NC}"
+  echo -e "${GREEN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+  echo ""
+  echo -e "${BOLD}Next steps:${NC}"
+  echo -e "  1. Review the changes: ${CYAN}cd $output_dir && git log${NC}"
+  echo -e "  2. Create a GitHub repository"
+  echo -e "  3. Add remote: ${CYAN}git remote add origin <your-github-repo-url>${NC}"
+  echo -e "  4. Push to GitHub: ${CYAN}git push -u origin main${NC}"
+  echo ""
+  echo -e "${BOLD}Location:${NC} ${CYAN}$output_dir${NC}"
+  echo ""
+}
+
+# Create .gitignore for Wine
+create_gitignore() {
+  cat > .gitignore << 'EOF'
+# Build artifacts
+*.o
+*.a
+*.so
+*.dll
+*.exe
+*.dylib
+*.lo
+*.la
+*.log
+
+# Build directories
+wine64-build/
+wine32-build/
+wine-install/
+build/
+.deps/
+
+# Autotools
+autom4te.cache/
+config.cache
+config.log
+config.status
+Makefile
+libtool
+stamp-h1
+
+# Editor files
+*~
+*.swp
+*.swo
+.DS_Store
+.vscode/
+.idea/
+
+# Temporary files
+*.tmp
+*.bak
+*.orig
+*.rej
+EOF
+  echo -e "${GREEN}${BOLD}✓ .gitignore created.${NC}"
+}
+
+# Create README for patched Wine
+create_readme() {
+  local version="$1"
+  cat > README.md << EOF
+# Wine $version (Patched)
+
+This repository contains Wine $version with patches applied from the [Affinity-Wine-Builder](https://github.com/ElementalWarrior/Affinity-Wine-Builder) project.
+
+## About
+
+This is a patched version of Wine $version, prepared for building and distribution. The patches include various fixes and enhancements for better compatibility.
+
+## Building
+
+To build this patched Wine version:
+
+\`\`\`bash
+./configure --prefix=/usr/local
+make -j\$(nproc)
+sudo make install
+\`\`\`
+
+## Patches Applied
+
+The following patches have been applied to this Wine version:
+
+- Patches from Affinity-Wine-Builder project
+- See the [source repository](https://github.com/ElementalWarrior/Affinity-Wine-Builder) for patch details
+
+## License
+
+Wine is licensed under the LGPL v2.1. See the COPYING.LIB file for details.
+
+## Original Source
+
+This is based on Wine $version from [WineHQ](https://www.winehq.org/).
+EOF
+  echo -e "${GREEN}${BOLD}✓ README.md created.${NC}"
+}
+
+# Show main menu
+if ! show_main_menu; then
+  # GitHub prep mode
+  prepare_wine_for_github
   exit 0
 fi
+
+# Build mode (continue with existing flow)
 echo ""
 
 # Check if OpenCL headers are available (mandatory)

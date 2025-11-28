@@ -1,0 +1,224 @@
+name: Build Wine 10.10
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+    branches:
+      - main
+      - master
+  merge_group:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    # Skip build if PR was closed without merging
+    if: |
+      github.event_name == 'push' ||
+      (github.event_name == 'pull_request' && github.event.action != 'closed') ||
+      (github.event_name == 'pull_request' && github.event.pull_request.merged == true) ||
+      github.event_name == 'merge_group' ||
+      github.event_name == 'workflow_dispatch'
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up build environment
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            gcc \
+            g++ \
+            make \
+            flex \
+            bison \
+            autoconf \
+            automake \
+            libtool \
+            gettext \
+            git \
+            wget \
+            curl \
+            tar \
+            xz-utils \
+            patch \
+            pkg-config \
+            ccache \
+            xorg-dev \
+            libx11-dev \
+            libxext-dev \
+            libxrender-dev \
+            libxrandr-dev \
+            libxinerama-dev \
+            libxi-dev \
+            libxfixes-dev \
+            libxcursor-dev \
+            libxcomposite-dev \
+            libxdamage-dev \
+            libxss-dev \
+            libxtst-dev \
+            libasound2-dev \
+            libpulse-dev \
+            libdbus-1-dev \
+            libfontconfig1-dev \
+            libfreetype6-dev \
+            libjpeg-dev \
+            libpng-dev \
+            libtiff-dev \
+            liblcms2-dev \
+            libxml2-dev \
+            libxslt1-dev \
+            libgnutls28-dev \
+            libsane-dev \
+            libv4l-dev \
+            libgphoto2-dev \
+            libcapi20-dev \
+            libcups2-dev \
+            libkrb5-dev \
+            libldap2-dev \
+            libsdl2-dev \
+            libusb-1.0-0-dev \
+            libudev-dev \
+            libunwind-dev \
+            libavcodec-dev \
+            libavformat-dev \
+            libavutil-dev \
+            libgstreamer1.0-dev \
+            libgstreamer-plugins-base1.0-dev \
+            samba-dev \
+            ocl-icd-opencl-dev \
+            opencl-headers
+
+      - name: Set up ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ${{ runner.os }}-ccache-wine-10.10-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-ccache-wine-10.10-
+
+      - name: Configure ccache
+        run: |
+          ccache --set-config=max_size=2G
+          ccache --set-config=compression=true
+          ccache -s
+
+      - name: Verify OpenCL headers
+        run: |
+          if [ ! -f "/usr/include/CL/cl.h" ] && [ ! -f "/usr/local/include/CL/cl.h" ]; then
+            echo "❌ ERROR: OpenCL headers not found!"
+            exit 1
+          fi
+          echo "✓ OpenCL headers found"
+
+      - name: Set build environment variables
+        run: |
+          echo "BUILD_THREADS=$(nproc)" >> $GITHUB_ENV
+          echo "CFLAGS=-O2 -std=gnu17 -pipe -ffat-lto-objects -Wno-discarded-qualifiers -Wno-format -Wno-maybe-uninitialized -Wno-misleading-indentation" >> $GITHUB_ENV
+          echo "CROSSCFLAGS=-O2 -std=gnu17 -pipe -Wno-discarded-qualifiers -Wno-format -Wno-maybe-uninitialized -Wno-misleading-indentation" >> $GITHUB_ENV
+          echo "CROSSCXXFLAGS=-O2 -std=gnu17 -pipe -Wno-discarded-qualifiers -Wno-format -Wno-maybe-uninitialized -Wno-misleading-indentation" >> $GITHUB_ENV
+          echo "CROSSLDFLAGS=-Wl,-O1" >> $GITHUB_ENV
+          echo "INSTALL_PREFIX=${{ github.workspace }}/ElementalWarrior-wine-10.10" >> $GITHUB_ENV
+          echo "CC=ccache gcc" >> $GITHUB_ENV
+          echo "CXX=ccache g++" >> $GITHUB_ENV
+
+      - name: Make script executable
+        run: |
+          chmod +x Build-Wine-10.10.sh
+          echo "✓ Build-Wine-10.10.sh is executable"
+
+      - name: Build Wine 10.10
+        env:
+          CC: ccache gcc
+          CXX: ccache g++
+        run: |
+          echo "Running Build-Wine-10.10.sh..."
+          ./Build-Wine-10.10.sh
+          
+          echo ""
+          echo "ccache statistics:"
+          ccache -s
+
+      - name: Verify installation
+        run: |
+          echo "Verifying installation at: ${{ env.INSTALL_PREFIX }}"
+          
+          if [ ! -d "${{ env.INSTALL_PREFIX }}" ]; then
+            echo "❌ ERROR: Installation directory not found at ${{ env.INSTALL_PREFIX }}"
+            exit 1
+          fi
+          
+          echo "✓ Installation directory exists"
+          echo "Installation directory contents:"
+          ls -la "${{ env.INSTALL_PREFIX }}" || true
+          echo ""
+          
+          # Verify all required directories exist (bin, include, lib, share)
+          REQUIRED_DIRS=("bin" "include" "lib" "share")
+          MISSING_DIRS=()
+          
+          for dir in "${REQUIRED_DIRS[@]}"; do
+            if [ -d "${{ env.INSTALL_PREFIX }}/$dir" ]; then
+              echo "✓ $dir/ directory found"
+              echo "  Contents: $(ls -1 "${{ env.INSTALL_PREFIX }}/$dir" | wc -l) items"
+            else
+              echo "❌ $dir/ directory MISSING!"
+              MISSING_DIRS+=("$dir")
+            fi
+          done
+          
+          if [ ${#MISSING_DIRS[@]} -gt 0 ]; then
+            echo ""
+            echo "❌ ERROR: Missing required directories: ${MISSING_DIRS[*]}"
+            exit 1
+          fi
+          
+          echo ""
+          echo "✓ All required directories verified (bin, include, lib, share)"
+          echo ""
+          echo "Directory sizes:"
+          du -sh "${{ env.INSTALL_PREFIX }}"/* 2>/dev/null || true
+
+      - name: Verify package exists
+        run: |
+          PACKAGE_NAME="ElementalWarrior-wine-10.10.tar.xz"
+          if [ ! -f "$PACKAGE_NAME" ]; then
+            echo "❌ ERROR: Package $PACKAGE_NAME not found!"
+            exit 1
+          fi
+          echo "✓ Package found: $PACKAGE_NAME"
+          ls -lh "$PACKAGE_NAME"
+          echo ""
+          echo "Package size: $(du -h "$PACKAGE_NAME" | cut -f1)"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ElementalWarrior-wine-10.10
+          path: ${{ github.workspace }}/ElementalWarrior-wine-10.10.tar.xz
+          retention-days: 30
+
+      - name: Build summary
+        if: always()
+        run: |
+          echo "=========================================="
+          if [ "${{ job.status }}" == "success" ]; then
+            echo "✓ BUILD COMPLETE!"
+          else
+            echo "❌ BUILD FAILED!"
+          fi
+          echo "=========================================="
+          echo ""
+          echo "Artifact: ElementalWarrior-wine-10.10.tar.xz"
+          echo "Installation prefix: ${{ env.INSTALL_PREFIX }}"
+          echo ""
+
