@@ -153,7 +153,7 @@ jobs:
           EOF
           chmod +x ~/ccache-bin/*
           # Add to PATH (must be before /usr/bin)
-          echo "$HOME/ccache-bin:$PATH" >> $GITHUB_ENV
+          echo "$HOME/ccache-bin" >> $GITHUB_PATH
           echo "✓ ccache wrappers created for MinGW cross-compilers"
 
       - name: Set build environment variables
