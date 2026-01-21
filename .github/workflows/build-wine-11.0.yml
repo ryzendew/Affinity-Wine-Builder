@@ -103,6 +103,15 @@ jobs:
             libwayland-dev:i386 \
             libwayland-egl-backend-dev \
             libwayland-egl-backend-dev:i386 \
+            libegl1-mesa-dev \
+            libegl1-mesa-dev:i386 \
+            libgbm-dev \
+            libgbm-dev:i386 \
+            libwayland-egl1 \
+            libwayland-egl1:i386 \
+            libegl1-mesa0 \
+            libgbm1 \
+            libgbm1:i386 \
             wayland-protocols \
             libpcap-dev \
             libpcsclite-dev \
