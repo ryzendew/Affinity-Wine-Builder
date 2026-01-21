@@ -7,7 +7,7 @@
 # This script assumes:
 #   - All build dependencies are already installed (handled by GitHub Actions)
 #   - Wine source code is in the current directory (or will be downloaded)
-#   - Patches are in patches/wine-10.10/
+#   - Patches are in patches/wine-11.0/
 #
 # Usage:
 #   ./Build-Wine-11.0.sh
@@ -332,21 +332,21 @@ echo -e "${CYAN}${BOLD}Step 6: Packaging Wine${NC}"
 echo -e "${BLUE}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 
 # Package Wine as .tar.xz
-# The tarball should extract to ElementalWarrior-wine-10.10/ with bin, include, lib, share inside
+# The tarball should extract to ElementalWarrior-wine-11.0/ with bin, include, lib, share inside
 if [ -d "$INSTALL_PREFIX" ]; then
   echo -e "${CYAN}${BOLD}Packaging Wine as .tar.xz...${NC}"
   cd "$(dirname "$INSTALL_PREFIX")" || exit 1
   PACKAGE_NAME="ElementalWarrior-wine-$WINE_VERSION.tar.xz"
   
   # Package with the directory name included
-  # This ensures extraction creates ElementalWarrior-wine-10.10/ with bin, include, lib, share inside
+  # This ensures extraction creates ElementalWarrior-wine-11.0/ with bin, include, lib, share inside
   if tar -cJf "$PACKAGE_NAME" "$(basename "$INSTALL_PREFIX")" 2>/dev/null; then
     echo -e "${GREEN}${BOLD}✓ Wine packaged successfully: ${CYAN}$PACKAGE_NAME${NC}"
     echo -e "  ${BOLD}Location:${NC} ${CYAN}$(pwd)/$PACKAGE_NAME${NC}"
     echo -e "  ${BOLD}Size:${NC} ${CYAN}$(du -h "$PACKAGE_NAME" | cut -f1)${NC}"
     echo ""
     echo -e "${CYAN}Package structure:${NC}"
-    echo -e "  ${GREEN}ElementalWarrior-wine-10.10/${NC}"
+    echo -e "  ${GREEN}ElementalWarrior-wine-11.0/${NC}"
     echo -e "    ${GREEN}bin/${NC}"
     echo -e "    ${GREEN}include/${NC}"
     echo -e "    ${GREEN}lib/${NC}"
