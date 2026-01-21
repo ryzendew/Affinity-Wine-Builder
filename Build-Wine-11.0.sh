@@ -74,8 +74,8 @@ else
   echo -e "${YELLOW}⚠ Wine source not found. Attempting to download...${NC}"
   
   # Download Wine source
-  local v_maj=$(echo "$WINE_VERSION" | cut -d'.' -f1)
-  local v_min=$(echo "$WINE_VERSION" | cut -s -d'.' -f2)
+  v_maj=$(echo "$WINE_VERSION" | cut -d'.' -f1)
+  v_min=$(echo "$WINE_VERSION" | cut -s -d'.' -f2)
   local url_subdir
   if [ -z "$v_min" ] || [ "$v_min" = "0" ]; then
     url_subdir="$v_maj.0"
