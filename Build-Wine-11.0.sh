@@ -76,7 +76,7 @@ else
   # Download Wine source
   v_maj=$(echo "$WINE_VERSION" | cut -d'.' -f1)
   v_min=$(echo "$WINE_VERSION" | cut -s -d'.' -f2)
-  local url_subdir
+  url_subdir
   if [ -z "$v_min" ] || [ "$v_min" = "0" ]; then
     url_subdir="$v_maj.0"
   else
