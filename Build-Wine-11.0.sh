@@ -1,8 +1,8 @@
 #!/bin/bash
 #
-# Build-Wine-10.10.sh
+# Build-Wine-11.0.sh
 # Simplified Wine build script for GitHub Actions
-# Patches, builds, and packages Wine 10.10
+# Patches, builds, and packages Wine 11.0
 #
 # This script assumes:
 #   - All build dependencies are already installed (handled by GitHub Actions)
@@ -10,7 +10,7 @@
 #   - Patches are in patches/wine-10.10/
 #
 # Usage:
-#   ./Build-Wine-10.10.sh
+#   ./Build-Wine-11.0.sh
 #
 # Environment variables:
 #   BUILD_THREADS    - Number of build threads (default: nproc)
@@ -32,7 +32,7 @@ NC='\033[0m' # No Color
 BOLD='\033[1m'
 
 # Wine version
-WINE_VERSION="10.10"
+WINE_VERSION="11.0"
 
 # Get script directory
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -40,8 +40,8 @@ cd "$SCRIPT_DIR"
 
 # Set defaults
 BUILD_THREADS="${BUILD_THREADS:-$(nproc 2>/dev/null || echo 4)}"
-# Use ElementalWarrior-wine-10.10 as the directory name for proper packaging
-INSTALL_PREFIX="${INSTALL_PREFIX:-$SCRIPT_DIR/ElementalWarrior-wine-10.10}"
+# Use ElementalWarrior-wine-11.0 as the directory name for proper packaging
+INSTALL_PREFIX="${INSTALL_PREFIX:-$SCRIPT_DIR/ElementalWarrior-wine-11.0}"
 
 # Build flags (matching GitHub Actions workflow)
 CFLAGS="${CFLAGS:--O2 -std=gnu17 -pipe -ffat-lto-objects -Wno-discarded-qualifiers -Wno-format -Wno-maybe-uninitialized -Wno-misleading-indentation}"
@@ -53,7 +53,7 @@ export CFLAGS CROSSCFLAGS CROSSCXXFLAGS CROSSLDFLAGS
 
 # Print header
 echo -e "${CYAN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${CYAN}${BOLD}Wine 10.10 Build Script${NC}"
+echo -e "${CYAN}${BOLD}Wine 11.0 Build Script${NC}"
 echo -e "${CYAN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo ""
 echo -e "${BOLD}Configuration:${NC}"

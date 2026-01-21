@@ -1214,7 +1214,17 @@ download_wine_source() {
     fi
   fi
   
-  local wine_url="https://dl.winehq.org/wine/source/${version%.*}.x/wine-${version}.tar.xz"
+  local version_major=$(echo "$version" | cut -d'.' -f1)
+  local version_minor=$(echo "$version" | cut -s -d'.' -f2)
+  local url_subdir
+  
+  if [ -z "$version_minor" ] || [ "$version_minor" = "0" ]; then
+    url_subdir="$version_major.0"
+  else
+    url_subdir="$version_major.x"
+  fi
+  
+  local wine_url="https://dl.winehq.org/wine/source/$url_subdir/wine-${version}.tar.xz"
   local wine_file="wine-${version}.tar.xz"
   local wine_dir="wine-${version}"
   
