@@ -33,6 +33,7 @@ jobs:
 
       - name: Set up build environment
         run: |
+          sudo dpkg --add-architecture i386
           sudo apt-get update
           sudo apt-get install -y \
             build-essential \
@@ -99,6 +100,9 @@ jobs:
             opencl-headers \
             gcc-mingw-w64 \
             libwayland-dev \
+            libwayland-dev:i386 \
+            libwayland-egl-backend-dev \
+            libwayland-egl-backend-dev:i386 \
             wayland-protocols \
             libpcap-dev \
             libpcsclite-dev \
