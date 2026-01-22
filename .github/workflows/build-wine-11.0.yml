@@ -31,102 +31,54 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Install Arch Linux
+        run: curl -L https://github.com/zaoqi/github-actions-archlinux/raw/master/install.sh | sh
+
       - name: Set up build environment
         run: |
-          sudo dpkg --add-architecture i386
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential \
-            gcc \
-            gcc-multilib \
-            g++ \
-            g++-multilib \
-            make \
-            flex \
-            bison \
-            autoconf \
-            automake \
-            libtool \
-            gettext \
+          pacman -Syu --noconfirm
+          pacman -S --noconfirm \
+            base-devel \
             git \
             wget \
-            curl \
-            tar \
-            xz-utils \
-            patch \
+            cmake \
+            ninja \
             pkg-config \
             ccache \
-            xorg-dev \
-            libx11-dev \
-            libxext-dev \
-            libxrender-dev \
-            libxrandr-dev \
-            libxinerama-dev \
-            libxi-dev \
-            libxfixes-dev \
-            libxcursor-dev \
-            libxcomposite-dev \
-            libxdamage-dev \
-            libxss-dev \
-            libxtst-dev \
-            libasound2-dev \
-            libpulse-dev \
-            libdbus-1-dev \
-            libfontconfig1-dev \
-            libfreetype6-dev \
-            libjpeg-dev \
-            libpng-dev \
-            libtiff-dev \
-            liblcms2-dev \
-            libxml2-dev \
-            libxslt1-dev \
-            libgnutls28-dev \
-            libsane-dev \
-            libv4l-dev \
-            libgphoto2-dev \
-            libcapi20-dev \
-            libcups2-dev \
-            libkrb5-dev \
-            libldap2-dev \
-            libsdl2-dev \
-            libusb-1.0-0-dev \
-            libudev-dev \
-            libunwind-dev \
-            libavcodec-dev \
-            libavformat-dev \
-            libavutil-dev \
-            libgstreamer1.0-dev \
-            libgstreamer-plugins-base1.0-dev \
-            samba-dev \
-            ocl-icd-opencl-dev \
-            opencl-headers \
-            gcc-mingw-w64 \
-            libwayland-dev \
-            libwayland-bin \
+            mingw-w64-gcc \
+            wayland \
             wayland-protocols \
-            libxkbcommon-dev \
-            libegl1-mesa-dev \
-            libgl1-mesa-dev \
-            libgbm-dev \
-            libpcap-dev \
-            libpcsclite-dev \
-            libvulkan-dev
-
-      - name: Add missing wayland-egl.pc pkg-config file
-        run: |
-          sudo mkdir -p /usr/lib/x86_64-linux-gnu/pkgconfig
-          cat << 'EOF' | sudo tee /usr/lib/x86_64-linux-gnu/pkgconfig/wayland-egl.pc
-          prefix=/usr
-          exec_prefix=${prefix}
-          libdir=${exec_prefix}/lib/x86_64-linux-gnu
-          includedir=${prefix}/include
-
-          Name: wayland-egl
-          Description: Wayland EGL library
-          Version: 1.19.0
-          Libs: -lwayland-egl
-          Cflags: -I${includedir}
-          EOF
+            libxkbcommon \
+            mesa \
+            libglvnd \
+            vulkan-icd-loader \
+            gst-plugins-base \
+            libpng \
+            freetype2 \
+            fontconfig \
+            opencl-headers \
+            ocl-icd \
+            libpulse \
+            libdbus \
+            libxml2 \
+            libxslt \
+            gnutls \
+            sane \
+            libv4l \
+            libgphoto2 \
+            libcapi \
+            cups \
+            krb5 \
+            openldap \
+            sdl2 \
+            libusb \
+            systemd \
+            libunwind \
+            ffmpeg \
+            samba \
+            libpcap \
+            pcsclite \
+            vulkan-headers
 
       - name: Verify Wayland pkg-config setup
         run: |
