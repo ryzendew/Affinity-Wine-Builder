@@ -52,6 +52,7 @@ jobs:
             libxcomposite-dev \
             libxcomposite-dev:i386 \
             libwayland-egl-backend-dev \
+            libwayland-egl-backend-dev:i386 \
             libwayland-egl1-mesa \
             libwayland-dev \
             libwayland-dev:i386 \
@@ -59,8 +60,12 @@ jobs:
             libwayland-egl1:i386 \
             wayland-protocols \
             libxkbcommon-dev \
+            libxkbcommon-dev:i386 \
+            libxkbregistry-dev \
             libegl1-mesa-dev \
             libegl1-mesa-dev:i386 \
+            libegl-dev \
+            libgles2-mesa-dev \
             libgbm-dev \
             libgbm-dev:i386 \
             pkg-config \
@@ -103,6 +108,7 @@ jobs:
 
       - name: Add missing wayland-egl.pc pkg-config file
         run: |
+          # 64-bit version
           sudo mkdir -p /usr/lib/x86_64-linux-gnu/pkgconfig
           cat << 'EOF' | sudo tee /usr/lib/x86_64-linux-gnu/pkgconfig/wayland-egl.pc
           prefix=/usr
@@ -112,18 +118,46 @@ jobs:
 
           Name: wayland-egl
           Description: Wayland EGL library
-          Version: 1.19.0
-          Libs: -lwayland-egl
+          Version: 1.22.0
+          Libs: -L${libdir} -lwayland-egl
+          Cflags: -I${includedir}
+          EOF
+          # 32-bit version
+          sudo mkdir -p /usr/lib/i386-linux-gnu/pkgconfig
+          cat << 'EOF' | sudo tee /usr/lib/i386-linux-gnu/pkgconfig/wayland-egl.pc
+          prefix=/usr
+          exec_prefix=${prefix}
+          libdir=${exec_prefix}/lib/i386-linux-gnu
+          includedir=${prefix}/include
+
+          Name: wayland-egl
+          Description: Wayland EGL library
+          Version: 1.22.0
+          Libs: -L${libdir} -lwayland-egl
           Cflags: -I${includedir}
           EOF
 
       - name: Verify Wayland pkg-config setup
         run: |
-          echo "Checking pkg-config files..."
-          pkg-config --exists wayland-client && echo "✓ wayland-client OK" || echo "✗ wayland-client missing"
-          pkg-config --exists xkbcommon && echo "✓ xkbcommon OK" || echo "✗ xkbcommon missing"
-          pkg-config --exists wayland-egl && echo "✓ wayland-egl OK" || echo "✗ wayland-egl missing"
-          pkg-config --exists egl && echo "✓ egl OK" || echo "✗ egl missing"
+          echo "pkg-config --modversion for key modules:"
+          pkg-config --modversion wayland-client || echo "✗ wayland-client"
+          pkg-config --modversion wayland-protocols || echo "✗ wayland-protocols (critical!)"
+          pkg-config --modversion xkbcommon || echo "✗ xkbcommon"
+          pkg-config --modversion wayland-egl || echo "✗ wayland-egl (check your .pc file)"
+          pkg-config --modversion egl || echo "✗ egl"
+          echo ""
+          echo "wayland-protocols pkgdatadir (should show XML path):"
+          pkg-config --variable=pkgdatadir wayland-protocols || echo "No pkgdatadir → protocols missing"
+          echo ""
+          echo "Listing wayland .pc files:"
+          find /usr -name "*wayland*.pc" 2>/dev/null | grep -i egl || echo "No wayland-egl.pc found"
+          echo ""
+          echo "Checking libwayland-egl.so existence:"
+          find /usr/lib -name "libwayland-egl.so*" 2>/dev/null || echo "No libwayland-egl found!"
+          echo ""
+          echo "Checking wayland-egl.pc files..."
+          ls -la /usr/lib/x86_64-linux-gnu/pkgconfig/wayland-egl.pc || echo "✗ 64-bit wayland-egl.pc missing"
+          ls -la /usr/lib/i386-linux-gnu/pkgconfig/wayland-egl.pc || echo "✗ 32-bit wayland-egl.pc missing"
           echo ""
           echo "Checking for Wayland libraries..."
           find /usr/lib -name "*wayland*" -type f 2>/dev/null | head -10
@@ -193,7 +227,7 @@ jobs:
           echo "INSTALL_PREFIX=${{ github.workspace }}/ElementalWarrior-wine-11.0" >> $GITHUB_ENV
           echo "CC=ccache gcc" >> $GITHUB_ENV
           echo "CXX=ccache g++" >> $GITHUB_ENV
-          echo "PKG_CONFIG_PATH=/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/lib/pkgconfig:/usr/share/pkgconfig" >> $GITHUB_ENV
+          echo "PKG_CONFIG_PATH=/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/lib/i386-linux-gnu/pkgconfig:/usr/lib/pkgconfig:/usr/share/pkgconfig" >> $GITHUB_ENV
 
       - name: Make script executable
         run: |
