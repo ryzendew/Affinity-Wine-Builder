@@ -242,6 +242,7 @@ if ! "$WINE_SRC_DIR/configure" \
   --disable-tests \
   --enable-win64 \
   --without-oss \
+  --with-wayland \
   >configure.log 2>&1; then
   echo -e "${RED}${BOLD}❌ ERROR: Wine configure failed!${NC}"
   echo -e "${YELLOW}Last 100 lines of configure log:${NC}"

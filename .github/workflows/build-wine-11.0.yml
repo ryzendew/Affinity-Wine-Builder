@@ -49,6 +49,10 @@ jobs:
             libgstreamer-plugins-base1.0-dev \
             libvulkan-dev \
             libgl1-mesa-dev \
+            libxcomposite-dev \
+            libxcomposite-dev:i386 \
+            libwayland-egl-backend-dev \
+            libwayland-egl1-mesa \
             libwayland-dev \
             libwayland-dev:i386 \
             libwayland-egl1 \
@@ -120,6 +124,12 @@ jobs:
           pkg-config --exists xkbcommon && echo "✓ xkbcommon OK" || echo "✗ xkbcommon missing"
           pkg-config --exists wayland-egl && echo "✓ wayland-egl OK" || echo "✗ wayland-egl missing"
           pkg-config --exists egl && echo "✓ egl OK" || echo "✗ egl missing"
+          echo ""
+          echo "Checking for Wayland libraries..."
+          find /usr/lib -name "*wayland*" -type f 2>/dev/null | head -10
+          echo ""
+          echo "Checking pkg-config paths..."
+          pkg-config --list-all | grep -i wayland || echo "No wayland packages found in pkg-config"
 
       - name: Set up ccache
         uses: actions/cache@v4
@@ -183,6 +193,7 @@ jobs:
           echo "INSTALL_PREFIX=${{ github.workspace }}/ElementalWarrior-wine-11.0" >> $GITHUB_ENV
           echo "CC=ccache gcc" >> $GITHUB_ENV
           echo "CXX=ccache g++" >> $GITHUB_ENV
+          echo "PKG_CONFIG_PATH=/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/lib/pkgconfig:/usr/share/pkgconfig" >> $GITHUB_ENV
 
       - name: Make script executable
         run: |
