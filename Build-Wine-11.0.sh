@@ -291,39 +291,6 @@ fi
 # Install development files
 make install-dev -j"$BUILD_THREADS" >>wine-install.log 2>&1 || echo -e "${YELLOW}⚠ Warning: make install-dev failed, continuing...${NC}"
 
-# Install programs
-for progdir in programs/*/; do
-  if [ -d "$progdir" ] && [ -f "$progdir/Makefile" ]; then
-    make -C "$progdir" install >>wine-install.log 2>&1 || echo -e "${YELLOW}⚠ Warning: Failed to install $progdir${NC}"
-  fi
-done
-
-# Install tools
-for tooldir in tools/wine tools/widl tools/winebuild tools/winedump tools/winegcc tools/winemaker tools/wmc tools/wrc; do
-  if [ -d "$tooldir" ] && [ -f "$tooldir/Makefile" ]; then
-    make -C "$tooldir" install >>wine-install.log 2>&1 || echo -e "${YELLOW}⚠ Warning: Failed to install $tooldir${NC}"
-  fi
-done
-
-# Install loader
-if [ -d "loader" ] && [ -f "loader/Makefile" ]; then
-  make -C loader install >>wine-install.log 2>&1 || echo -e "${YELLOW}⚠ Warning: Failed to install loader${NC}"
-fi
-
-# Install server
-if [ -d "server" ] && [ -f "server/Makefile" ]; then
-  make -C server install >>wine-install.log 2>&1 || echo -e "${YELLOW}⚠ Warning: Failed to install server${NC}"
-fi
-
-# Install fonts and NLS
-if [ -d "fonts" ] && [ -f "fonts/Makefile" ]; then
-  make -C fonts install >>wine-install.log 2>&1 || echo -e "${YELLOW}⚠ Warning: Failed to install fonts${NC}"
-fi
-
-if [ -d "nls" ] && [ -f "nls/Makefile" ]; then
-  make -C nls install >>wine-install.log 2>&1 || echo -e "${YELLOW}⚠ Warning: Failed to install nls${NC}"
-fi
-
 echo -e "${GREEN}✓${NC} Wine installed successfully"
 echo ""
 
