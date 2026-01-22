@@ -104,10 +104,33 @@ jobs:
             libxkbcommon-dev \
             libegl1-mesa-dev \
             libgbm-dev \
-            pkg-config \
             libpcap-dev \
             libpcsclite-dev \
             libvulkan-dev
+
+      - name: Add missing wayland-egl.pc pkg-config file
+        run: |
+          sudo mkdir -p /usr/lib/x86_64-linux-gnu/pkgconfig
+          cat << 'EOF' | sudo tee /usr/lib/x86_64-linux-gnu/pkgconfig/wayland-egl.pc
+          prefix=/usr
+          exec_prefix=${prefix}
+          libdir=${exec_prefix}/lib/x86_64-linux-gnu
+          includedir=${prefix}/include
+
+          Name: wayland-egl
+          Description: Wayland EGL library
+          Version: 1.19.0
+          Libs: -lwayland-egl
+          Cflags: -I${includedir}
+          EOF
+
+      - name: Verify Wayland pkg-config setup
+        run: |
+          echo "Checking pkg-config files..."
+          pkg-config --exists wayland-client && echo "✓ wayland-client OK" || echo "✗ wayland-client missing"
+          pkg-config --exists xkbcommon && echo "✓ xkbcommon OK" || echo "✗ xkbcommon missing"
+          pkg-config --exists wayland-egl && echo "✓ wayland-egl OK" || echo "✗ wayland-egl missing"
+          pkg-config --exists egl && echo "✓ egl OK" || echo "✗ egl missing"
 
       - name: Set up ccache
         uses: actions/cache@v4
