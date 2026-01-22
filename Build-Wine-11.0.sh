@@ -238,6 +238,7 @@ echo -e "${CYAN}Configuring Wine...${NC}"
 if ! "$WINE_SRC_DIR/configure" \
   --prefix="$INSTALL_PREFIX" \
   --enable-opencl \
+  --with-wayland \
   --enable-archs=i386,x86_64 \
   --disable-tests \
   --without-oss \
