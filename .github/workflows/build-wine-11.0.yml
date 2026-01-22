@@ -102,9 +102,11 @@ jobs:
             opencl-headers \
             gcc-mingw-w64 \
             libwayland-dev \
+            libwayland-bin \
             wayland-protocols \
             libxkbcommon-dev \
             libegl1-mesa-dev \
+            libgl1-mesa-dev \
             libgbm-dev \
             libpcap-dev \
             libpcsclite-dev \
