@@ -233,6 +233,23 @@ fi
 
 echo -e "${GREEN}✓${NC} OpenCL headers found"
 
+# Create missing wayland-egl.pc pkg-config file (required for Wayland support)
+echo -e "${CYAN}Creating wayland-egl.pc pkg-config file...${NC}"
+sudo mkdir -p /usr/lib/pkgconfig
+cat << 'EOF' | sudo tee /usr/lib/pkgconfig/wayland-egl.pc > /dev/null
+prefix=/usr
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib/x86_64-linux-gnu
+includedir=${prefix}/include
+
+Name: wayland-egl
+Description: Wayland EGL library
+Version: 1.19.0
+Libs: -lwayland-egl
+Cflags: -I${includedir}
+EOF
+echo -e "${GREEN}✓${NC} Created wayland-egl.pc pkg-config file"
+
 # Configure Wine (matching GitHub Actions workflow)
 echo -e "${CYAN}Configuring Wine...${NC}"
 if ! "$WINE_SRC_DIR/configure" \
@@ -241,6 +258,7 @@ if ! "$WINE_SRC_DIR/configure" \
   --with-wayland \
   --enable-archs=i386,x86_64 \
   --disable-tests \
+  --enable-win64 \
   --without-oss \
   >configure.log 2>&1; then
   echo -e "${RED}${BOLD}❌ ERROR: Wine configure failed!${NC}"

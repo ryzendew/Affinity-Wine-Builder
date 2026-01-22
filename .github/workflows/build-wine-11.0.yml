@@ -100,17 +100,11 @@ jobs:
             opencl-headers \
             gcc-mingw-w64 \
             libwayland-dev \
-            libwayland-dev:i386 \
-            libwayland-egl-backend-dev \
-            libwayland-egl-backend-dev:i386 \
-            libgbm-dev \
-            libgbm-dev:i386 \
-            libwayland-egl1 \
-            libwayland-egl1:i386 \
-            libegl-mesa0 \
-            libgbm1 \
-            libgbm1:i386 \
             wayland-protocols \
+            libxkbcommon-dev \
+            libegl1-mesa-dev \
+            libgbm-dev \
+            pkg-config \
             libpcap-dev \
             libpcsclite-dev \
             libvulkan-dev
