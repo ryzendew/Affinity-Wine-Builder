@@ -103,8 +103,6 @@ jobs:
             libwayland-dev:i386 \
             libwayland-egl-backend-dev \
             libwayland-egl-backend-dev:i386 \
-            libegl-mesa-dev \
-            libegl-mesa-dev:i386 \
             libgbm-dev \
             libgbm-dev:i386 \
             libwayland-egl1 \
