@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Build-Wine-11.0.sh
+# Build-Wine-11.1.sh
 # Simplified Wine build script for GitHub Actions
 # Patches, builds, and packages Wine 11.0
 #
@@ -10,7 +10,7 @@
 #   - Patches are in patches/wine-11.0/
 #
 # Usage:
-#   ./Build-Wine-11.0.sh
+#   ./Build-Wine-11.1.sh
 #
 # Environment variables:
 #   BUILD_THREADS    - Number of build threads (default: nproc)
@@ -32,7 +32,7 @@ NC='\033[0m' # No Color
 BOLD='\033[1m'
 
 # Wine version
-WINE_VERSION="11.0"
+WINE_VERSION="11.1"
 
 # Get script directory
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -41,7 +41,7 @@ cd "$SCRIPT_DIR"
 # Set defaults
 BUILD_THREADS="${BUILD_THREADS:-$(nproc 2>/dev/null || echo 4)}"
 # Use ElementalWarrior-wine-11.0 as the directory name for proper packaging
-INSTALL_PREFIX="${INSTALL_PREFIX:-$SCRIPT_DIR/ElementalWarrior-wine-11.0}"
+INSTALL_PREFIX="${INSTALL_PREFIX:-$SCRIPT_DIR/ElementalWarrior-wine-11.1}"
 
 # Build flags (matching GitHub Actions workflow)
 CFLAGS="${CFLAGS:--O2 -std=gnu17 -pipe -ffat-lto-objects -Wno-discarded-qualifiers -Wno-format -Wno-maybe-uninitialized -Wno-misleading-indentation}"
@@ -53,7 +53,7 @@ export CFLAGS CROSSCFLAGS CROSSCXXFLAGS CROSSLDFLAGS
 
 # Print header
 echo -e "${CYAN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${CYAN}${BOLD}Wine 11.0 Build Script${NC}"
+echo -e "${CYAN}${BOLD}Wine 11.1 Build Script${NC}"
 echo -e "${CYAN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo ""
 echo -e "${BOLD}Configuration:${NC}"
