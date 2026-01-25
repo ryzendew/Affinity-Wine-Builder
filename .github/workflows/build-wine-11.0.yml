@@ -1,4 +1,4 @@
-name: Build Wine 11.0
+name: Build Wine 11.1
 
 on:
   push:
@@ -234,7 +234,7 @@ jobs:
           chmod +x Build-Wine-11.0.sh
           echo "✓ Build-Wine-11.0.sh is executable"
 
-      - name: Build Wine 11.0
+      - name: Build Wine 11.1
         env:
           CC: ccache gcc
           CXX: ccache g++
@@ -308,7 +308,7 @@ jobs:
 
       - name: Verify package exists
         run: |
-          PACKAGE_NAME="ElementalWarrior-wine-11.0.tar.xz"
+          PACKAGE_NAME="ElementalWarrior-wine-11.1.tar.xz"
           if [ ! -f "$PACKAGE_NAME" ]; then
             echo "❌ ERROR: Package $PACKAGE_NAME not found!"
             exit 1
@@ -332,8 +332,8 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ElementalWarrior-wine-11.0
-          path: ${{ github.workspace }}/ElementalWarrior-wine-11.0.tar.xz
+          name: ElementalWarrior-wine-11.1
+          path: ${{ github.workspace }}/ElementalWarrior-wine-11.1.tar.xz
           retention-days: 30
 
       - name: Build summary
@@ -347,6 +347,6 @@ jobs:
           fi
           echo "=========================================="
           echo ""
-          echo "Artifact: ElementalWarrior-wine-11.0.tar.xz"
+          echo "Artifact: ElementalWarrior-wine-11.1.tar.xz"
           echo "Installation prefix: $INSTALL_PREFIX"
           echo ""
