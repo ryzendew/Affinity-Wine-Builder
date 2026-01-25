@@ -334,7 +334,7 @@ echo -e "${CYAN}${BOLD}Step 6: Packaging Wine${NC}"
 echo -e "${BLUE}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 
 # Package Wine as .tar.xz
-# The tarball should extract to ElementalWarrior-wine-11.0/ with bin, include, lib, share inside
+# The tarball should extract to ElementalWarrior-wine-11.1/ with bin, include, lib, share inside
 if [ -d "$INSTALL_PREFIX" ]; then
   echo -e "${CYAN}${BOLD}Packaging Wine as .tar.xz...${NC}"
   cd "$(dirname "$INSTALL_PREFIX")" || exit 1
