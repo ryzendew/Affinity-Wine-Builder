@@ -2,8 +2,8 @@ version: 2.1
 
 executors:
   wine-builder:
-    machine:
-      image: ubuntu-2404:current
+    docker:
+      - image: fedora:43
     resource_class: large
     environment:
       BUILD_THREADS: 4
@@ -17,21 +17,44 @@ jobs:
       - run:
           name: Install build dependencies
           command: |
-            sudo dpkg --add-architecture i386
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq --no-install-recommends \
-              build-essential flex bison autoconf xorg-dev \
-              libfreetype-dev libfontconfig-dev libx11-dev libxext-dev \
-              libgl1-mesa-dev libglu1-mesa-dev libosmesa6-dev \
-              libwayland-dev wayland-protocols libxkbcommon-dev \
-              libwayland-dev:i386 libxkbcommon-dev:i386 \
-              libpulse-dev libgstreamer1.0-dev \
-              libgstreamer-plugins-base1.0-dev libcups2-dev \
-              libsane-dev libvulkan-dev mesa-common-dev \
-              ocl-icd-opencl-dev opencl-headers \
-              g++-mingw-w64-i686 g++-mingw-w64-x86-64 \
-              binutils-mingw-w64-i686 binutils-mingw-w64-x86-64 \
-              libudev-dev libdbus-1-dev libunwind-dev
+            dnf install -y -q \
+              make gcc gcc-c++ flex bison autoconf automake libtool \
+              pkg-config diffutils patch which \
+              freetype-devel fontconfig-devel \
+              libX11-devel libXext-devel \
+              libXxf86vm-devel libXrandr-devel libXcursor-devel \
+              libXrender-devel libXi-devel libXinerama-devel \
+              libXcomposite-devel libXfixes-devel \
+              mesa-libGL-devel mesa-libGLU-devel mesa-libOSMesa-devel \
+              mesa-libEGL-devel mesa-libGLES-devel mesa-libgbm-devel \
+              wayland-devel wayland-protocols-devel libxkbcommon-devel \
+              pulseaudio-libs-devel \
+              gstreamer1-devel gstreamer1-plugins-base-devel \
+              cups-devel sane-backends-devel \
+              vulkan-loader-devel vulkan-headers \
+              opencl-headers ocl-icd-devel \
+              mingw64-gcc-c++ mingw32-gcc-c++ \
+              mingw64-binutils mingw32-binutils \
+              libudev-devel dbus-devel libunwind-devel \
+              glibc-devel.i686 libgcc.i686
+
+      - run:
+          name: Add missing wayland-egl.pc pkg-config file
+          command: |
+            if ! pkg-config --exists wayland-egl 2>/dev/null; then
+              mkdir -p /usr/lib64/pkgconfig
+              cat << 'EOF' > /usr/lib64/pkgconfig/wayland-egl.pc
+            prefix=/usr
+            exec_prefix=${prefix}
+            libdir=${exec_prefix}/lib64
+            includedir=${prefix}/include
+            Name: wayland-egl
+            Description: Wayland EGL library
+            Version: 1.22.0
+            Libs: -L${libdir} -lwayland-egl
+            Cflags: -I${includedir}
+            EOF
+            fi
 
       - run:
           name: Build Wine 11.11
