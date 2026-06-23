@@ -1,0 +1,352 @@
+name: Build Wine 11.11
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+    branches:
+      - main
+      - master
+  merge_group:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    # Skip build if PR was closed without merging
+    if: |
+      github.event_name == 'push' ||
+      (github.event_name == 'pull_request' && github.event.action != 'closed') ||
+      (github.event_name == 'pull_request' && github.event.pull_request.merged == true) ||
+      github.event_name == 'merge_group' ||
+      github.event_name == 'workflow_dispatch'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up build environment
+        run: |
+          sudo apt-get update
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            gcc-multilib \
+            g++-multilib \
+            flex \
+            bison \
+            libpng-dev \
+            libfreetype6-dev \
+            libfontconfig1-dev \
+            libgstreamer1.0-dev \
+            libgstreamer-plugins-base1.0-dev \
+            libvulkan-dev \
+            libgl1-mesa-dev \
+            libxcomposite-dev \
+            libxcomposite-dev:i386 \
+            libwayland-egl-backend-dev \
+            libwayland-egl-backend-dev:i386 \
+            libwayland-egl1-mesa \
+            libwayland-dev \
+            libwayland-dev:i386 \
+            libwayland-egl1 \
+            libwayland-egl1:i386 \
+            wayland-protocols \
+            libxkbcommon-dev \
+            libxkbcommon-dev:i386 \
+            libxkbregistry-dev \
+            libegl1-mesa-dev \
+            libegl1-mesa-dev:i386 \
+            libegl-dev \
+            libgles2-mesa-dev \
+            libgbm-dev \
+            libgbm-dev:i386 \
+            pkg-config \
+            ccache \
+            wget \
+            curl \
+            tar \
+            xz-utils \
+            patch \
+            autoconf \
+            automake \
+            libtool \
+            gettext \
+            git \
+            libpulse-dev \
+            libdbus-1-dev \
+            libxml2-dev \
+            libxslt1-dev \
+            libgnutls28-dev \
+            libsane-dev \
+            libv4l-dev \
+            libgphoto2-dev \
+            libcapi20-dev \
+            libcups2-dev \
+            libkrb5-dev \
+            libldap2-dev \
+            libsdl2-dev \
+            libusb-1.0-0-dev \
+            libudev-dev \
+            libunwind-dev \
+            libavcodec-dev \
+            libavformat-dev \
+            libavutil-dev \
+            samba-dev \
+            ocl-icd-opencl-dev \
+            opencl-headers \
+            gcc-mingw-w64 \
+            libpcap-dev \
+            libpcsclite-dev
+
+      - name: Add missing wayland-egl.pc pkg-config file
+        run: |
+          # 64-bit version
+          sudo mkdir -p /usr/lib/x86_64-linux-gnu/pkgconfig
+          cat << 'EOF' | sudo tee /usr/lib/x86_64-linux-gnu/pkgconfig/wayland-egl.pc
+          prefix=/usr
+          exec_prefix=${prefix}
+          libdir=${exec_prefix}/lib/x86_64-linux-gnu
+          includedir=${prefix}/include
+
+          Name: wayland-egl
+          Description: Wayland EGL library
+          Version: 1.22.0
+          Libs: -L${libdir} -lwayland-egl
+          Cflags: -I${includedir}
+          EOF
+          # 32-bit version
+          sudo mkdir -p /usr/lib/i386-linux-gnu/pkgconfig
+          cat << 'EOF' | sudo tee /usr/lib/i386-linux-gnu/pkgconfig/wayland-egl.pc
+          prefix=/usr
+          exec_prefix=${prefix}
+          libdir=${exec_prefix}/lib/i386-linux-gnu
+          includedir=${prefix}/include
+
+          Name: wayland-egl
+          Description: Wayland EGL library
+          Version: 1.22.0
+          Libs: -L${libdir} -lwayland-egl
+          Cflags: -I${includedir}
+          EOF
+
+      - name: Verify Wayland pkg-config setup
+        run: |
+          echo "pkg-config --modversion for key modules:"
+          pkg-config --modversion wayland-client || echo "✗ wayland-client"
+          pkg-config --modversion wayland-protocols || echo "✗ wayland-protocols (critical!)"
+          pkg-config --modversion xkbcommon || echo "✗ xkbcommon"
+          pkg-config --modversion wayland-egl || echo "✗ wayland-egl (check your .pc file)"
+          pkg-config --modversion egl || echo "✗ egl"
+          echo ""
+          echo "wayland-protocols pkgdatadir (should show XML path):"
+          pkg-config --variable=pkgdatadir wayland-protocols || echo "No pkgdatadir → protocols missing"
+          echo ""
+          echo "Listing wayland .pc files:"
+          find /usr -name "*wayland*.pc" 2>/dev/null | grep -i egl || echo "No wayland-egl.pc found"
+          echo ""
+          echo "Checking libwayland-egl.so existence:"
+          find /usr/lib -name "libwayland-egl.so*" 2>/dev/null || echo "No libwayland-egl found!"
+          echo ""
+          echo "Checking wayland-egl.pc files..."
+          ls -la /usr/lib/x86_64-linux-gnu/pkgconfig/wayland-egl.pc || echo "✗ 64-bit wayland-egl.pc missing"
+          ls -la /usr/lib/i386-linux-gnu/pkgconfig/wayland-egl.pc || echo "✗ 32-bit wayland-egl.pc missing"
+          echo ""
+          echo "Checking for Wayland libraries..."
+          find /usr/lib -name "*wayland*" -type f 2>/dev/null | head -10
+          echo ""
+          echo "Checking pkg-config paths..."
+          pkg-config --list-all | grep -i wayland || echo "No wayland packages found in pkg-config"
+
+      - name: Set up ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ${{ runner.os }}-ccache-wine-11.11-${{ hashFiles('patches/wine-11.11/*.patch', 'Build-Wine-11.11.sh') }}
+          restore-keys: |
+            ${{ runner.os }}-ccache-wine-11.11-
+
+      - name: Configure ccache
+        run: |
+          ccache --set-config=max_size=10G
+          ccache --set-config=compression=true
+          ccache --set-config=compression_level=6
+          ccache --set-config=sloppiness=pch_defines,time_macros,include_file_mtime,include_file_ctime
+          ccache --set-config=hash_dir=false
+          ccache --zero-stats
+          ccache --show-stats
+
+      - name: Verify OpenCL headers
+        run: |
+          if [ ! -f "/usr/include/CL/cl.h" ] && [ ! -f "/usr/local/include/CL/cl.h" ]; then
+            echo "❌ ERROR: OpenCL headers not found!"
+            exit 1
+          fi
+          echo "✓ OpenCL headers found"
+
+      - name: Set up ccache for cross-compilers
+        run: |
+          # Configure ccache to work with MinGW cross-compilers
+          # Create wrapper scripts that ccache can use
+          mkdir -p ~/ccache-bin
+          cat > ~/ccache-bin/i686-w64-mingw32-gcc << 'EOF'
+          #!/bin/bash
+          exec ccache /usr/bin/i686-w64-mingw32-gcc "$@"
+          EOF
+          cat > ~/ccache-bin/x86_64-w64-mingw32-gcc << 'EOF'
+          #!/bin/bash
+          exec ccache /usr/bin/x86_64-w64-mingw32-gcc "$@"
+          EOF
+          cat > ~/ccache-bin/i686-w64-mingw32-g++ << 'EOF'
+          #!/bin/bash
+          exec ccache /usr/bin/i686-w64-mingw32-g++ "$@"
+          EOF
+          cat > ~/ccache-bin/x86_64-w64-mingw32-g++ << 'EOF'
+          #!/bin/bash
+          exec ccache /usr/bin/x86_64-w64-mingw32-g++ "$@"
+          EOF
+          chmod +x ~/ccache-bin/*
+          # Add to PATH (must be before /usr/bin)
+          echo "$HOME/ccache-bin" >> $GITHUB_PATH
+          echo "✓ ccache wrappers created for MinGW cross-compilers"
+
+      - name: Set build environment variables
+        run: |
+          echo "BUILD_THREADS=$(nproc)" >> $GITHUB_ENV
+          echo "CFLAGS=-O2 -std=gnu17 -pipe -ffat-lto-objects -Wno-discarded-qualifiers -Wno-format -Wno-maybe-uninitialized -Wno-misleading-indentation" >> $GITHUB_ENV
+          echo "CROSSCFLAGS=-O2 -std=gnu17 -pipe -Wno-discarded-qualifiers -Wno-format -Wno-maybe-uninitialized -Wno-misleading-indentation" >> $GITHUB_ENV
+          echo "CROSSCXXFLAGS=-O2 -std=gnu17 -pipe -Wno-discarded-qualifiers -Wno-format -Wno-maybe-uninitialized -Wno-misleading-indentation" >> $GITHUB_ENV
+          echo "CROSSLDFLAGS=-Wl,-O1" >> $GITHUB_ENV
+          echo "INSTALL_PREFIX=${{ github.workspace }}/ElementalWarrior-wine-11.0" >> $GITHUB_ENV
+          echo "CC=ccache gcc" >> $GITHUB_ENV
+          echo "CXX=ccache g++" >> $GITHUB_ENV
+          echo "PKG_CONFIG_PATH=/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/lib/i386-linux-gnu/pkgconfig:/usr/lib/pkgconfig:/usr/share/pkgconfig" >> $GITHUB_ENV
+
+      - name: Make script executable
+        run: |
+          chmod +x Build-Wine-11.11.sh
+          echo "✓ Build-Wine-11.11.sh is executable"
+
+      - name: Build Wine 11.11
+        env:
+          CC: ccache gcc
+          CXX: ccache g++
+        run: |
+          echo "Running Build-Wine-11.11.sh..."
+          ./Build-Wine-11.11.sh || {
+            echo "❌ Build failed! Checking for error logs..."
+            if [ -f "wine64-build/configure.log" ]; then
+              echo "=== Configure log ==="
+              cat wine64-build/configure.log
+            fi
+            if [ -f "wine64-build/wine-build.log" ]; then
+              echo "=== Last 100 lines of build log ==="
+              tail -100 wine64-build/wine-build.log
+            fi
+            if [ -f "wine64-build/wine-install.log" ]; then
+              echo "=== Last 100 lines of install log ==="
+              tail -100 wine64-build/wine-install.log
+            fi
+            exit 1
+          }
+          
+          echo ""
+          echo "=========================================="
+          echo "ccache statistics (after build):"
+          echo "=========================================="
+          ccache -s
+          echo ""
+          echo "Cache hit rate:"
+          ccache -s | grep -E "(cache hit|cache miss|hit rate)" || true
+
+      - name: Verify installation
+        run: |
+          echo "Verifying installation at: $INSTALL_PREFIX"
+          
+          if [ ! -d "$INSTALL_PREFIX" ]; then
+            echo "❌ ERROR: Installation directory not found at $INSTALL_PREFIX"
+            exit 1
+          fi
+          
+          echo "✓ Installation directory exists"
+          echo "Installation directory contents:"
+          ls -la "$INSTALL_PREFIX" || true
+          echo ""
+          
+          # Verify all required directories exist (bin, include, lib, share)
+          REQUIRED_DIRS=("bin" "include" "lib" "share")
+          MISSING_DIRS=()
+          
+          for dir in "${REQUIRED_DIRS[@]}"; do
+            if [ -d "$INSTALL_PREFIX/$dir" ]; then
+              echo "✓ $dir/ directory found"
+              echo "  Contents: $(ls -1 "$INSTALL_PREFIX/$dir" | wc -l) items"
+            else
+              echo "❌ $dir/ directory MISSING!"
+              MISSING_DIRS+=("$dir")
+            fi
+          done
+          
+          if [ ${#MISSING_DIRS[@]} -gt 0 ]; then
+            echo ""
+            echo "❌ ERROR: Missing required directories: ${MISSING_DIRS[*]}"
+            exit 1
+          fi
+          
+          echo ""
+          echo "✓ All required directories verified (bin, include, lib, share)"
+          echo ""
+          echo "Directory sizes:"
+          du -sh "$INSTALL_PREFIX"/* 2>/dev/null || true
+
+      - name: Verify package exists
+        run: |
+          PACKAGE_NAME="ElementalWarrior-wine-11.0.tar.xz"
+          if [ ! -f "$PACKAGE_NAME" ]; then
+            echo "❌ ERROR: Package $PACKAGE_NAME not found!"
+            exit 1
+          fi
+          echo "✓ Package found: $PACKAGE_NAME"
+          ls -lh "$PACKAGE_NAME"
+          echo ""
+          echo "Package size: $(du -h "$PACKAGE_NAME" | cut -f1)"
+
+      - name: Upload build logs (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            wine64-build/configure.log
+            wine64-build/wine-build.log
+            wine64-build/wine-install.log
+          retention-days: 7
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ElementalWarrior-wine-11.11
+          path: ${{ github.workspace }}/ElementalWarrior-wine-11.11.tar.xz
+          retention-days: 30
+
+      - name: Build summary
+        if: always()
+        run: |
+          echo "=========================================="
+          if [ "${{ job.status }}" == "success" ]; then
+            echo "✓ BUILD COMPLETE!"
+          else
+            echo "❌ BUILD FAILED!"
+          fi
+          echo "=========================================="
+          echo ""
+          echo "Artifact: ElementalWarrior-wine-11.11.tar.xz"
+          echo "Installation prefix: $INSTALL_PREFIX"
+          echo ""
