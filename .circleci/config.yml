@@ -17,7 +17,7 @@ jobs:
       - run:
           name: Install build dependencies
           command: |
-            dnf install -y -q \
+            dnf install -y -q --skip-unavailable \
               make gcc gcc-c++ flex bison autoconf automake libtool \
               pkg-config diffutils patch which \
               freetype-devel fontconfig-devel \
@@ -25,8 +25,8 @@ jobs:
               libXxf86vm-devel libXrandr-devel libXcursor-devel \
               libXrender-devel libXi-devel libXinerama-devel \
               libXcomposite-devel libXfixes-devel \
-              mesa-libGL-devel mesa-libGLU-devel mesa-libOSMesa-devel \
-              mesa-libEGL-devel mesa-libGLES-devel mesa-libgbm-devel \
+              mesa-libGL-devel mesa-libGLU-devel mesa-compat-libOSMesa-devel \
+              mesa-libEGL-devel libglvnd-devel mesa-libgbm-devel \
               wayland-devel wayland-protocols-devel libxkbcommon-devel \
               pulseaudio-libs-devel \
               gstreamer1-devel gstreamer1-plugins-base-devel \
