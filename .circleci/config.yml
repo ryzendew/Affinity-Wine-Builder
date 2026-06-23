@@ -17,12 +17,14 @@ jobs:
       - run:
           name: Install build dependencies
           command: |
+            sudo dpkg --add-architecture i386
             sudo apt-get update -qq
             sudo apt-get install -y -qq --no-install-recommends \
               build-essential flex bison autoconf xorg-dev \
               libfreetype-dev libfontconfig-dev libx11-dev libxext-dev \
               libgl1-mesa-dev libglu1-mesa-dev libosmesa6-dev \
               libwayland-dev wayland-protocols libxkbcommon-dev \
+              libwayland-dev:i386 libxkbcommon-dev:i386 \
               libpulse-dev libgstreamer1.0-dev \
               libgstreamer-plugins-base1.0-dev libcups2-dev \
               libsane-dev libvulkan-dev mesa-common-dev \
