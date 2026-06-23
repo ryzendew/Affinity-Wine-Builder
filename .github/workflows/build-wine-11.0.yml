@@ -1,4 +1,4 @@
-name: Build Wine 11.0
+name: Build Wine 11.11
 
 on:
   push:
@@ -169,9 +169,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.ccache
-          key: ${{ runner.os }}-ccache-wine-11.0-${{ hashFiles('patches/wine-11.0/*.patch', 'Build-Wine-11.0.sh') }}
+          key: ${{ runner.os }}-ccache-wine-11.0-${{ hashFiles('patches/wine-11.11/*.patch', 'Build-Wine-11.11.sh') }}
           restore-keys: |
-            ${{ runner.os }}-ccache-wine-11.0-
+            ${{ runner.os }}-ccache-wine-11.11-
 
       - name: Configure ccache
         run: |
@@ -231,16 +231,16 @@ jobs:
 
       - name: Make script executable
         run: |
-          chmod +x Build-Wine-11.0.sh
-          echo "✓ Build-Wine-11.0.sh is executable"
+          chmod +x Build-Wine-11.11.sh
+          echo "✓ Build-Wine-11.11.sh is executable"
 
-      - name: Build Wine 11.0
+      - name: Build Wine 11.11
         env:
           CC: ccache gcc
           CXX: ccache g++
         run: |
-          echo "Running Build-Wine-11.0.sh..."
-          ./Build-Wine-11.0.sh || {
+          echo "Running Build-Wine-11.11.sh..."
+          ./Build-Wine-11.11.sh || {
             echo "❌ Build failed! Checking for error logs..."
             if [ -f "wine64-build/configure.log" ]; then
               echo "=== Configure log ==="
@@ -332,8 +332,8 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ElementalWarrior-wine-11.0
-          path: ${{ github.workspace }}/ElementalWarrior-wine-11.0.tar.xz
+          name: ElementalWarrior-wine-11.11
+          path: ${{ github.workspace }}/ElementalWarrior-wine-11.11.tar.xz
           retention-days: 30
 
       - name: Build summary
@@ -347,6 +347,6 @@ jobs:
           fi
           echo "=========================================="
           echo ""
-          echo "Artifact: ElementalWarrior-wine-11.0.tar.xz"
+          echo "Artifact: ElementalWarrior-wine-11.11.tar.xz"
           echo "Installation prefix: $INSTALL_PREFIX"
           echo ""
