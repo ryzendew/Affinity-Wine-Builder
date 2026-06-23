@@ -25,7 +25,7 @@ jobs:
               libXxf86vm-devel libXrandr-devel libXcursor-devel \
               libXrender-devel libXi-devel libXinerama-devel \
               libXcomposite-devel libXfixes-devel \
-              mesa-libGL-devel mesa-libGLU-devel mesa-libOSMesa-devel \
+              mesa-libGL-devel mesa-libGLU-devel \
               mesa-libEGL-devel mesa-libGLES-devel mesa-libgbm-devel \
               wayland-devel wayland-protocols-devel libxkbcommon-devel \
               pulseaudio-libs-devel \
