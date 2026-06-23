@@ -16,6 +16,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-24.04
+    container: fedora:43
     timeout-minutes: 120
     # Skip build if PR was closed without merging
     if: |
@@ -31,139 +32,46 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Set up build environment
+      - name: Install build dependencies
         run: |
-          sudo apt-get update
-          sudo dpkg --add-architecture i386
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential \
-            gcc-multilib \
-            g++-multilib \
-            flex \
-            bison \
-            libpng-dev \
-            libfreetype6-dev \
-            libfontconfig1-dev \
-            libgstreamer1.0-dev \
-            libgstreamer-plugins-base1.0-dev \
-            libvulkan-dev \
-            libgl1-mesa-dev \
-            libxcomposite-dev \
-            libxcomposite-dev:i386 \
-            libwayland-egl-backend-dev \
-            libwayland-egl-backend-dev:i386 \
-            libwayland-egl1-mesa \
-            libwayland-dev \
-            libwayland-dev:i386 \
-            libwayland-egl1 \
-            libwayland-egl1:i386 \
-            wayland-protocols \
-            libxkbcommon-dev \
-            libxkbcommon-dev:i386 \
-            libxkbregistry-dev \
-            libegl1-mesa-dev \
-            libegl1-mesa-dev:i386 \
-            libegl-dev \
-            libgles2-mesa-dev \
-            libgbm-dev \
-            libgbm-dev:i386 \
-            pkg-config \
-            ccache \
-            wget \
-            curl \
-            tar \
-            xz-utils \
-            patch \
-            autoconf \
-            automake \
-            libtool \
-            gettext \
-            git \
-            libpulse-dev \
-            libdbus-1-dev \
-            libxml2-dev \
-            libxslt1-dev \
-            libgnutls28-dev \
-            libsane-dev \
-            libv4l-dev \
-            libgphoto2-dev \
-            libcapi20-dev \
-            libcups2-dev \
-            libkrb5-dev \
-            libldap2-dev \
-            libsdl2-dev \
-            libusb-1.0-0-dev \
-            libudev-dev \
-            libunwind-dev \
-            libavcodec-dev \
-            libavformat-dev \
-            libavutil-dev \
-            samba-dev \
-            ocl-icd-opencl-dev \
-            opencl-headers \
-            gcc-mingw-w64 \
-            libpcap-dev \
-            libpcsclite-dev
+          dnf install -y -q --skip-unavailable \
+            make gcc gcc-c++ flex bison autoconf automake libtool \
+            pkg-config diffutils patch which \
+            freetype-devel fontconfig-devel \
+            libX11-devel libXext-devel \
+            libXxf86vm-devel libXrandr-devel libXcursor-devel \
+            libXrender-devel libXi-devel libXinerama-devel \
+            libXcomposite-devel libXfixes-devel \
+            mesa-libGL-devel mesa-libGLU-devel mesa-compat-libOSMesa-devel \
+            mesa-libEGL-devel libglvnd-devel mesa-libgbm-devel \
+            wayland-devel wayland-protocols-devel libxkbcommon-devel \
+            pulseaudio-libs-devel \
+            gstreamer1-devel gstreamer1-plugins-base-devel \
+            cups-devel sane-backends-devel \
+            vulkan-loader-devel vulkan-headers \
+            opencl-headers ocl-icd-devel \
+            mingw64-gcc-c++ mingw32-gcc-c++ \
+            mingw64-binutils mingw32-binutils \
+            libudev-devel dbus-devel libunwind-devel \
+            glibc-devel.i686 libgcc.i686
 
       - name: Add missing wayland-egl.pc pkg-config file
         run: |
-          # 64-bit version
-          sudo mkdir -p /usr/lib/x86_64-linux-gnu/pkgconfig
-          cat << 'EOF' | sudo tee /usr/lib/x86_64-linux-gnu/pkgconfig/wayland-egl.pc
-          prefix=/usr
-          exec_prefix=${prefix}
-          libdir=${exec_prefix}/lib/x86_64-linux-gnu
-          includedir=${prefix}/include
-
-          Name: wayland-egl
-          Description: Wayland EGL library
-          Version: 1.22.0
-          Libs: -L${libdir} -lwayland-egl
-          Cflags: -I${includedir}
-          EOF
-          # 32-bit version
-          sudo mkdir -p /usr/lib/i386-linux-gnu/pkgconfig
-          cat << 'EOF' | sudo tee /usr/lib/i386-linux-gnu/pkgconfig/wayland-egl.pc
-          prefix=/usr
-          exec_prefix=${prefix}
-          libdir=${exec_prefix}/lib/i386-linux-gnu
-          includedir=${prefix}/include
-
-          Name: wayland-egl
-          Description: Wayland EGL library
-          Version: 1.22.0
-          Libs: -L${libdir} -lwayland-egl
-          Cflags: -I${includedir}
-          EOF
-
-      - name: Verify Wayland pkg-config setup
-        run: |
-          echo "pkg-config --modversion for key modules:"
-          pkg-config --modversion wayland-client || echo "✗ wayland-client"
-          pkg-config --modversion wayland-protocols || echo "✗ wayland-protocols (critical!)"
-          pkg-config --modversion xkbcommon || echo "✗ xkbcommon"
-          pkg-config --modversion wayland-egl || echo "✗ wayland-egl (check your .pc file)"
-          pkg-config --modversion egl || echo "✗ egl"
-          echo ""
-          echo "wayland-protocols pkgdatadir (should show XML path):"
-          pkg-config --variable=pkgdatadir wayland-protocols || echo "No pkgdatadir → protocols missing"
-          echo ""
-          echo "Listing wayland .pc files:"
-          find /usr -name "*wayland*.pc" 2>/dev/null | grep -i egl || echo "No wayland-egl.pc found"
-          echo ""
-          echo "Checking libwayland-egl.so existence:"
-          find /usr/lib -name "libwayland-egl.so*" 2>/dev/null || echo "No libwayland-egl found!"
-          echo ""
-          echo "Checking wayland-egl.pc files..."
-          ls -la /usr/lib/x86_64-linux-gnu/pkgconfig/wayland-egl.pc || echo "✗ 64-bit wayland-egl.pc missing"
-          ls -la /usr/lib/i386-linux-gnu/pkgconfig/wayland-egl.pc || echo "✗ 32-bit wayland-egl.pc missing"
-          echo ""
-          echo "Checking for Wayland libraries..."
-          find /usr/lib -name "*wayland*" -type f 2>/dev/null | head -10
-          echo ""
-          echo "Checking pkg-config paths..."
-          pkg-config --list-all | grep -i wayland || echo "No wayland packages found in pkg-config"
+          if ! pkg-config --exists wayland-egl 2>/dev/null; then
+            mkdir -p /usr/lib64/pkgconfig
+            printf '%s\n' \
+              'prefix=/usr' \
+              'exec_prefix=${prefix}' \
+              'libdir=${exec_prefix}/lib64' \
+              'includedir=${prefix}/include' \
+              '' \
+              'Name: wayland-egl' \
+              'Description: Wayland EGL library' \
+              'Version: 1.22.0' \
+              'Libs: -L${libdir} -lwayland-egl' \
+              'Cflags: -I${includedir}' \
+              > /usr/lib64/pkgconfig/wayland-egl.pc
+          fi
 
       - name: Set up ccache
         uses: actions/cache@v4
@@ -224,10 +132,10 @@ jobs:
           echo "CROSSCFLAGS=-O2 -std=gnu17 -pipe -Wno-discarded-qualifiers -Wno-format -Wno-maybe-uninitialized -Wno-misleading-indentation" >> $GITHUB_ENV
           echo "CROSSCXXFLAGS=-O2 -std=gnu17 -pipe -Wno-discarded-qualifiers -Wno-format -Wno-maybe-uninitialized -Wno-misleading-indentation" >> $GITHUB_ENV
           echo "CROSSLDFLAGS=-Wl,-O1" >> $GITHUB_ENV
-          echo "INSTALL_PREFIX=${{ github.workspace }}/ElementalWarrior-wine-11.0" >> $GITHUB_ENV
+          echo "INSTALL_PREFIX=${{ github.workspace }}/ElementalWarrior-wine-11.11" >> $GITHUB_ENV
           echo "CC=ccache gcc" >> $GITHUB_ENV
           echo "CXX=ccache g++" >> $GITHUB_ENV
-          echo "PKG_CONFIG_PATH=/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/lib/i386-linux-gnu/pkgconfig:/usr/lib/pkgconfig:/usr/share/pkgconfig" >> $GITHUB_ENV
+          echo "PKG_CONFIG_PATH=/usr/lib64/pkgconfig:/usr/lib/pkgconfig:/usr/share/pkgconfig" >> $GITHUB_ENV
 
       - name: Make script executable
         run: |
@@ -308,7 +216,7 @@ jobs:
 
       - name: Verify package exists
         run: |
-          PACKAGE_NAME="ElementalWarrior-wine-11.0.tar.xz"
+          PACKAGE_NAME="ElementalWarrior-wine-11.11.tar.xz"
           if [ ! -f "$PACKAGE_NAME" ]; then
             echo "❌ ERROR: Package $PACKAGE_NAME not found!"
             exit 1
