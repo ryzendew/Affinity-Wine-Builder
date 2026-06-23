@@ -1,0 +1,136 @@
+Revert Wine 11.11 texelFetchOffset change in glsl_shader.c
+
+Wine 11.11 changed the ld() instruction to add texel offset to coordinates
+for non-mipmapped buffer/MSAA textures instead of using texelFetchOffset().
+This changes shader output and could cause visual corruption. Reverts to the
+Wine 11.0 behavior where the offset is always passed via WINED3D_GLSL_SAMPLE_OFFSET.
+
+diff -uNarp a/dlls/wined3d/glsl_shader.c	2026-06-12 16:41:20.000000000 -0300
++++ b/dlls/wined3d/glsl_shader.c	2026-06-23 00:36:03.141217342 -0300
+@@ -3537,37 +3537,6 @@ static DWORD shader_glsl_append_dst(stru
+     return shader_glsl_append_dst_ext(buffer, ins, &ins->dst[0], 0, ins->dst[0].reg.data_type);
+ }
+ 
+-static void shader_glsl_get_coord_size(enum wined3d_shader_resource_type resource_type,
+-        unsigned int *coord_size, unsigned int *deriv_size)
+-{
+-    const BOOL is_array = resource_type == WINED3D_SHADER_RESOURCE_TEXTURE_1DARRAY
+-            || resource_type == WINED3D_SHADER_RESOURCE_TEXTURE_2DARRAY;
+-
+-    *coord_size = resource_type_info[resource_type].coord_size;
+-    *deriv_size = *coord_size;
+-    if (is_array)
+-        --(*deriv_size);
+-}
+-
+-static void shader_glsl_add_offset_immdata_param(const struct wined3d_shader_context *ctx,
+-        const struct wined3d_shader_texel_offset *offset, enum wined3d_shader_resource_type resource_type,
+-        struct glsl_src_param *glsl_src)
+-{
+-    struct shader_glsl_ctx_priv *priv = ctx->backend_data;
+-    struct wined3d_string_buffer *imm_str = string_buffer_get(priv->string_buffers);
+-    int offset_immdata[4] = {offset->u, offset->v, offset->w};
+-    unsigned int coord_size, deriv_size;
+-
+-    shader_glsl_get_coord_size(resource_type, &coord_size, &deriv_size);
+-
+-    glsl_src->param_str[0] = '\0';
+-
+-    shader_glsl_append_imm_ivec(imm_str, offset_immdata, coord_size);
+-    sprintf(glsl_src->param_str, "%s", imm_str->buffer);
+-
+-    string_buffer_release(priv->string_buffers, imm_str);
+-}
+-
+ /** Process GLSL instruction modifiers */
+ static void shader_glsl_add_instruction_modifiers(const struct wined3d_shader_instruction *ins)
+ {
+@@ -3633,6 +3602,18 @@ static BOOL shader_glsl_has_core_grad(co
+     return shader_glsl_get_version(gl_info) >= 130 || gl_info->supported[EXT_GPU_SHADER4];
+ }
+ 
++static void shader_glsl_get_coord_size(enum wined3d_shader_resource_type resource_type,
++        unsigned int *coord_size, unsigned int *deriv_size)
++{
++    const BOOL is_array = resource_type == WINED3D_SHADER_RESOURCE_TEXTURE_1DARRAY
++            || resource_type == WINED3D_SHADER_RESOURCE_TEXTURE_2DARRAY;
++
++    *coord_size = resource_type_info[resource_type].coord_size;
++    *deriv_size = *coord_size;
++    if (is_array)
++        --(*deriv_size);
++}
++
+ static void shader_glsl_get_sample_function(const struct wined3d_shader_context *ctx,
+         DWORD resource_idx, DWORD sampler_idx, uint32_t flags, struct glsl_sample_function *sample_function)
+ {
+@@ -3868,7 +3849,6 @@ static void PRINTF_ATTR(9, 10) shader_gl
+     else if (bias)
+         shader_addline(ins->ctx->buffer, ", %s", bias);
+ 
+-    assert(!sample_function->offset_size || offset);
+     if (sample_function->offset_size)
+     {
+         int offset_immdata[4] = {offset->u, offset->v, offset->w};
+@@ -6214,12 +6194,15 @@ static void shader_glsl_interpolate(cons
+ 
+ static void shader_glsl_ld(const struct wined3d_shader_instruction *ins)
+ {
+-    struct glsl_src_param coord_param, lod_param, sample_param, offset_param;
+     const struct wined3d_shader_reg_maps *reg_maps = ins->ctx->reg_maps;
++    struct glsl_src_param coord_param, lod_param, sample_param;
+     unsigned int resource_idx, sampler_idx, sampler_bind_idx;
+     struct glsl_sample_function sample_function;
+-    BOOL has_lod_param, just_add_offset = false;
+     DWORD flags = WINED3D_GLSL_SAMPLE_LOAD;
++    BOOL has_lod_param;
++
++    if (wined3d_shader_instruction_has_texel_offset(ins))
++        flags |= WINED3D_GLSL_SAMPLE_OFFSET;
+ 
+     resource_idx = ins->src[1].reg.idx[0].offset;
+     sampler_idx = WINED3D_SAMPLER_DEFAULT;
+@@ -6231,42 +6214,12 @@ static void shader_glsl_ld(const struct
+     }
+     has_lod_param = is_mipmapped(reg_maps->resource_info[resource_idx].type);
+ 
+-    /* texelFetchOffset() is not defined for BUFFER, TEXTURE_2DMS, and
+-     * TEXTURE_2DMSARRAY, so for these we just add the texel offset to the
+-     * coordinates. */
+-    if (wined3d_shader_instruction_has_texel_offset(ins))
+-    {
+-        if (has_lod_param)
+-            flags |= WINED3D_GLSL_SAMPLE_OFFSET;
+-        else
+-            just_add_offset = true;
+-    }
+-
+     shader_glsl_get_sample_function(ins->ctx, resource_idx, sampler_idx, flags, &sample_function);
+     shader_glsl_add_src_param(ins, &ins->src[0], sample_function.coord_mask, &coord_param);
+     shader_glsl_add_src_param(ins, &ins->src[0], WINED3DSP_WRITEMASK_3, &lod_param);
+     sampler_bind_idx = shader_glsl_find_sampler(&reg_maps->sampler_map, resource_idx, sampler_idx);
+ 
+-    if (just_add_offset)
+-    {
+-        shader_glsl_add_offset_immdata_param(ins->ctx, &ins->texel_offset,
+-                reg_maps->resource_info[resource_idx].type, &offset_param);
+-
+-        if (is_multisampled(reg_maps->resource_info[resource_idx].type))
+-        {
+-            shader_glsl_add_src_param(ins, &ins->src[2], WINED3DSP_WRITEMASK_0, &sample_param);
+-            shader_glsl_gen_sample_code(ins, sampler_bind_idx, &sample_function, ins->src[1].swizzle,
+-                    NULL, NULL, NULL, NULL, "%s + %s, %s", coord_param.param_str,
+-                    offset_param.param_str, sample_param.param_str);
+-        }
+-        else
+-        {
+-            shader_glsl_gen_sample_code(ins, sampler_bind_idx, &sample_function, ins->src[1].swizzle,
+-                    NULL, NULL, has_lod_param ? lod_param.param_str : NULL, NULL,
+-                    "%s + %s", coord_param.param_str, offset_param.param_str);
+-        }
+-    }
+-    else if (is_multisampled(reg_maps->resource_info[resource_idx].type))
++    if (is_multisampled(reg_maps->resource_info[resource_idx].type))
+     {
+         shader_glsl_add_src_param(ins, &ins->src[2], WINED3DSP_WRITEMASK_0, &sample_param);
+         shader_glsl_gen_sample_code(ins, sampler_bind_idx, &sample_function, ins->src[1].swizzle,

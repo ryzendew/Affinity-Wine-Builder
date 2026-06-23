@@ -1,0 +1,162 @@
+
+Local fix for vkd3d-shader signature mismatch abort, hit by Affinity Photo 3
+text/UI draw calls under wined3d's Vulkan backend (NOT vkd3d-proton/D3D12,
+this is wined3d's own D3D9/10/11 shader translation path, libs/vkd3d-shader).
+
+Confirmed still unfixed as of vkd3d release 1.14 (latest tag checked).
+
+vsir_program_remap_output_signature() aborts compilation whenever a later
+shader stage's input mask reads components an earlier stage's output mask
+never wrote ("Input mask 0xf reads components not written in output mask
+0x3"). Real D3D drivers tolerate this and simply read back zero for the
+unwritten components. This patch does the same: widens the signature
+element's mask to cover what's read, and synthesizes zero-writes for the
+missing components before every ret, reusing the same technique the
+function already uses just below for entirely-uninitialized varyings.
+
+Compile-checked with gcc -fsyntax-only against this tree's generated
+config.h; NOT runtime-tested against an actual Vulkan device. Build it,
+run with WINEDEBUG=+d3d_shader,+d3d and confirm the
+"Input mask ... reads components not written" abort is gone and the
+glyph/text draw calls succeed before relying on this.
+
+--- a/libs/vkd3d/libs/vkd3d-shader/ir.c	2026-06-23 02:12:08.060507981 +0000
++++ b/libs/vkd3d/libs/vkd3d-shader/ir.c	2026-06-23 02:15:00.087020539 +0000
+@@ -4003,9 +4003,7 @@ static void remove_unread_output_compone
+ static enum vkd3d_result vsir_program_remap_output_signature(struct vsir_program *program,
+         struct vsir_transformation_context *ctx)
+ {
+-    const struct vkd3d_shader_location location = {.source_name = ctx->compile_info->source_name};
+     struct vsir_program_iterator it = vsir_program_iterator(&program->instructions);
+-    struct vkd3d_shader_message_context *message_context = ctx->message_context;
+     const struct vkd3d_shader_compile_info *compile_info = ctx->compile_info;
+     bool allows_subset_masks = target_allows_subset_masks(compile_info);
+     struct shader_signature *signature = &program->output_signature;
+@@ -4016,11 +4014,16 @@ static enum vkd3d_result vsir_program_re
+     unsigned int subset_varying_count = 0;
+     struct vkd3d_shader_instruction *ins;
+     unsigned int new_register_count = 0;
++    unsigned int *pad_mask = NULL;
++    unsigned int pad_count = 0;
+     unsigned int i;
+ 
+     if (!(varying_map = vkd3d_find_struct(compile_info->next, VARYING_MAP_INFO)))
+         return VKD3D_OK;
+ 
++    if (!(pad_mask = vkd3d_calloc(signature->element_count, sizeof(*pad_mask))))
++        return VKD3D_ERROR_OUT_OF_MEMORY;
++
+     for (i = 0; i < signature->element_count; ++i)
+     {
+         const struct vkd3d_shader_varying_map *map = find_varying_map(varying_map, i);
+@@ -4046,11 +4049,21 @@ static enum vkd3d_result vsir_program_re
+             }
+             else if (input_mask && input_mask != e->mask)
+             {
+-                vkd3d_shader_error(message_context, &location, VKD3D_SHADER_ERROR_VSIR_NOT_IMPLEMENTED,
+-                        "Aborting due to not yet implemented feature: "
+-                        "Input mask %#x reads components not written in output mask %#x.",
+-                        input_mask, e->mask);
+-                return VKD3D_ERROR_NOT_IMPLEMENTED;
++                /* The input stage reads components which this stage never
++                 * writes. Real drivers tolerate this and simply read back
++                 * zero for the unwritten components; synthesize that
++                 * behaviour instead of aborting. Widen the signature mask to
++                 * cover what is read, and remember which components still
++                 * need to be zero-initialized so they can be written before
++                 * every return below. */
++                WARN("Padding signature index %u: input mask %#x reads components "
++                        "not written in output mask %#x, synthesizing zero writes.\n",
++                        i, input_mask, e->mask);
++
++                pad_mask[i] = input_mask & ~e->mask;
++                ++pad_count;
++                e->mask |= input_mask;
++                e->used_mask |= input_mask;
+             }
+         }
+         else
+@@ -4089,7 +4102,10 @@ static enum vkd3d_result vsir_program_re
+ 
+     if (!(new_elements = vkd3d_realloc(signature->elements,
+             (signature->element_count + uninit_varying_count) * sizeof(*signature->elements))))
++    {
++        vkd3d_free(pad_mask);
+         return VKD3D_ERROR_OUT_OF_MEMORY;
++    }
+     signature->elements = new_elements;
+ 
+     for (i = 0; i < varying_map->varying_count; ++i)
+@@ -4104,7 +4120,10 @@ static enum vkd3d_result vsir_program_re
+         e = &signature->elements[signature->element_count++];
+         memset(e, 0, sizeof(*e));
+         if (!(e->semantic_name = vkd3d_strdup("$unused")))
++        {
++            vkd3d_free(pad_mask);
+             return VKD3D_ERROR_OUT_OF_MEMORY;
++        }
+         e->sysval_semantic = VKD3D_SHADER_SV_NONE;
+         e->component_type = VKD3D_SHADER_COMPONENT_FLOAT;
+         e->register_count = 1;
+@@ -4125,7 +4144,10 @@ static enum vkd3d_result vsir_program_re
+ 
+         loc = ins->location;
+         if (!(ins = vsir_program_iterator_insert_before_and_move(&it, uninit_varying_count)))
++        {
++            vkd3d_free(pad_mask);
+             return VKD3D_ERROR_OUT_OF_MEMORY;
++        }
+ 
+         for (unsigned int j = signature->element_count - uninit_varying_count; j < signature->element_count; ++j)
+         {
+@@ -4140,6 +4162,50 @@ static enum vkd3d_result vsir_program_re
+         }
+     }
+ 
++    /* Write zero into the components of partially-initialized varyings
++     * (signature elements present in the output, but with a narrower write
++     * mask than what the next stage's input mask reads) before each ret, in
++     * addition to whatever the shader already writes to the rest of the
++     * register. This avoids aborting on signature mismatches that real
++     * D3D drivers tolerate. */
++    if (pad_count)
++    {
++        for (ins = vsir_program_iterator_head(&it); ins; ins = vsir_program_iterator_next(&it))
++        {
++            struct vkd3d_shader_location loc;
++            unsigned int remaining = pad_count;
++
++            if (ins->opcode != VSIR_OP_RET)
++                continue;
++
++            loc = ins->location;
++            if (!(ins = vsir_program_iterator_insert_before_and_move(&it, pad_count)))
++            {
++                vkd3d_free(pad_mask);
++                return VKD3D_ERROR_OUT_OF_MEMORY;
++            }
++
++            for (i = 0; i < orig_element_count && remaining; ++i)
++            {
++                if (!pad_mask[i])
++                    continue;
++
++                e = &signature->elements[i];
++
++                vsir_instruction_init_with_params(program, ins, &loc, VSIR_OP_MOV, 1, 1);
++                vsir_dst_operand_init_output(&ins->dst[0], VSIR_DATA_F32, e->register_index, pad_mask[i]);
++                vsir_src_operand_init(&ins->src[0], VKD3DSPR_IMMCONST, VSIR_DATA_F32, 0);
++                ins->src[0].reg.dimension = VSIR_DIMENSION_VEC4;
++                ins->src[0].swizzle = VKD3D_SHADER_NO_SWIZZLE;
++                ins = vsir_program_iterator_next(&it);
++                --remaining;
++            }
++        }
++    }
++
++    vkd3d_free(pad_mask);
++    pad_mask = NULL;
++
+     /* Vulkan (without KHR_maintenance4) disallows any mismatching masks,
+      * including when the input mask is a proper subset of the output mask.
+      * Resolve this by rewriting the shader to remove unread components from
