@@ -1,0 +1,219 @@
+From: ryzendew
+Date: 2026-06-23
+Subject: Fix clSetEventCallback to properly track event completion
+
+Replaces the immediate callback invocation from 0003 with proper
+event status tracking. Instead of firing the callback immediately
+when clSetEventCallback is called, we now:
+
+1. Check if the event is already complete -> fire immediately
+2. Register the callback in a deferred-checking list
+3. Fire callbacks as a side effect of clFinish, clGetEventInfo,
+   clWaitForEvents, and clReleaseEvent
+
+This prevents callback races that caused GPU pipeline stalls and
+progressive slowdowns with heavy SVG files in Affinity.
+
+diff --git a/dlls/opencl/pe_thunks.c b/dlls/opencl/pe_thunks.c
+index 17ec127..0be612c 100644
+--- a/dlls/opencl/pe_thunks.c
++++ b/dlls/opencl/pe_thunks.c
+@@ -7,6 +7,65 @@
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(opencl);
+ 
++/* Event callback tracking for clSetEventCallback */
++/* Fires callbacks as a side effect of other OpenCL API calls, avoiding background threads */
++
++struct event_callback
++{
++    struct event_callback *next;
++    cl_event event;
++    cl_int trigger_status;
++    cl_int actual_status;
++    void (WINAPI *pfn_notify)(cl_event event, cl_int event_command_status, void *user_data);
++    void *user_data;
++};
++
++struct event_callback *callback_list;
++CRITICAL_SECTION callback_cs;
++
++static void check_completed_callbacks(void)
++{
++    struct event_callback *completed = NULL;
++
++    EnterCriticalSection(&callback_cs);
++
++    struct event_callback **pp = &callback_list;
++    while (*pp)
++    {
++        struct event_callback *cb = *pp;
++        struct clGetEventInfo_params params;
++        cl_int status;
++
++        params.event = cb->event;
++        params.param_name = CL_EVENT_COMMAND_EXECUTION_STATUS;
++        params.param_value_size = sizeof(status);
++        params.param_value = &status;
++        params.param_value_size_ret = NULL;
++        OPENCL_CALL(clGetEventInfo, &params);
++
++        if (status == cb->trigger_status || status < 0)
++        {
++            cb->actual_status = status;
++            *pp = cb->next;
++            cb->next = completed;
++            completed = cb;
++            continue;
++        }
++        pp = &cb->next;
++    }
++
++    LeaveCriticalSection(&callback_cs);
++
++    while (completed)
++    {
++        struct event_callback *cb = completed;
++        completed = cb->next;
++        TRACE("Firing event callback for event %p (status %d)\n", cb->event, cb->actual_status);
++        cb->pfn_notify(cb->event, cb->actual_status, cb->user_data);
++        HeapFree(GetProcessHeap(), 0, cb);
++    }
++}
++
+ cl_int WINAPI clBuildProgram( cl_program program, cl_uint num_devices, const cl_device_id* device_list, const char* options, void (WINAPI* pfn_notify)(cl_program program, void* user_data), void* user_data )
+ {
+     struct clBuildProgram_params params = { program, num_devices, device_list, options, pfn_notify, user_data };
+@@ -342,9 +401,12 @@
+ 
+ cl_int WINAPI clFinish( cl_command_queue command_queue )
+ {
++    cl_int ret;
+     struct clFinish_params params = { command_queue };
+     TRACE( "(%p)\n", command_queue );
+-    return OPENCL_CALL( clFinish, &params );
++    ret = OPENCL_CALL( clFinish, &params );
++    check_completed_callbacks();
++    return ret;
+ }
+ 
+ cl_int WINAPI clFlush( cl_command_queue command_queue )
+@@ -377,9 +439,12 @@
+ 
+ cl_int WINAPI clGetEventInfo( cl_event event, cl_event_info param_name, size_t param_value_size, void* param_value, size_t* param_value_size_ret )
+ {
++    cl_int ret;
+     struct clGetEventInfo_params params = { event, param_name, param_value_size, param_value, param_value_size_ret };
+     TRACE( "(%p, %u, %Iu, %p, %p)\n", event, param_name, param_value_size, param_value, param_value_size_ret );
+-    return OPENCL_CALL( clGetEventInfo, &params );
++    ret = OPENCL_CALL( clGetEventInfo, &params );
++    check_completed_callbacks();
++    return ret;
+ }
+ 
+ cl_int WINAPI clGetEventProfilingInfo( cl_event event, cl_profiling_info param_name, size_t param_value_size, void* param_value, size_t* param_value_size_ret )
+@@ -491,9 +556,12 @@
+ 
+ cl_int WINAPI clReleaseEvent( cl_event event )
+ {
++    cl_int ret;
+     struct clReleaseEvent_params params = { event };
+     TRACE( "(%p)\n", event );
+-    return OPENCL_CALL( clReleaseEvent, &params );
++    check_completed_callbacks();
++    ret = OPENCL_CALL( clReleaseEvent, &params );
++    return ret;
+ }
+ 
+ cl_int WINAPI clReleaseKernel( cl_kernel kernel )
+@@ -582,12 +650,43 @@
+ 
+ cl_int WINAPI clSetEventCallback( cl_event event, cl_int command_exec_callback_type, void (WINAPI* pfn_notify)(cl_event event, cl_int event_command_status, void *user_data), void* user_data )
+ {
+-    cl_int ret;
+-    struct clSetEventCallback_params params = { event, command_exec_callback_type, pfn_notify, user_data };
++    struct clGetEventInfo_params info;
++    cl_int status;
++
+     TRACE( "(%p, %d, %p, %p)\n", event, command_exec_callback_type, pfn_notify, user_data );
+-    ret = OPENCL_CALL( clSetEventCallback, &params );
+-    params.pfn_notify(event, command_exec_callback_type, user_data);
+-    return ret;
++
++    /* Check if event is already at or past the trigger status */
++    info.event = event;
++    info.param_name = CL_EVENT_COMMAND_EXECUTION_STATUS;
++    info.param_value_size = sizeof(status);
++    info.param_value = &status;
++    info.param_value_size_ret = NULL;
++    OPENCL_CALL(clGetEventInfo, &info);
++
++    if (status == command_exec_callback_type || status < 0)
++    {
++        pfn_notify(event, status, user_data);
++        return CL_SUCCESS;
++    }
++
++    /* Register callback for deferred checking */
++    struct event_callback *cb = HeapAlloc(GetProcessHeap(), 0, sizeof(*cb));
++    if (!cb) return CL_OUT_OF_HOST_MEMORY;
++
++    cb->event = event;
++    cb->trigger_status = command_exec_callback_type;
++    cb->pfn_notify = pfn_notify;
++    cb->user_data = user_data;
++
++    EnterCriticalSection(&callback_cs);
++    cb->next = callback_list;
++    callback_list = cb;
++    LeaveCriticalSection(&callback_cs);
++
++    /* Check if any other callbacks have completed */
++    check_completed_callbacks();
++
++    return CL_SUCCESS;
+ }
+ 
+ cl_int WINAPI clSetKernelArg( cl_kernel kernel, cl_uint arg_index, size_t arg_size, const void* arg_value )
+@@ -627,9 +726,12 @@
+ 
+ cl_int WINAPI clWaitForEvents( cl_uint num_events, const cl_event* event_list )
+ {
++    cl_int ret;
+     struct clWaitForEvents_params params = { num_events, event_list };
+     TRACE( "(%u, %p)\n", num_events, event_list );
+-    return OPENCL_CALL( clWaitForEvents, &params );
++    ret = OPENCL_CALL( clWaitForEvents, &params );
++    check_completed_callbacks();
++    return ret;
+ }
+ 
+ BOOL extension_is_supported( const char *name, size_t len )
+diff --git a/dlls/opencl/pe_wrappers.c b/dlls/opencl/pe_wrappers.c
+index 01b8e0d..5860840 100644
+--- a/dlls/opencl/pe_wrappers.c
++++ b/dlls/opencl/pe_wrappers.c
+@@ -24,6 +24,10 @@
+ #include "wine/wgl.h"
+ #include "extensions.h"
+ 
++struct event_callback;
++extern struct event_callback *callback_list;
++extern CRITICAL_SECTION callback_cs;
++
+ WINE_DEFAULT_DEBUG_CHANNEL(opencl);
+ 
+ static cl_int filter_extensions( const char *unix_exts, SIZE_T size, char *win_exts, size_t *ret_size )
+@@ -310,7 +314,12 @@
+     if (reason == DLL_PROCESS_ATTACH)
+     {
+         DisableThreadLibraryCalls( instance );
++        InitializeCriticalSection(&callback_cs);
+         return !__wine_init_unix_call();
+     }
++    if (reason == DLL_PROCESS_DETACH && !reserved)
++    {
++        DeleteCriticalSection(&callback_cs);
++    }
+     return TRUE;
+ }

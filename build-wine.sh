@@ -184,7 +184,7 @@ echo -e "  • Automatic patch application"
 echo -e "  • Optimized build configuration"
 echo ""
 
-# Main menu: Build or Prepare for GitHub
+# Main menu: Build, Prepare for GitHub, or Download Only
 show_main_menu() {
   echo ""
   echo -e "${BLUE}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
@@ -193,13 +193,14 @@ show_main_menu() {
   echo ""
   echo -e "  ${GREEN}1${NC}) ${CYAN}Build Wine${NC} (download, patch, compile, and install)"
   echo -e "  ${GREEN}2${NC}) ${CYAN}Prepare Wine for GitHub${NC} (download, patch, initialize git repo)"
-  echo -e "  ${RED}3${NC}) ${YELLOW}Exit${NC}"
+  echo -e "  ${GREEN}3${NC}) ${CYAN}Grab Wine Source${NC} (download only, no patches, for creating patches)"
+  echo -e "  ${RED}4${NC}) ${YELLOW}Exit${NC}"
   echo ""
   echo -e "${BLUE}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
   echo ""
   
   while true; do
-    echo -ne "${YELLOW}Select an option [1-3]: ${NC}"
+    echo -ne "${YELLOW}Select an option [1-4]: ${NC}"
     read choice
     
     case "$choice" in
@@ -209,12 +210,15 @@ show_main_menu() {
       2)
         return 1  # GitHub prep mode
         ;;
-      3|"")
+      3)
+        return 2  # Download only mode
+        ;;
+      4|"")
         echo -e "${YELLOW}Exiting.${NC}"
         exit 0
         ;;
       *)
-        echo -e "${RED}Invalid choice. Please enter 1, 2, or 3.${NC}"
+        echo -e "${RED}Invalid choice. Please enter 1, 2, 3, or 4.${NC}"
         ;;
     esac
   done
@@ -501,12 +505,290 @@ EOF
   echo -e "${GREEN}${BOLD}✓ README.md created.${NC}"
 }
 
-# Show main menu
-if ! show_main_menu; then
-  # GitHub prep mode
-  prepare_wine_for_github
-  exit 0
-fi
+# Get available Wine versions from patches directory
+get_available_versions() {
+  local script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  local patches_dir=""
+  
+  if [ -d "$script_dir/patches" ]; then
+    patches_dir="$script_dir/patches"
+  elif [ -d "./patches" ]; then
+    patches_dir="./patches"
+  else
+    echo ""
+    return
+  fi
+  
+  # Find all wine-* directories and extract version numbers
+  find "$patches_dir" -maxdepth 1 -type d -name "wine-*" | \
+    sed 's|.*/wine-||' | sort -V
+}
+
+# Show version selection menu
+select_wine_version() {
+  local versions=($(get_available_versions))
+  
+  if [ ${#versions[@]} -eq 0 ]; then
+    echo -e "${RED}Error: No patch directories found. Cannot determine available Wine versions.${NC}"
+    exit 1
+  fi
+  
+  # If WINE_VERSION is set via environment variable, use it
+  if [ -n "$WINE_VERSION" ]; then
+    for v in "${versions[@]}"; do
+      if [ "$v" = "$WINE_VERSION" ]; then
+        echo "$WINE_VERSION"
+        return
+      fi
+    done
+    echo -e "${YELLOW}Warning: WINE_VERSION=$WINE_VERSION not found in patches. Available versions: ${versions[*]}${NC}" >&2
+  fi
+  
+  echo "" >&2
+  echo -e "${BLUE}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}" >&2
+  echo -e "${CYAN}${BOLD}Wine Version Selection${NC}" >&2
+  echo -e "${BLUE}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}" >&2
+  echo "" >&2
+  echo -e "${BOLD}Available Wine versions (with patches):${NC}" >&2
+  echo "" >&2
+  local i=1
+  for version in "${versions[@]}"; do
+    printf "  ${GREEN}%2d${NC}) ${CYAN}Wine version %s${NC}\n" "$i" "$version" >&2
+    ((i++))
+  done
+  printf "  ${RED}%2d${NC}) ${YELLOW}Exit${NC}\n" "$i" >&2
+  echo "" >&2
+  echo -e "${BLUE}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}" >&2
+  echo "" >&2
+  
+  while true; do
+    echo -ne "${YELLOW}Select Wine version to build [1-$i]: ${NC}" >&2
+    read choice
+    
+    if [ "$choice" = "$i" ] || [ -z "$choice" ]; then
+      echo -e "${YELLOW}Exiting.${NC}" >&2
+      exit 0
+    fi
+    
+    if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -lt "$i" ]; then
+      local selected_version="${versions[$((choice-1))]}"
+      echo "" >&2
+      echo -e "${GREEN}${BOLD}✓ Selected: Wine version $selected_version${NC}" >&2
+      echo "" >&2
+      echo "$selected_version"
+      return
+    else
+      echo -e "${RED}Invalid choice. Please enter a number between 1 and $i.${NC}" >&2
+    fi
+  done
+}
+
+# Download Wine source code
+download_wine_source() {
+  local version="$1"
+  local download_dir="${2:-./wine-src}"
+  
+  local original_dir="$(pwd)"
+  
+  if [[ "$download_dir" != /* ]]; then
+    if [[ "$download_dir" == ./* ]]; then
+      download_dir="$original_dir/$(echo "$download_dir" | sed 's|^\./||')"
+    elif [[ "$download_dir" == ../* ]]; then
+      download_dir="$(cd "$(dirname "$download_dir")" && pwd)/$(basename "$download_dir")"
+    else
+      download_dir="$original_dir/$download_dir"
+    fi
+  fi
+  
+  local version_major=$(echo "$version" | cut -d'.' -f1)
+  local version_minor=$(echo "$version" | cut -s -d'.' -f2)
+  local url_subdir
+  
+  if [ -z "$version_minor" ] || [ "$version_minor" = "0" ]; then
+    url_subdir="$version_major.0"
+  else
+    url_subdir="$version_major.x"
+  fi
+  
+  local wine_url="https://dl.winehq.org/wine/source/$url_subdir/wine-${version}.tar.xz"
+  local wine_file="wine-${version}.tar.xz"
+  local wine_dir="wine-${version}"
+  
+  if [ -d "$download_dir" ] && [ -f "$download_dir/configure" ]; then
+    echo "Wine source already exists at: $download_dir"
+    read -p "Use existing source? [Y/n]: " use_existing
+    if [[ ! "$use_existing" =~ ^[Nn]$ ]]; then
+      return 0
+    fi
+    echo "Removing existing $download_dir..."
+    rm -rf "$download_dir"
+  fi
+  
+  if [ -d "$download_dir" ]; then
+    echo "Removing existing $download_dir (may be incomplete)..."
+    rm -rf "$download_dir"
+  fi
+  
+  mkdir -p "$(dirname "$download_dir")"
+  local temp_dir=$(mktemp -d)
+  cd "$temp_dir" || exit 1
+  
+  echo ""
+  echo -e "${CYAN}${BOLD}Downloading Wine $version...${NC}"
+  echo -e "${BLUE}URL: ${NC}$wine_url"
+  echo ""
+  echo -e "${CYAN}Download progress:${NC}"
+  echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+  
+  if command -v wget >/dev/null 2>&1; then
+    if ! wget --progress=bar:force:noscroll "$wine_url" -O "$wine_file"; then
+      echo ""
+      echo -e "${RED}❌ ERROR: Failed to download Wine source.${NC}"
+      cd - >/dev/null || exit 1
+      rm -rf "$temp_dir"
+      return 1
+    fi
+  elif command -v curl >/dev/null 2>&1; then
+    if ! curl -L --progress-bar --fail -o "$wine_file" "$wine_url"; then
+      echo ""
+      echo -e "${RED}❌ ERROR: Failed to download Wine source.${NC}"
+      cd - >/dev/null || exit 1
+      rm -rf "$temp_dir"
+      return 1
+    fi
+    echo ""
+  else
+    echo -e "${RED}❌ ERROR: Neither wget nor curl found. Please install one to download Wine source.${NC}"
+    cd - >/dev/null || exit 1
+    rm -rf "$temp_dir"
+    return 1
+  fi
+  
+  echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+  echo -e "${GREEN}✓${NC} Download complete!"
+  echo ""
+  
+  echo ""
+  echo -e "${CYAN}Extracting Wine source...${NC}"
+  if ! tar -xf "$wine_file"; then
+    echo -e "${RED}❌ ERROR: Failed to extract Wine source.${NC}"
+    cd - >/dev/null || exit 1
+    rm -rf "$temp_dir"
+    return 1
+  fi
+  
+  echo -e "${CYAN}Checking extracted contents...${NC}"
+  ls -la
+  
+  if [ -d "$wine_dir" ]; then
+    if [ -d "$download_dir" ]; then
+      echo -e "${YELLOW}Removing existing $download_dir...${NC}"
+      rm -rf "$download_dir"
+    fi
+    
+    mkdir -p "$(dirname "$download_dir")"
+    mv "$wine_dir" "$download_dir"
+    echo -e "${GREEN}✓${NC} Wine source extracted to: ${CYAN}$download_dir${NC}"
+    
+    if [ ! -d "$download_dir" ]; then
+      echo -e "${RED}❌ ERROR: Failed to move extracted directory to $download_dir${NC}"
+      cd - >/dev/null || exit 1
+      rm -rf "$temp_dir"
+      return 1
+    fi
+  else
+    echo -e "${RED}❌ ERROR: Extracted directory '$wine_dir' not found.${NC}"
+    echo -e "${YELLOW}Contents of extraction directory:${NC}"
+    ls -la
+    cd - >/dev/null || exit 1
+    rm -rf "$temp_dir"
+    return 1
+  fi
+  
+  cd - >/dev/null || exit 1
+  rm -rf "$temp_dir"
+  
+  if [ ! -f "$download_dir/configure" ]; then
+    local nested_dir=""
+    for possible_dir in "$download_dir"/wine-*; do
+      if [ -d "$possible_dir" ] && [ -f "$possible_dir/configure" ]; then
+        nested_dir="$possible_dir"
+        break
+      fi
+    done
+    
+    if [ -n "$nested_dir" ]; then
+      echo -e "${YELLOW}Found nested directory structure. Fixing...${NC}"
+      echo -e "${CYAN}Moving contents from $nested_dir to $download_dir...${NC}"
+      
+      local temp_fix=$(mktemp -d)
+      mv "$download_dir"/* "$temp_fix/" 2>/dev/null
+      rm -rf "$download_dir"
+      mv "$temp_fix"/* "$download_dir/" 2>/dev/null
+      rmdir "$temp_fix"
+      
+      if [ -f "$download_dir/configure" ]; then
+        echo -e "${GREEN}✓${NC} Fixed nested structure. Configure script found."
+      else
+        echo -e "${RED}❌ ERROR: Still could not find configure script after fix attempt.${NC}"
+        return 1
+      fi
+    else
+      echo -e "${RED}❌ ERROR: configure script not found after extraction.${NC}"
+      echo -e "${YELLOW}Expected at: $download_dir/configure${NC}"
+      echo -e "${CYAN}Checking if directory exists:${NC}"
+      if [ -d "$download_dir" ]; then
+        echo -e "${YELLOW}Directory exists. Contents:${NC}"
+        ls -la "$download_dir" | head -20
+      else
+        echo -e "${RED}Directory does not exist: $download_dir${NC}"
+      fi
+      return 1
+    fi
+  fi
+  
+  echo -e "${GREEN}✓${NC} Configure script verified at: ${CYAN}$download_dir/configure${NC}"
+  
+  return 0
+}
+
+# Show main menu and dispatch
+show_main_menu
+menu_choice=$?
+
+case $menu_choice in
+  1)
+    # GitHub prep mode — select version at top level to avoid subshell issues
+    SELECTED_VERSION=$(select_wine_version)
+    if [ -z "$SELECTED_VERSION" ]; then
+      echo -e "${RED}No version selected. Exiting.${NC}"
+      exit 1
+    fi
+    prepare_wine_for_github "$SELECTED_VERSION"
+    exit 0
+    ;;
+  2)
+    # Download only mode — grab clean source for patch development
+    SELECTED_VERSION=$(select_wine_version)
+    if [ -z "$SELECTED_VERSION" ]; then
+      echo -e "${RED}No version selected. Exiting.${NC}"
+      exit 1
+    fi
+    echo ""
+    echo -e "${CYAN}${BOLD}Downloading Wine $SELECTED_VERSION source (no patches)...${NC}"
+    echo ""
+    if ! download_wine_source "$SELECTED_VERSION" "./wine-src"; then
+      echo -e "${RED}FAILED to download Wine source.${NC}"
+      exit 1
+    fi
+    echo ""
+    echo -e "${GREEN}${BOLD}✓ Wine $SELECTED_VERSION source downloaded to ./wine-src${NC}"
+    echo -e "${CYAN}You can now create patches against this clean source.${NC}"
+    echo ""
+    exit 0
+    ;;
+esac
+# Fall through — option 0 (Build mode) continues below
 
 # Build mode (continue with existing flow)
 echo ""
@@ -573,7 +855,7 @@ install_packages_64bit() {
           sudo apt install -y gcc-mingw-w64 2>/dev/null || true
         fi
         # Verify critical packages are actually installed (sometimes build-dep misses some)
-        local critical_packages=("libfreetype6-dev" "libfontconfig1-dev" "pkg-config")
+        local critical_packages=("libfreetype-dev" "libfontconfig-dev" "pkg-config")
         local missing_critical=()
         for pkg in "${critical_packages[@]}"; do
           if ! check_package_installed_apt "$pkg"; then
@@ -588,7 +870,7 @@ install_packages_64bit() {
       else
         echo -e "${YELLOW}  Note: 'apt build-dep wine' failed or wine package not available, installing packages manually...${NC}"
         local required_packages=(
-          # Essential build tools (works on all Ubuntu/Debian variants)
+          # Essential build tools
           "build-essential"
           "gcc"
           "g++"
@@ -598,29 +880,42 @@ install_packages_64bit() {
           "gettext"
           "perl"
           "pkg-config"
-          
+
           # MinGW cross-compilers (for PE binaries)
+          # gcc-mingw-w64 + mingw-w64 + mingw-w64-tools for full C++17 PE support
+          # llvm + lld + clang enable the preferred lld linker path Wine probes for
           "gcc-mingw-w64"
           "mingw-w64"
-          
-          # Core Wine dependencies - 64-bit versions
-          # Note: samba-dev may not exist on all distros, Wine uses libsamba-dev or samba-libs-dev
-          # We'll try samba-dev first, fallback handled by apt
-          "samba-dev"
-          "libsamba-dev"
+          "mingw-w64-tools"
+          "llvm"
+          "lld"
+          "clang"
+
+          # CUPS printing support
+          # Try both names: libcups-dev (Debian Sid) and libcups2-dev (Ubuntu/PikaOS)
+          "libcups-dev"
           "libcups2-dev"
+
+          # Samba NetAPI support
+          # libnetapi-dev is what Wine's configure actually checks for
+          # libsamba-dev provides it on pure Debian Sid
+          "libnetapi-dev"
+          "libsamba-dev"
+
+          # OpenCL
           "ocl-icd-opencl-dev"
           "opencl-headers"
-          
+
           # Audio libraries - 64-bit
           "libasound2-dev"
           "libpulse-dev"
-          
+
           # Font libraries - 64-bit
-          "libfontconfig1-dev"
-          "libfreetype6-dev"
+          # libfontconfig-dev and libfreetype-dev are the Debian Sid names
+          # the -1/-6 suffixed names are Ubuntu aliases kept for compat
+          "libfontconfig-dev"
           "libfreetype-dev"
-          
+
           # X11 libraries - 64-bit
           "libx11-dev"
           "libxext-dev"
@@ -633,73 +928,65 @@ install_packages_64bit() {
           "libxcomposite-dev"
           "libxdamage-dev"
           "libxxf86vm-dev"
+          # x11proto-dev supersedes x11proto-xinerama-dev and x11proto-xf86vidmode-dev
           "x11proto-dev"
-          "x11proto-xinerama-dev"
-          "x11proto-xf86vidmode-dev"
-          
+
           # XKB support
           "libxkbcommon-dev"
           "libxkbcommon-x11-dev"
-          
+
           # Graphics libraries - 64-bit
-          # libgl1-mesa-dev is the correct package (libgl-dev is a virtual package)
-          "libgl1-mesa-dev"
+          # libgl-dev is the correct virtual package in Debian Sid
+          "libgl-dev"
           "libglu1-mesa-dev"
           "mesa-common-dev"
           "libosmesa6-dev"
-          
+
           # Vulkan support
-          # vulkan-dev may not exist, libvulkan-dev is the standard package
+          # vulkan-validationlayers-dev does NOT exist in Debian Sid / PikaOS
+          # vulkan-utility-libraries-dev replaces it
           "libvulkan-dev"
           "vulkan-tools"
-          "vulkan-validationlayers-dev"
           "vulkan-utility-libraries-dev"
-          
+
           # Wayland support
+          # libwayland-egl1-mesa-dev is folded into libwayland-dev in Debian Sid
           "libwayland-dev"
           "wayland-protocols"
-          "libwayland-egl1-mesa-dev"
-          
+
           # GStreamer - 64-bit
           "libgstreamer1.0-dev"
           "libgstreamer-plugins-base1.0-dev"
           "gstreamer1.0-plugins-base"
-          
+
           # SDL - 64-bit
           "libsdl2-dev"
-          
+
           # System libraries - 64-bit
           "libdbus-1-dev"
           "libudev-dev"
           "libunwind-dev"
           "libsystemd-dev"
-          
+
           # GnuTLS for secure connections
           "libgnutls28-dev"
-          
+
           # Optional but recommended - 64-bit
           "libxml2-dev"
           "libxslt1-dev"
-          # JPEG support (libjpeg-turbo8-dev is preferred, libjpeg-dev is fallback)
-          "libjpeg-turbo8-dev"
+          # JPEG: libjpeg62-turbo-dev is the Debian Sid name
           "libjpeg62-turbo-dev"
           "libjpeg-dev"
           "libpng-dev"
-          # TIFF support (version may vary by distro)
+          # TIFF: libtiff-dev is current in Sid (versioned names dropped)
           "libtiff-dev"
-          "libtiff5-dev"
-          "libtiff6-dev"
-          "libtiffxx5"
           "libtiffxx6"
           "liblcms2-dev"
           "libusb-1.0-0-dev"
-          # pcap support (libpcap0.8-dev is the standard package)
-          "libpcap0.8-dev"
+          # pcap: libpcap-dev (libpcap0.8-dev dropped in Sid)
           "libpcap-dev"
-          # ncurses support (libncurses5-dev is standard, libncurses-dev is virtual)
-          "libncurses5-dev"
+          # ncurses: libncurses-dev (versioned names dropped in Sid)
           "libncurses-dev"
-          "libncursesw5-dev"
           "libkrb5-dev"
           "unixodbc-dev"
           "libv4l-dev"
@@ -711,7 +998,7 @@ install_packages_64bit() {
           "libmpg123-dev"
           "libopenal-dev"
           "libopenal1"
-          
+
           # Multimedia libraries (optional)
           "libavcodec-dev"
           "libavformat-dev"
@@ -719,21 +1006,23 @@ install_packages_64bit() {
           "libswscale-dev"
           "libswresample-dev"
           "libavfilter-dev"
-          
-          # ISDN support (optional, may not be available on all distros)
+
+          # ISDN support (optional)
           "libcapi20-dev"
         )
-        
+
         # Add 32-bit (i386) packages for Wine 32-bit support
         # These are required when building with --enable-archs=i386,x86_64
         local required_packages_i386=(
           "libasound2-dev:i386"
           "libpulse-dev:i386"
           "libdbus-1-dev:i386"
-          "libfontconfig1-dev:i386"
-          "libfreetype6-dev:i386"
+          # libfontconfig-dev and libfreetype-dev are the Debian Sid / PikaOS names
+          "libfontconfig-dev:i386"
+          "libfreetype-dev:i386"
           "libgnutls28-dev:i386"
-          "libgl1-mesa-dev:i386"
+          # libgl-dev replaced libgl1-mesa-dev in Debian Sid
+          "libgl-dev:i386"
           "libglu1-mesa-dev:i386"
           "libunwind-dev:i386"
           "libx11-dev:i386"
@@ -752,6 +1041,8 @@ install_packages_64bit() {
           "libudev-dev:i386"
           "libvulkan-dev:i386"
           "libcapi20-dev:i386"
+          # Try both cups dev names for i386
+          "libcups-dev:i386"
           "libcups2-dev:i386"
           "libgphoto2-dev:i386"
           "libsane-dev:i386"
@@ -803,13 +1094,48 @@ install_packages_64bit() {
           
           echo ""
           echo -e "${CYAN}Installing packages...${NC}"
-          # Try to install all packages, some may fail if not available
-          if sudo apt install -y "${packages_to_install[@]}" 2>/dev/null || \
-             sudo apt install -y --fix-missing "${packages_to_install[@]}" 2>/dev/null; then
-            echo -e "${GREEN}✓ Package installation completed successfully${NC}"
-          else
-            echo -e "${YELLOW}⚠ Some packages may have failed to install, but continuing...${NC}"
+          local failed_packages=()
+          local skipped_packages=()
+          for pkg in "${packages_to_install[@]}"; do
+            # Check if the package actually exists in apt's package lists before trying to install
+            # Strip :i386 suffix for apt-cache check, then re-add for install
+            local pkg_base="${pkg%%:*}"
+            local pkg_arch="${pkg#*:}"
+            local apt_check_name="$pkg_base"
+            if [ "$pkg_arch" != "$pkg_base" ]; then
+              apt_check_name="${pkg_base}:${pkg_arch}"
+            fi
+            if apt-cache show "$pkg_base" >/dev/null 2>&1; then
+              if ! sudo apt install -y "$pkg" >/dev/null 2>&1; then
+                # Retry with --fix-missing in case of partial state
+                if ! sudo apt install -y --fix-missing "$pkg" >/dev/null 2>&1; then
+                  failed_packages+=("$pkg")
+                  echo -e "  ${YELLOW}⚠${NC} $pkg ${YELLOW}(failed to install)${NC}"
+                else
+                  echo -e "  ${GREEN}✓${NC} $pkg ${GREEN}(installed)${NC}"
+                fi
+              else
+                echo -e "  ${GREEN}✓${NC} $pkg ${GREEN}(installed)${NC}"
+              fi
+            else
+              skipped_packages+=("$pkg")
+              echo -e "  ${YELLOW}↷${NC} $pkg ${YELLOW}(not available on this distro, skipping)${NC}"
+            fi
+          done
+          echo ""
+          if [ ${#failed_packages[@]} -gt 0 ]; then
+            echo -e "${YELLOW}⚠ The following packages failed to install (may affect optional features):${NC}"
+            for pkg in "${failed_packages[@]}"; do
+              echo -e "  ${YELLOW}- $pkg${NC}"
+            done
           fi
+          if [ ${#skipped_packages[@]} -gt 0 ]; then
+            echo -e "${CYAN}ℹ The following packages are not available on this distro (normal):${NC}"
+            for pkg in "${skipped_packages[@]}"; do
+              echo -e "  ${CYAN}- $pkg${NC}"
+            done
+          fi
+          echo -e "${GREEN}✓ Package installation completed${NC}"
         else
           echo ""
           echo -e "${GREEN}${BOLD}✓ All required packages are already installed${NC}"
@@ -1088,87 +1414,6 @@ if [ "$BUILD_DEBUG" = "1" ]; then
   CFLAGS+=" -g"; CXXFLAGS+=" -g"; CROSSCFLAGS+=" -g"; CROSSCXXFLAGS+=" -g"
 fi
 
-# Get available Wine versions from patches directory
-get_available_versions() {
-  local script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  local patches_dir=""
-  
-  if [ -d "$script_dir/patches" ]; then
-    patches_dir="$script_dir/patches"
-  elif [ -d "./patches" ]; then
-    patches_dir="./patches"
-  else
-    echo ""
-    return
-  fi
-  
-  # Find all wine-* directories and extract version numbers
-  find "$patches_dir" -maxdepth 1 -type d -name "wine-*" | \
-    sed 's|.*/wine-||' | sort -V
-}
-
-# Show version selection menu
-select_wine_version() {
-  local versions=($(get_available_versions))
-  
-  if [ ${#versions[@]} -eq 0 ]; then
-    echo -e "${RED}Error: No patch directories found. Cannot determine available Wine versions.${NC}"
-    exit 1
-  fi
-  
-  # If WINE_VERSION is set via environment variable, use it
-  if [ -n "$WINE_VERSION" ]; then
-    # Validate the version exists
-    for v in "${versions[@]}"; do
-      if [ "$v" = "$WINE_VERSION" ]; then
-        echo "$WINE_VERSION"
-        return
-      fi
-    done
-    echo -e "${YELLOW}Warning: WINE_VERSION=$WINE_VERSION not found in patches. Available versions: ${versions[*]}${NC}" >&2
-  fi
-  
-  # Output menu to stderr so it displays even when function output is captured
-  echo "" >&2
-  echo -e "${BLUE}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}" >&2
-  echo -e "${CYAN}${BOLD}Wine Version Selection${NC}" >&2
-  echo -e "${BLUE}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}" >&2
-  echo "" >&2
-  echo -e "${BOLD}Available Wine versions (with patches):${NC}" >&2
-  echo "" >&2
-  local i=1
-  for version in "${versions[@]}"; do
-    printf "  ${GREEN}%2d${NC}) ${CYAN}Wine version %s${NC}\n" "$i" "$version" >&2
-    ((i++))
-  done
-  printf "  ${RED}%2d${NC}) ${YELLOW}Exit${NC}\n" "$i" >&2
-  echo "" >&2
-  echo -e "${BLUE}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}" >&2
-  echo "" >&2
-  
-  while true; do
-    echo -ne "${YELLOW}Select Wine version to build [1-$i]: ${NC}" >&2
-    read choice
-    
-    if [ "$choice" = "$i" ] || [ -z "$choice" ]; then
-      echo -e "${YELLOW}Exiting.${NC}" >&2
-      exit 0
-    fi
-    
-    if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -lt "$i" ]; then
-      local selected_version="${versions[$((choice-1))]}"
-      echo "" >&2
-      echo -e "${GREEN}${BOLD}✓ Selected: Wine version $selected_version${NC}" >&2
-      echo "" >&2
-      # Output version to stdout for capture
-      echo "$selected_version"
-      return
-    else
-      echo -e "${RED}Invalid choice. Please enter a number between 1 and $i.${NC}" >&2
-    fi
-  done
-}
-
 # Show build options menu
 show_build_options_menu() {
   echo ""
@@ -1195,195 +1440,7 @@ show_build_options_menu() {
 }
 
 # Download Wine source code
-download_wine_source() {
-  local version="$1"
-  local download_dir="${2:-./wine-src}"
-  
-  # Save current directory
-  local original_dir="$(pwd)"
-  
-  # Convert to absolute path early (before changing directories)
-  if [[ "$download_dir" != /* ]]; then
-    # Handle relative paths
-    if [[ "$download_dir" == ./* ]]; then
-      download_dir="$original_dir/$(echo "$download_dir" | sed 's|^\./||')"
-    elif [[ "$download_dir" == ../* ]]; then
-      download_dir="$(cd "$(dirname "$download_dir")" && pwd)/$(basename "$download_dir")"
-    else
-      download_dir="$original_dir/$download_dir"
-    fi
-  fi
-  
-  local version_major=$(echo "$version" | cut -d'.' -f1)
-  local version_minor=$(echo "$version" | cut -s -d'.' -f2)
-  local url_subdir
-  
-  if [ -z "$version_minor" ] || [ "$version_minor" = "0" ]; then
-    url_subdir="$version_major.0"
-  else
-    url_subdir="$version_major.x"
-  fi
-  
-  local wine_url="https://dl.winehq.org/wine/source/$url_subdir/wine-${version}.tar.xz"
-  local wine_file="wine-${version}.tar.xz"
-  local wine_dir="wine-${version}"
-  
-  # Check if already downloaded and extracted
-  if [ -d "$download_dir" ] && [ -f "$download_dir/configure" ]; then
-    echo "Wine source already exists at: $download_dir"
-    read -p "Use existing source? [Y/n]: " use_existing
-    if [[ ! "$use_existing" =~ ^[Nn]$ ]]; then
-      return 0
-    fi
-    # User wants to re-download, so remove existing directory
-    echo "Removing existing $download_dir..."
-    rm -rf "$download_dir"
-  fi
-  
-  # Remove target directory if it exists (even without configure, to avoid nested structure)
-  if [ -d "$download_dir" ]; then
-    echo "Removing existing $download_dir (may be incomplete)..."
-    rm -rf "$download_dir"
-  fi
-  
-  # Create download directory parent if needed
-  mkdir -p "$(dirname "$download_dir")"
-  local temp_dir=$(mktemp -d)
-  cd "$temp_dir" || exit 1
-  
-  echo ""
-  echo -e "${CYAN}${BOLD}Downloading Wine $version...${NC}"
-  echo -e "${BLUE}URL: ${NC}$wine_url"
-  echo ""
-  echo -e "${CYAN}Download progress:${NC}"
-  echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-  
-  # Try to download with progress display
-  if command -v wget >/dev/null 2>&1; then
-    # wget shows progress on stderr, so we need to let it through
-    if ! wget --progress=bar:force:noscroll "$wine_url" -O "$wine_file"; then
-      echo ""
-      echo -e "${RED}❌ ERROR: Failed to download Wine source.${NC}"
-      cd - >/dev/null || exit 1
-      rm -rf "$temp_dir"
-      return 1
-    fi
-  elif command -v curl >/dev/null 2>&1; then
-    # curl --progress-bar shows a progress bar
-    if ! curl -L --progress-bar --fail -o "$wine_file" "$wine_url"; then
-      echo ""
-      echo -e "${RED}❌ ERROR: Failed to download Wine source.${NC}"
-      cd - >/dev/null || exit 1
-      rm -rf "$temp_dir"
-      return 1
-    fi
-    echo ""  # New line after curl progress bar
-  else
-    echo -e "${RED}❌ ERROR: Neither wget nor curl found. Please install one to download Wine source.${NC}"
-    cd - >/dev/null || exit 1
-    rm -rf "$temp_dir"
-    return 1
-  fi
-  
-  echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-  echo -e "${GREEN}✓${NC} Download complete!"
-  echo ""
-  
-  echo ""
-  echo -e "${CYAN}Extracting Wine source...${NC}"
-  if ! tar -xf "$wine_file"; then
-    echo -e "${RED}❌ ERROR: Failed to extract Wine source.${NC}"
-    cd - >/dev/null || exit 1
-    rm -rf "$temp_dir"
-    return 1
-  fi
-  
-  # Check what was extracted
-  echo -e "${CYAN}Checking extracted contents...${NC}"
-  ls -la
-  
-  # Move extracted directory to target location
-  if [ -d "$wine_dir" ]; then
-    # Always remove target directory if it exists (even if empty)
-    if [ -d "$download_dir" ]; then
-      echo -e "${YELLOW}Removing existing $download_dir...${NC}"
-      rm -rf "$download_dir"
-    fi
-    
-    # Ensure parent directory exists
-    mkdir -p "$(dirname "$download_dir")"
-    
-    # Move the wine directory to the target location
-    mv "$wine_dir" "$download_dir"
-    echo -e "${GREEN}✓${NC} Wine source extracted to: ${CYAN}$download_dir${NC}"
-    
-    # Verify the move worked and configure exists
-    if [ ! -d "$download_dir" ]; then
-      echo -e "${RED}❌ ERROR: Failed to move extracted directory to $download_dir${NC}"
-      cd - >/dev/null || exit 1
-      rm -rf "$temp_dir"
-      return 1
-    fi
-  else
-    echo -e "${RED}❌ ERROR: Extracted directory '$wine_dir' not found.${NC}"
-    echo -e "${YELLOW}Contents of extraction directory:${NC}"
-    ls -la
-    cd - >/dev/null || exit 1
-    rm -rf "$temp_dir"
-    return 1
-  fi
-  
-  # Cleanup temp directory
-  cd - >/dev/null || exit 1
-  rm -rf "$temp_dir"
-  
-  # Verify configure script exists (using absolute path)
-  if [ ! -f "$download_dir/configure" ]; then
-    # Check if we have a nested structure (wine-src/wine-X.X/)
-    local nested_dir=""
-    for possible_dir in "$download_dir"/wine-*; do
-      if [ -d "$possible_dir" ] && [ -f "$possible_dir/configure" ]; then
-        nested_dir="$possible_dir"
-        break
-      fi
-    done
-    
-    if [ -n "$nested_dir" ]; then
-      echo -e "${YELLOW}Found nested directory structure. Fixing...${NC}"
-      echo -e "${CYAN}Moving contents from $nested_dir to $download_dir...${NC}"
-      
-      # Create temp location
-      local temp_fix=$(mktemp -d)
-      mv "$download_dir"/* "$temp_fix/" 2>/dev/null
-      rm -rf "$download_dir"
-      mv "$temp_fix"/* "$download_dir/" 2>/dev/null
-      rmdir "$temp_fix"
-      
-      # Verify configure now exists
-      if [ -f "$download_dir/configure" ]; then
-        echo -e "${GREEN}✓${NC} Fixed nested structure. Configure script found."
-      else
-        echo -e "${RED}❌ ERROR: Still could not find configure script after fix attempt.${NC}"
-        return 1
-      fi
-    else
-      echo -e "${RED}❌ ERROR: configure script not found after extraction.${NC}"
-      echo -e "${YELLOW}Expected at: $download_dir/configure${NC}"
-      echo -e "${CYAN}Checking if directory exists:${NC}"
-      if [ -d "$download_dir" ]; then
-        echo -e "${YELLOW}Directory exists. Contents:${NC}"
-        ls -la "$download_dir" | head -20
-      else
-        echo -e "${RED}Directory does not exist: $download_dir${NC}"
-      fi
-      return 1
-    fi
-  fi
-  
-  echo -e "${GREEN}✓${NC} Configure script verified at: ${CYAN}$download_dir/configure${NC}"
-  
-  return 0
-}
+
 
 # Detect wine source directory or download it
 WINE_SRC_DIR=""
@@ -1777,9 +1834,9 @@ if ! check_freetype; then
   
   case "$PKG_MGR" in
     apt)
-      if ! check_package_installed_apt "libfreetype6-dev"; then
-        echo "  Installing libfreetype6-dev..."
-        sudo apt install -y libfreetype6-dev 2>/dev/null || true
+      if ! check_package_installed_apt "libfreetype-dev"; then
+        echo "  Installing libfreetype-dev..."
+        sudo apt install -y libfreetype-dev 2>/dev/null || true
       fi
       # Also ensure pkg-config is available
       if ! command -v pkg-config >/dev/null 2>&1; then
@@ -1814,7 +1871,7 @@ if ! check_freetype; then
         echo -e "  ${CYAN}sudo pacman -S freetype2${NC}"
         ;;
       apt)
-        echo -e "  ${CYAN}sudo apt install libfreetype6-dev pkg-config${NC}"
+        echo -e "  ${CYAN}sudo apt install libfreetype-dev pkg-config${NC}"
         ;;
     esac
     BUILD_FAILED=1
