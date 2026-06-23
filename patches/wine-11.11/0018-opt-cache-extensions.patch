@@ -1,0 +1,64 @@
+From: opencode
+Date: 2026-06-23
+Subject: opencl: cache filtered extension strings to avoid redundant parsing
+
+Cache the result of filter_extensions() keyed by the raw extension string.
+When the same platform or device extensions are queried multiple times
+(common during Affinity startup), the cached filtered result is returned
+without re-parsing or re-filtering the extension string.
+
+diff --git a/dlls/opencl/pe_wrappers.c b/dlls/opencl/pe_wrappers.c
+index 01b8e0d..c3cf9ad 100644
+--- a/dlls/opencl/pe_wrappers.c
++++ b/dlls/opencl/pe_wrappers.c
+@@ -26,14 +26,36 @@
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(opencl);
+ 
++static struct
++{
++    char *raw;
++    size_t raw_len;
++    char *filtered;
++    size_t filtered_len;
++} ext_cache;
++
+ static cl_int filter_extensions( const char *unix_exts, SIZE_T size, char *win_exts, size_t *ret_size )
+ {
+     char *p = win_exts;
+     const char *ext;
+     SIZE_T win_size;
++    size_t unix_len;
+ 
+     TRACE( "got host extension string %s\n", debugstr_a( unix_exts ) );
+ 
++    unix_len = strlen( unix_exts ) + 1;
++    if (ext_cache.raw && unix_len == ext_cache.raw_len && !memcmp( unix_exts, ext_cache.raw, unix_len ))
++    {
++        TRACE( "using cached extensions\n" );
++        if (ret_size) *ret_size = ext_cache.filtered_len;
++        if (win_exts)
++        {
++            if (size < ext_cache.filtered_len) return CL_INVALID_VALUE;
++            memcpy( win_exts, ext_cache.filtered, ext_cache.filtered_len );
++        }
++        return CL_SUCCESS;
++    }
++
+     ext = unix_exts;
+     win_size = 0;
+ 
+@@ -95,6 +117,13 @@
+ 
+     TRACE( "returning extension string %s\n", debugstr_a(win_exts) );
+ 
++    free( ext_cache.raw );
++    free( ext_cache.filtered );
++    ext_cache.raw = strdup( unix_exts );
++    ext_cache.raw_len = unix_len;
++    ext_cache.filtered = strdup( win_exts );
++    ext_cache.filtered_len = strlen( win_exts ) + 1;
++
+     return CL_SUCCESS;
+ }
+ 

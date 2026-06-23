@@ -1,0 +1,47 @@
+From: opencode
+Date: 2026-06-23
+Subject: opencl: add LUID-based device matching and GPU-only enumeration
+
+Adds fast LUID-based device comparison (via CL_DEVICE_LUID_KHR from
+cl_khr_device_uuid extension) as the first matching attempt, before
+falling back to vendor ID. Also queries CL_DEVICE_TYPE_GPU instead of
+CL_DEVICE_TYPE_ALL to avoid enumerating CPU/accelerator devices.
+
+diff --git a/dlls/opencl/cl_khr_d3d10_sharing.c b/dlls/opencl/cl_khr_d3d10_sharing.c
+index a863e1d..582fd24 100644
+--- a/dlls/opencl/cl_khr_d3d10_sharing.c
++++ b/dlls/opencl/cl_khr_d3d10_sharing.c
+@@ -31,7 +31,23 @@
+     }
+     IUnknown_Release(this);
+ 
+-    /* First try vendor ID matching (most reliable) */
++    /* Try LUID comparison first (fast, available on NVIDIA/Intel). */
++    {
++        BYTE luid_buf[sizeof(LUID)];
++        params.device = cl_device;
++        params.param_name = CL_DEVICE_LUID_KHR;
++        params.param_value = luid_buf;
++        params.param_value_size = sizeof(luid_buf);
++        params.param_value_size_ret = NULL;
++        if (!OPENCL_CALL( clGetDeviceInfo, &params ))
++        {
++            *result = !memcmp( luid_buf, &info.AdapterLuid, sizeof(LUID) );
++            TRACE("LUID match: result=%d\n", *result);
++            if (*result) return CL_SUCCESS;
++        }
++    }
++
++    /* Next try vendor ID matching */
+     {
+         cl_int vid;
+         params.device = cl_device;
+@@ -101,7 +117,7 @@
+ 
+ 
+     ids_params.platform = platform;
+-    ids_params.device_type = CL_DEVICE_TYPE_ALL;
++    ids_params.device_type = CL_DEVICE_TYPE_GPU;
+     ids_params.num_devices = &ids_params.num_entries;
+     ids_params.num_entries = 0;
+     ids_params.devices = NULL;

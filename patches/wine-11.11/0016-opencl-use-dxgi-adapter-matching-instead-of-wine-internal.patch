@@ -15,7 +15,7 @@ diff --git a/dlls/opencl/cl_khr_d3d10_sharing.c b/dlls/opencl/cl_khr_d3d10_shari
 index 737afce..a863e1d 100644
 --- a/dlls/opencl/cl_khr_d3d10_sharing.c
 +++ b/dlls/opencl/cl_khr_d3d10_sharing.c
-@@ -6,48 +6,76 @@
+@@ -6,48 +6,79 @@
  #define COBJMACROS
  #include "objbase.h"
  #include "initguid.h"
@@ -34,6 +34,7 @@ index 737afce..a863e1d 100644
 +    IDXGIAdapter *this;
 +    DXGI_ADAPTER_DESC info;
 +    WCHAR *cl_name;
++    size_t name_size;
      struct clGetDeviceInfo_params params;
  
 -    /*
@@ -70,7 +71,7 @@ index 737afce..a863e1d 100644
 +        params.param_value_size_ret = NULL;
 +        if (!(err = OPENCL_CALL( clGetDeviceInfo, &params ))) {
 +            *result = (vid == (cl_int)info.VendorId);
-+            TRACE("vendor ID match: cl_vid=%ld dxgi_vendor=0x%04x result=%d\n", vid, info.VendorId, *result);
++            TRACE("vendor ID match: cl_vid=%d dxgi_vendor=0x%04x result=%d\n", vid, info.VendorId, *result);
 +            if (*result) return CL_SUCCESS;
 +        }
 +    }
@@ -79,11 +80,13 @@ index 737afce..a863e1d 100644
 +    params.param_name = CL_DEVICE_NAME;
 +    params.param_value = NULL;
 +    params.param_value_size = 0;
-+    params.param_value_size_ret = &params.param_value_size;
++    params.param_value_size_ret = &name_size;
 +    if ((err = OPENCL_CALL( clGetDeviceInfo, &params ))) {
 +        ERR("Error getting device name of %p; %d.\n", cl_device, err);
 +        return err;
 +    }
++
++    params.param_value_size = name_size;
 +
 +    if (!(params.param_value = calloc(params.param_value_size+1, 1)))
 +        return CL_OUT_OF_HOST_MEMORY;

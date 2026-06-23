@@ -1,0 +1,35 @@
+From 141ccb5f45f97ba12df848671244b9948ca197c5 Mon Sep 17 00:00:00 2001
+From: Arecsu <alejandro9r@gmail.com>
+Date: Fri, 27 Mar 2026 19:32:40 -0300
+Subject: [PATCH 2/5] d2d1: stub Widen with empty geometry to prevent caller
+ freeze
+
+Return S_OK with an empty closed sink instead of E_NOTIMPL.
+Affinity hangs indefinitely when Widen returns E_NOTIMPL on a
+stroked path geometry (e.g. clicking a stroked SVG vector).
+Stroke rendering will be absent but the app remains usable.
+---
+ dlls/d2d1/geometry.c | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/dlls/d2d1/geometry.c b/dlls/d2d1/geometry.c
+index 68de4c2..cab7bb7 100644
+--- a/dlls/d2d1/geometry.c
++++ b/dlls/d2d1/geometry.c
+@@ -4457,7 +4457,12 @@ static HRESULT STDMETHODCALLTYPE d2d_path_geometry_Widen(ID2D1PathGeometry1 *ifa
+     FIXME("iface %p, stroke_width %.8e, stroke_style %p, transform %p, tolerance %.8e, sink %p stub!\n",
+             iface, stroke_width, stroke_style, transform, tolerance, sink);
+ 
+-    return E_NOTIMPL;
++    /* Return an empty geometry instead of E_NOTIMPL to prevent callers from
++     * hanging indefinitely waiting for a valid result. Stroke rendering will
++     * be missing but the application remains usable. */
++    ID2D1SimplifiedGeometrySink_SetFillMode(sink, D2D1_FILL_MODE_WINDING);
++    ID2D1SimplifiedGeometrySink_Close(sink);
++    return S_OK;
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE d2d_path_geometry_Open(ID2D1PathGeometry1 *iface, ID2D1GeometrySink **sink)
+-- 
+2.53.0
+
