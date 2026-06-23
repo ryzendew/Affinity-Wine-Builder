@@ -14,11 +14,6 @@ jobs:
     steps:
       - checkout
 
-      - restore_cache:
-          keys:
-            - wine-source-v1-{{ .Branch }}
-            - wine-source-v1
-
       - run:
           name: Install build dependencies
           command: |
@@ -42,14 +37,22 @@ jobs:
             ./Build-Wine-11.11.sh
           no_output_timeout: 2h
 
-      - save_cache:
-          key: wine-source-v1-{{ .Branch }}
-          paths:
-            - wine-11.11/
+      - run:
+          name: Collect build logs
+          command: |
+            mkdir -p /tmp/build-logs
+            cp wine64-build/*.log /tmp/build-logs/ 2>/dev/null || true
+          when: always
 
       - store_artifacts:
           path: ElementalWarrior-wine-11.11.tar.xz
           destination: /
+          when: on_success
+
+      - store_artifacts:
+          path: /tmp/build-logs
+          destination: build-logs
+          when: on_fail
 
 workflows:
   version: 2.1
