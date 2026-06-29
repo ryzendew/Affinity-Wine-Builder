@@ -1,4 +1,4 @@
-name: Build Wine 11.11
+name: Build Wine 11.12
 
 on:
   push:
@@ -78,9 +78,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.ccache
-          key: ${{ runner.os }}-ccache-wine-11.11-${{ hashFiles('patches/wine-11.11/*.patch', 'Build-Wine-11.11.sh') }}
+          key: ${{ runner.os }}-ccache-wine-11.12-${{ hashFiles('patches/wine-11.12/*.patch', 'Build-Wine-11.12.sh') }}
           restore-keys: |
-            ${{ runner.os }}-ccache-wine-11.11-
+            ${{ runner.os }}-ccache-wine-11.12-
 
       - name: Configure ccache
         run: |
@@ -133,23 +133,23 @@ jobs:
           echo "CROSSCFLAGS=-O2 -std=gnu17 -pipe -Wno-discarded-qualifiers -Wno-format -Wno-maybe-uninitialized -Wno-misleading-indentation" >> $GITHUB_ENV
           echo "CROSSCXXFLAGS=-O2 -std=gnu17 -pipe -Wno-discarded-qualifiers -Wno-format -Wno-maybe-uninitialized -Wno-misleading-indentation" >> $GITHUB_ENV
           echo "CROSSLDFLAGS=-Wl,-O1" >> $GITHUB_ENV
-          echo "INSTALL_PREFIX=${{ github.workspace }}/ElementalWarrior-wine-11.11" >> $GITHUB_ENV
+          echo "INSTALL_PREFIX=${{ github.workspace }}/ElementalWarrior-wine-11.12" >> $GITHUB_ENV
           echo "CC=ccache gcc" >> $GITHUB_ENV
           echo "CXX=ccache g++" >> $GITHUB_ENV
           echo "PKG_CONFIG_PATH=/usr/lib64/pkgconfig:/usr/lib/pkgconfig:/usr/share/pkgconfig" >> $GITHUB_ENV
 
       - name: Make script executable
         run: |
-          chmod +x Build-Wine-11.11.sh
-          echo "✓ Build-Wine-11.11.sh is executable"
+          chmod +x Build-Wine-11.12.sh
+          echo "✓ Build-Wine-11.12.sh is executable"
 
-      - name: Build Wine 11.11
+      - name: Build Wine 11.12
         env:
           CC: ccache gcc
           CXX: ccache g++
         run: |
-          echo "Running Build-Wine-11.11.sh..."
-          ./Build-Wine-11.11.sh || {
+          echo "Running Build-Wine-11.12.sh..."
+          ./Build-Wine-11.12.sh || {
             echo "❌ Build failed! Checking for error logs..."
             if [ -f "wine64-build/configure.log" ]; then
               echo "=== Configure log ==="
@@ -217,7 +217,7 @@ jobs:
 
       - name: Verify package exists
         run: |
-          PACKAGE_NAME="ElementalWarrior-wine-11.11.tar.xz"
+          PACKAGE_NAME="ElementalWarrior-wine-11.12.tar.xz"
           if [ ! -f "$PACKAGE_NAME" ]; then
             echo "❌ ERROR: Package $PACKAGE_NAME not found!"
             exit 1
@@ -241,8 +241,8 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ElementalWarrior-wine-11.11
-          path: ${{ github.workspace }}/ElementalWarrior-wine-11.11.tar.xz
+          name: ElementalWarrior-wine-11.12
+          path: ${{ github.workspace }}/ElementalWarrior-wine-11.12.tar.xz
           retention-days: 30
 
       - name: Build summary
@@ -256,6 +256,6 @@ jobs:
           fi
           echo "=========================================="
           echo ""
-          echo "Artifact: ElementalWarrior-wine-11.11.tar.xz"
+          echo "Artifact: ElementalWarrior-wine-11.12.tar.xz"
           echo "Installation prefix: $INSTALL_PREFIX"
           echo ""

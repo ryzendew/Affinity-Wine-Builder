@@ -58,9 +58,9 @@ jobs:
             fi
 
       - run:
-          name: Build Wine 11.11
+          name: Build Wine 11.12
           command: |
-            ./Build-Wine-11.11.sh
+            ./Build-Wine-11.12.sh
           no_output_timeout: 2h
 
       - run:
@@ -71,7 +71,7 @@ jobs:
           when: always
 
       - store_artifacts:
-          path: ElementalWarrior-wine-11.11.tar.xz
+          path: ElementalWarrior-wine-11.12.tar.xz
           destination: /
           when: on_success
 

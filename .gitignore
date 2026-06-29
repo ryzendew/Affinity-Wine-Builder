@@ -1,7 +1,11 @@
 # Wine build directories
-wine64-build/
-wine-src/
-wine32-build/
+/wine64-build
+/wine-src
+/wine32-build
+/wine-src-clean
+/wine-src-test
+/wine-src-test-baseline
+/wine-src-test-patches
 
 # Build logs
 *.log
@@ -23,3 +27,4 @@ Affinity.log
 
 
 wine-11.0.tar.xz
+.vscode/settings.json

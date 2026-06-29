@@ -1,0 +1,20 @@
+
+Fix sizeof(&desc.AdapterLuid) to sizeof(desc.AdapterLuid) in adapter.c
+
+sizeof(&desc.AdapterLuid) takes the size of a pointer (LUID*) which is
+8 bytes on x86_64, instead of sizeof(LUID) which is also 8 bytes due to
+LUID being {DWORD LowPart; LONG HighPart}. This is benign on x86_64 but
+incorrect on x86 where sizeof(LUID*) is 4 while sizeof(LUID) is 8.
+
+diff -uNarp a/dlls/dxcore/adapter.c b/dlls/dxcore/adapter.c
+--- a/dlls/dxcore/adapter.c	2026-06-22 23:56:19.630591161 -0300
++++ b/dlls/dxcore/adapter.c	2026-06-22 23:56:23.024641305 -0300
+@@ -21,7 +21,7 @@ HRESULT dxcore_adapter_pInstanceLuid(str
+     if (FAILED(hr))
+         return hr;
+ 
+-    memcpy(buffer, (void*)&desc.AdapterLuid, sizeof(&desc.AdapterLuid));
++    memcpy(buffer, (void*)&desc.AdapterLuid, sizeof(desc.AdapterLuid));
+     return S_OK;
+ }
+ HRESULT dxcore_adapter_pDriverVersion(struct dxcore_adapter *this, size_t lenBuffer, void *buffer) {

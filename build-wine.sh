@@ -613,6 +613,8 @@ download_wine_source() {
   local wine_url="https://dl.winehq.org/wine/source/$url_subdir/wine-${version}.tar.xz"
   local wine_file="wine-${version}.tar.xz"
   local wine_dir="wine-${version}"
+  local script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  local archive_path="$script_dir/$wine_file"
   
   if [ -d "$download_dir" ] && [ -f "$download_dir/configure" ]; then
     echo "Wine source already exists at: $download_dir"
@@ -633,40 +635,49 @@ download_wine_source() {
   local temp_dir=$(mktemp -d)
   cd "$temp_dir" || exit 1
   
-  echo ""
-  echo -e "${CYAN}${BOLD}Downloading Wine $version...${NC}"
-  echo -e "${BLUE}URL: ${NC}$wine_url"
-  echo ""
-  echo -e "${CYAN}Download progress:${NC}"
-  echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-  
-  if command -v wget >/dev/null 2>&1; then
-    if ! wget --progress=bar:force:noscroll "$wine_url" -O "$wine_file"; then
-      echo ""
-      echo -e "${RED}❌ ERROR: Failed to download Wine source.${NC}"
-      cd - >/dev/null || exit 1
-      rm -rf "$temp_dir"
-      return 1
-    fi
-  elif command -v curl >/dev/null 2>&1; then
-    if ! curl -L --progress-bar --fail -o "$wine_file" "$wine_url"; then
-      echo ""
-      echo -e "${RED}❌ ERROR: Failed to download Wine source.${NC}"
-      cd - >/dev/null || exit 1
-      rm -rf "$temp_dir"
-      return 1
-    fi
-    echo ""
+  if [ -f "$archive_path" ]; then
+    echo -e "${GREEN}✓${NC} Found cached archive: ${CYAN}$archive_path${NC}"
+    echo -e "${CYAN}Using cached archive instead of downloading.${NC}"
+    cp "$archive_path" "$wine_file"
   else
-    echo -e "${RED}❌ ERROR: Neither wget nor curl found. Please install one to download Wine source.${NC}"
-    cd - >/dev/null || exit 1
-    rm -rf "$temp_dir"
-    return 1
+    echo ""
+    echo -e "${CYAN}${BOLD}Downloading Wine $version...${NC}"
+    echo -e "${BLUE}URL: ${NC}$wine_url"
+    echo ""
+    echo -e "${CYAN}Download progress:${NC}"
+    echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    
+    if command -v wget >/dev/null 2>&1; then
+      if ! wget --progress=bar:force:noscroll "$wine_url" -O "$wine_file"; then
+        echo ""
+        echo -e "${RED}❌ ERROR: Failed to download Wine source.${NC}"
+        cd - >/dev/null || exit 1
+        rm -rf "$temp_dir"
+        return 1
+      fi
+    elif command -v curl >/dev/null 2>&1; then
+      if ! curl -L --progress-bar --fail -o "$wine_file" "$wine_url"; then
+        echo ""
+        echo -e "${RED}❌ ERROR: Failed to download Wine source.${NC}"
+        cd - >/dev/null || exit 1
+        rm -rf "$temp_dir"
+        return 1
+      fi
+      echo ""
+    else
+      echo -e "${RED}❌ ERROR: Neither wget nor curl found. Please install one to download Wine source.${NC}"
+      cd - >/dev/null || exit 1
+      rm -rf "$temp_dir"
+      return 1
+    fi
+    
+    echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${GREEN}✓${NC} Download complete!"
+    echo ""
+    
+    cp "$wine_file" "$archive_path"
+    echo -e "${GREEN}✓${NC} Archive cached to: ${CYAN}$archive_path${NC}"
   fi
-  
-  echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-  echo -e "${GREEN}✓${NC} Download complete!"
-  echo ""
   
   echo ""
   echo -e "${CYAN}Extracting Wine source...${NC}"
@@ -844,11 +855,18 @@ install_packages_64bit() {
         sudo apt update 2>/dev/null || true
       fi
       
-      # First, try to use apt build-dep which automatically installs all build dependencies
-      # This works on Ubuntu, Debian, Mint, Zorin and other Debian-based distros
-      echo -e "${CYAN}Attempting to install Wine build dependencies using 'apt build-dep wine'...${NC}"
-      if sudo apt build-dep -y wine 2>/dev/null; then
-        echo -e "  ${GREEN}✓${NC} Wine build dependencies installed via build-dep"
+      # Quick check: if common build deps are already installed, skip the full check
+      if check_package_installed_apt "build-essential" && \
+         check_package_installed_apt "libfreetype-dev" && \
+         check_package_installed_apt "libx11-dev" && \
+         check_package_installed_apt "libgl-dev"; then
+        echo -e "  ${GREEN}✓${NC} Core build dependencies appear to be installed already"
+      else
+        # First, try to use apt build-dep which automatically installs all build dependencies
+        # This works on Ubuntu, Debian, Mint, Zorin and other Debian-based distros
+        echo -e "${CYAN}Attempting to install Wine build dependencies using 'apt build-dep wine'...${NC}"
+        if sudo apt build-dep -y wine 2>/dev/null; then
+          echo -e "  ${GREEN}✓${NC} Wine build dependencies installed via build-dep"
         # Still need to ensure MinGW cross-compiler is installed
         if ! check_package_installed_apt "gcc-mingw-w64"; then
           echo -e "${CYAN}  Installing MinGW cross-compiler...${NC}"
@@ -1087,59 +1105,56 @@ install_packages_64bit() {
           echo -e "${YELLOW}Total packages to install: ${#packages_to_install[@]}${NC}"
           echo ""
           
-          if ! prompt_yes_no "Do you want to install these dependencies now? (sudo required)" "y"; then
-            echo -e "${RED}Dependency installation cancelled. Cannot proceed without dependencies.${NC}"
-            exit 1
-          fi
-          
-          echo ""
-          echo -e "${CYAN}Installing packages...${NC}"
-          local failed_packages=()
-          local skipped_packages=()
-          for pkg in "${packages_to_install[@]}"; do
-            # Check if the package actually exists in apt's package lists before trying to install
-            # Strip :i386 suffix for apt-cache check, then re-add for install
-            local pkg_base="${pkg%%:*}"
-            local pkg_arch="${pkg#*:}"
-            local apt_check_name="$pkg_base"
-            if [ "$pkg_arch" != "$pkg_base" ]; then
-              apt_check_name="${pkg_base}:${pkg_arch}"
-            fi
-            if apt-cache show "$pkg_base" >/dev/null 2>&1; then
-              if ! sudo apt install -y "$pkg" >/dev/null 2>&1; then
-                # Retry with --fix-missing in case of partial state
-                if ! sudo apt install -y --fix-missing "$pkg" >/dev/null 2>&1; then
-                  failed_packages+=("$pkg")
-                  echo -e "  ${YELLOW}⚠${NC} $pkg ${YELLOW}(failed to install)${NC}"
+          if prompt_yes_no "Do you want to install these dependencies now? (sudo required)" "y"; then
+            echo ""
+            echo -e "${CYAN}Installing packages...${NC}"
+            local failed_packages=()
+            local skipped_packages=()
+            for pkg in "${packages_to_install[@]}"; do
+              local pkg_base="${pkg%%:*}"
+              local pkg_arch="${pkg#*:}"
+              local apt_check_name="$pkg_base"
+              if [ "$pkg_arch" != "$pkg_base" ]; then
+                apt_check_name="${pkg_base}:${pkg_arch}"
+              fi
+              if apt-cache show "$pkg_base" >/dev/null 2>&1; then
+                if ! sudo apt install -y "$pkg" >/dev/null 2>&1; then
+                  if ! sudo apt install -y --fix-missing "$pkg" >/dev/null 2>&1; then
+                    failed_packages+=("$pkg")
+                    echo -e "  ${YELLOW}⚠${NC} $pkg ${YELLOW}(failed to install)${NC}"
+                  else
+                    echo -e "  ${GREEN}✓${NC} $pkg ${GREEN}(installed)${NC}"
+                  fi
                 else
                   echo -e "  ${GREEN}✓${NC} $pkg ${GREEN}(installed)${NC}"
                 fi
               else
-                echo -e "  ${GREEN}✓${NC} $pkg ${GREEN}(installed)${NC}"
+                skipped_packages+=("$pkg")
+                echo -e "  ${YELLOW}↷${NC} $pkg ${YELLOW}(not available on this distro, skipping)${NC}"
               fi
-            else
-              skipped_packages+=("$pkg")
-              echo -e "  ${YELLOW}↷${NC} $pkg ${YELLOW}(not available on this distro, skipping)${NC}"
+            done
+            echo ""
+            if [ ${#failed_packages[@]} -gt 0 ]; then
+              echo -e "${YELLOW}⚠ The following packages failed to install (may affect optional features):${NC}"
+              for pkg in "${failed_packages[@]}"; do
+                echo -e "  ${YELLOW}- $pkg${NC}"
+              done
             fi
-          done
-          echo ""
-          if [ ${#failed_packages[@]} -gt 0 ]; then
-            echo -e "${YELLOW}⚠ The following packages failed to install (may affect optional features):${NC}"
-            for pkg in "${failed_packages[@]}"; do
-              echo -e "  ${YELLOW}- $pkg${NC}"
-            done
+            if [ ${#skipped_packages[@]} -gt 0 ]; then
+              echo -e "${CYAN}ℹ The following packages are not available on this distro (normal):${NC}"
+              for pkg in "${skipped_packages[@]}"; do
+                echo -e "  ${CYAN}- $pkg${NC}"
+              done
+            fi
+            echo -e "${GREEN}✓ Package installation completed${NC}"
+          else
+            echo -e "${YELLOW}⚠ Skipped installing ${#packages_to_install[@]} missing packages. Build may fail without them.${NC}"
           fi
-          if [ ${#skipped_packages[@]} -gt 0 ]; then
-            echo -e "${CYAN}ℹ The following packages are not available on this distro (normal):${NC}"
-            for pkg in "${skipped_packages[@]}"; do
-              echo -e "  ${CYAN}- $pkg${NC}"
-            done
-          fi
-          echo -e "${GREEN}✓ Package installation completed${NC}"
         else
           echo ""
           echo -e "${GREEN}${BOLD}✓ All required packages are already installed${NC}"
         fi
+      fi
       fi
       ;;
     dnf)
@@ -1530,39 +1545,9 @@ BUILD_FAILED=0
 # Store original directory for cleanup
 ORIGINAL_DIR="$(pwd)"
 
-# Cleanup function for build failures
+# Cleanup function for build failures (disabled for debugging)
 cleanup_on_failure() {
-  if [ "${BUILD_FAILED:-0}" = "1" ]; then
-    echo ""
-    echo -e "${YELLOW}${BOLD}Cleaning up build directories...${NC}"
-    
-    # Return to original directory
-    cd "$ORIGINAL_DIR" 2>/dev/null || true
-    
-    # Remove wine64-build directory
-    if [ -d "wine64-build" ]; then
-      echo -e "${YELLOW}  Removing wine64-build directory...${NC}"
-      rm -rf wine64-build
-      echo -e "${GREEN}  ✓ wine64-build removed${NC}"
-    fi
-    
-    # Remove wine-src directory
-    if [ -d "wine-src" ]; then
-      echo -e "${YELLOW}  Removing wine-src directory...${NC}"
-      rm -rf wine-src
-      echo -e "${GREEN}  ✓ wine-src removed${NC}"
-    fi
-    
-    # Also check parent directory for wine-src
-    if [ -d "../wine-src" ]; then
-      echo -e "${YELLOW}  Removing ../wine-src directory...${NC}"
-      rm -rf ../wine-src
-      echo -e "${GREEN}  ✓ ../wine-src removed${NC}"
-    fi
-    
-    echo -e "${GREEN}${BOLD}✓ Cleanup complete${NC}"
-    echo ""
-  fi
+  echo -e "${YELLOW}Cleanup disabled for debugging - preserving build directories.${NC}"
 }
 
 # Apply patches before building

@@ -1,0 +1,65 @@
+From 908477da2a47795e52dee93c0d49a5c0c3757967 Mon Sep 17 00:00:00 2001
+From: Arecsu <alejandro9r@gmail.com>
+Date: Sat, 28 Mar 2026 23:28:57 -0300
+Subject: [PATCH] d2d1: Fix collinear outline join placing vertices 25 units
+ away on smooth continuations.
+
+When two adjacent outline segments are collinear (ccw == 0), the existing
+code unconditionally places join vertices 25 units away from the join
+point.  This is correct for hairpin reversals (where prev and next point
+in the same direction) but produces visible spikes on smooth curve
+continuations (where prev and next point in opposite directions).
+
+Check the dot product of the prev and next direction vectors to
+distinguish the two cases.  For smooth continuations (dot < 0), emit a
+flat join with all vertices at the join point instead.
+
+This fixes erroneous lines appearing at path corners when viewing
+converted-to-curves shapes at zoomed-out levels.
+---
+ dlls/d2d1/geometry.c | 29 +++++++++++++++++++++++------
+ 1 file changed, 23 insertions(+), 6 deletions(-)
+
+diff --git a/dlls/d2d1/geometry.c b/dlls/d2d1/geometry.c
+index 1c80895..1dc8669 100644
+--- a/dlls/d2d1/geometry.c
++++ b/dlls/d2d1/geometry.c
+@@ -3043,12 +3043,29 @@ static BOOL d2d_geometry_outline_add_join(struct d2d_geometry *geometry,
+     ccw = d2d_point_ccw(&origin, prev, next);
+     if (ccw == 0.0f)
+     {
+-        d2d_outline_vertex_set(&v[0], p0->x, p0->y, -prev->x, -prev->y, -prev->x, -prev->y);
+-        d2d_outline_vertex_set(&v[1], p0->x, p0->y,  prev->x,  prev->y,  prev->x,  prev->y);
+-        d2d_outline_vertex_set(&v[2], p0->x + 25.0f * -prev->x, p0->y + 25.0f * -prev->y,
+-                 prev->x,  prev->y,  prev->x,  prev->y);
+-        d2d_outline_vertex_set(&v[3], p0->x + 25.0f * -prev->x, p0->y + 25.0f * -prev->y,
+-                -prev->x, -prev->y, -prev->x, -prev->y);
++        float dot = prev->x * next->x + prev->y * next->y;
++
++        if (dot >= 0.0f)
++        {
++            /* Hairpin: prev and next point in the same direction (reversal).
++             * Place cap vertices 25 units away. */
++            d2d_outline_vertex_set(&v[0], p0->x, p0->y, -prev->x, -prev->y, -prev->x, -prev->y);
++            d2d_outline_vertex_set(&v[1], p0->x, p0->y,  prev->x,  prev->y,  prev->x,  prev->y);
++            d2d_outline_vertex_set(&v[2], p0->x + 25.0f * -prev->x, p0->y + 25.0f * -prev->y,
++                     prev->x,  prev->y,  prev->x,  prev->y);
++            d2d_outline_vertex_set(&v[3], p0->x + 25.0f * -prev->x, p0->y + 25.0f * -prev->y,
++                    -prev->x, -prev->y, -prev->x, -prev->y);
++        }
++        else
++        {
++            /* Smooth continuation: prev and next point in opposite directions.
++             * Use a flat join — the perpendicular direction is the same on
++             * both sides, so the outline segments already meet cleanly. */
++            d2d_outline_vertex_set(&v[0], p0->x, p0->y,  prev->x,  prev->y,  prev->x,  prev->y);
++            d2d_outline_vertex_set(&v[1], p0->x, p0->y, -prev->x, -prev->y, -prev->x, -prev->y);
++            d2d_outline_vertex_set(&v[2], p0->x, p0->y,  prev->x,  prev->y,  prev->x,  prev->y);
++            d2d_outline_vertex_set(&v[3], p0->x, p0->y, -prev->x, -prev->y, -prev->x, -prev->y);
++        }
+     }
+     else if (ccw < 0.0f)
+     {
+-- 
+2.53.0
+
