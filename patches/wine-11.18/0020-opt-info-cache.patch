@@ -1,0 +1,171 @@
+From: ryzendew
+Date: 2026-06-23
+Subject: Cache CL_PLATFORM_EXTENSIONS and CL_DEVICE_EXTENSIONS info queries
+
+Adds a linked-list info cache for device/platform info queries to avoid
+redundant PE-to-unix thunk calls and extension filtering on every call
+to clGetPlatformInfo / clGetDeviceInfo.
+
+diff -uNarp a/dlls/opencl/pe_wrappers.c b/dlls/opencl/pe_wrappers.c
+--- a/dlls/opencl/pe_wrappers.c	2026-06-23 04:47:33.459296764 -0300
++++ b/dlls/opencl/pe_wrappers.c	2026-06-23 04:47:33.460106109 -0300
+@@ -38,7 +38,10 @@
+     char *filtered;
+     size_t filtered_len;
+ } ext_cache;
+ 
++static void *info_cache_find( void *object, cl_uint name, int is_platform, size_t *out_size );
++static void info_cache_store( void *object, cl_uint name, int is_platform, const void *data, size_t size );
++
+ static cl_int filter_extensions( const char *unix_exts, SIZE_T size, char *win_exts, size_t *ret_size )
+ {
+     char *p = win_exts;
+@@ -143,8 +143,22 @@ cl_int WINAPI clGetPlatformInfo( cl_plat
+     {
+         size_t unix_size;
+         char *unix_exts;
++        size_t cached_size;
++        void *cached = info_cache_find( platform, name, TRUE, &cached_size );
+         struct clGetPlatformInfo_params params = { platform, name, 0, NULL, &unix_size };
+ 
++        if (cached)
++        {
++            TRACE( "returning cached platform extensions\n" );
++            if (ret_size) *ret_size = cached_size;
++            if (value)
++            {
++                if (size < cached_size) return CL_INVALID_VALUE;
++                memcpy( value, cached, cached_size );
++            }
++            return CL_SUCCESS;
++        }
++
+         ret = OPENCL_CALL( clGetPlatformInfo, &params );
+         if (ret != CL_SUCCESS)
+             return ret;
+@@ -164,6 +178,13 @@ cl_int WINAPI clGetPlatformInfo( cl_plat
+         ret = filter_extensions( unix_exts, size, value, ret_size );
+ 
+         free( unix_exts );
++
++        if (ret == CL_SUCCESS && value)
++        {
++            if (ret_size) info_cache_store( platform, name, TRUE, value, *ret_size );
++        }
++
++        return ret;
+     }
+     else
+     {
+@@ -186,8 +207,22 @@ cl_int WINAPI clGetDeviceInfo( cl_device
+     {
+         size_t unix_size;
+         char *unix_exts;
++        size_t cached_size;
++        void *cached = info_cache_find( device, name, FALSE, &cached_size );
+         struct clGetDeviceInfo_params params = { device, name, 0, NULL, &unix_size };
+ 
++        if (cached)
++        {
++            TRACE( "returning cached device extensions\n" );
++            if (ret_size) *ret_size = cached_size;
++            if (value)
++            {
++                if (size < cached_size) return CL_INVALID_VALUE;
++                memcpy( value, cached, cached_size );
++            }
++            return CL_SUCCESS;
++        }
++
+         ret = OPENCL_CALL( clGetDeviceInfo, &params );
+         if (ret != CL_SUCCESS)
+             return ret;
+@@ -207,13 +242,42 @@ cl_int WINAPI clGetDeviceInfo( cl_device
+         ret = filter_extensions( unix_exts, size, value, ret_size );
+ 
+         free( unix_exts );
++
++        if (ret == CL_SUCCESS && value)
++        {
++            if (ret_size) info_cache_store( device, name, FALSE, value, *ret_size );
++        }
++
++        return ret;
+     }
+-    else
++
++    {
++        size_t cached_size;
++        void *cached = info_cache_find( device, name, FALSE, &cached_size );
++        if (cached)
++        {
++            TRACE( "returning cached device info %#x\n", name );
++            if (ret_size) *ret_size = cached_size;
++            if (value)
++            {
++                if (size < cached_size) return CL_INVALID_VALUE;
++                memcpy( value, cached, cached_size );
++            }
++            return CL_SUCCESS;
++        }
++    }
++
++    if (name != CL_DEVICE_EXTENSIONS)
+     {
+         struct clGetDeviceInfo_params params = { device, name, size, value, ret_size };
+         ret = OPENCL_CALL( clGetDeviceInfo, &params );
+     }
+ 
++    if (ret == CL_SUCCESS && value && name != CL_DEVICE_EXTENSIONS)
++    {
++        if (ret_size) info_cache_store( device, name, FALSE, value, *ret_size );
++    }
++
+     /* Filter out the CL_EXEC_NATIVE_KERNEL flag */
+     if (name == CL_DEVICE_EXECUTION_CAPABILITIES)
+     {
+@@ -353,3 +417,44 @@ BOOL WINAPI DllMain( HINSTANCE instance,
+     }
+     return TRUE;
+ }
++
++struct info_cache_entry
++{
++    struct info_cache_entry *next;
++    void *object;
++    cl_uint name;
++    int is_platform;
++    size_t size;
++    char data[1];
++};
++
++static struct info_cache_entry *info_cache_head;
++
++static void *info_cache_find( void *object, cl_uint name, int is_platform, size_t *out_size )
++{
++    struct info_cache_entry *entry = info_cache_head;
++    while (entry)
++    {
++        if (entry->object == object && entry->name == name && entry->is_platform == is_platform)
++        {
++            *out_size = entry->size;
++            return entry->data;
++        }
++        entry = entry->next;
++    }
++    return NULL;
++}
++
++static void info_cache_store( void *object, cl_uint name, int is_platform, const void *data, size_t size )
++{
++    struct info_cache_entry *entry = HeapAlloc( GetProcessHeap(), 0, sizeof(*entry) + size );
++    if (!entry) return;
++    entry->object = object;
++    entry->name = name;
++    entry->is_platform = is_platform;
++    entry->size = size;
++    memcpy( entry->data, data, size );
++    entry->next = info_cache_head;
++    info_cache_head = entry;
++}
++

@@ -1,0 +1,100 @@
+server: do not treat the desktop window as a foreground process.
+
+A Wine application cannot bring its own window to the front once the input
+focus has moved to a window that does not belong to Wine. SetForegroundWindow
+returns 0 and sets ERROR_ACCESS_DENIED. Under a compositor this is every
+file-manager double-click: the user is in Dolphin, the running application is
+asked to open a document, and it cannot come forward to show it.
+
+The denial comes from the foreground permission check in
+req_set_foreground_window:
+
+    if (!is_current_process_foreground( desktop ) && queue->input &&
+        desktop->foreground_input &&
+        queue->input->user_time < desktop->foreground_input->user_time)
+        set_error( STATUS_ACCESS_DENIED );
+
+When the focus leaves Wine, the graphics driver makes the desktop window the
+foreground window -- on X11 through the _NET_ACTIVE_WINDOW tracking in
+WM_WINE_WINDOW_STATE_CHANGED, which calls set_foreground_window(..., internal).
+set_foreground_input then records the desktop's owner, explorer.exe, as
+desktop->foreground_pid and stamps its thread input with the current time.
+
+Both are wrong. explorer.exe was not activated and received no user input; the
+focus merely left Wine altogether. But the effect is that every other process
+now fails is_current_process_foreground(), and every user_time in the desktop
+is older than the stamp that was just written, so the check denies everyone --
+including the application the user was working in a moment earlier.
+
+The request path already gets this right: when a non-internal request targets
+the desktop window it passes a null input, and a null desktop->foreground_input
+short-circuits the check. Only the driver's internal requests set the trap.
+So treat both the same way: when the target is the desktop window, do not
+record a foreground process and do not stamp a user-input time that never
+happened. desktop->foreground_pid == 0 already means "no foreground process"
+to is_current_process_foreground(), which matches the documented Windows rule
+that SetForegroundWindow succeeds when there is no foreground window.
+
+The window manager remains the arbiter of whether the raise is honoured: the
+driver still asks for it with _NET_ACTIVE_WINDOW and focus-stealing prevention
+applies as before.
+
+Measured on Wine 11.16, Plasma 6 on Wayland (Wine under XWayland), with a
+test program that takes the foreground, loses it to a non-Wine window, and
+then calls SetForegroundWindow on its own window:
+
+  unpatched   ret=0 err=5 (ACCESS_DENIED), window never activated  (2/2 runs)
+  patched     ret=1, _NET_ACTIVE_WINDOW granted, window activated  (3/3 runs)
+
+--- a/server/queue.c
++++ b/server/queue.c
+@@ -641,19 +641,35 @@
+ }
+ 
+ /* change the foreground input and reset the cursor clip rect */
+-static void set_foreground_input( struct desktop *desktop, struct process *process, struct thread_input *input )
++static void set_foreground_input( struct desktop *desktop, struct process *process,
++                                  struct thread_input *input, int is_desktop )
+ {
+     input_shm_t *input_shm, *old_input_shm;
+     shared_object_t dummy_obj = {0};
+ 
+-    if (input) input->user_time = monotonic_time;
+-    if (desktop->foreground_input == input) return;
++    /* Making the desktop window foreground means that no application window is
++     * foreground.  On Unix the graphics driver does this whenever the input
++     * focus moves to a window that does not belong to Wine at all, and then the
++     * desktop's owner is not a foreground process in any meaningful sense: it
++     * has not been activated and it has received no user input.  Recording it as
++     * one, and stamping its input with the current time, makes every application
++     * fail the foreground permission check below for as long as the focus stays
++     * outside Wine -- including the application the user was working in a moment
++     * earlier, which can then no longer bring itself back to the front.
++     * Requests that come from the application side already avoid this by passing
++     * a null input; do the same for the driver's internal ones. */
++    if (input && !is_desktop) input->user_time = monotonic_time;
++    if (desktop->foreground_input == input)
++    {
++        desktop->foreground_pid = is_desktop ? 0 : process->id;
++        return;
++    }
+     input_shm = input ? input->shared : &dummy_obj.shm.input;
+     old_input_shm = desktop->foreground_input ? desktop->foreground_input->shared : &dummy_obj.shm.input;
+ 
+     set_clip_rectangle( desktop, NULL, SET_CURSOR_NOCLIP, 1 );
+     desktop->foreground_input = input;
+-    desktop->foreground_pid = process->id;
++    desktop->foreground_pid = is_desktop ? 0 : process->id;
+ 
+     SHARED_WRITE_BEGIN( old_input_shm, input_shm_t )
+     {
+@@ -3813,7 +3829,8 @@
+ 
+     reply->previous = desktop->foreground_input ? desktop->foreground_input->shared->active : 0;
+     reply->send_msg_old = (reply->previous && desktop->foreground_input != queue->input);
+-    set_foreground_input( desktop, thread->process, req->internal || !is_desktop ? thread->queue->input : NULL );
++    set_foreground_input( desktop, thread->process,
++                          req->internal || !is_desktop ? thread->queue->input : NULL, is_desktop );
+     reply->send_msg_new = (desktop->foreground_input != queue->input);
+ 
+ done:
