@@ -1,0 +1,361 @@
+--- a/dlls/comdlg32/itemdlg.c
++++ b/dlls/comdlg32/itemdlg.c
+@@ -132,6 +132,7 @@
+     IShellItemArray *psia_selection;
+     IShellItemArray *psia_results;
+     IShellItem *psi_defaultfolder;
++    BOOL app_set_defaultfolder;   /* constructor synthesizes psi_defaultfolder (Desktop); this marks a real app call */
+     IShellItem *psi_setfolder;
+     IShellItem *psi_folder;
+ 
+@@ -495,6 +496,171 @@
+     }
+ }
+ 
++/* RecentFiles.xml is XML, so paths containing & < > " ' arrive escaped. Passing
++ * "W:\\Souls &amp; Hearts\\..." through unescaped produces a path that fails Unix
++ * conversion; xdg-desktop-portal-kde then silently DROPS a non-absolute
++ * current_folder (QDir::isRelativePath -> "ignoring non absolute path"), so the
++ * dialog quietly opens somewhere else. */
++static void xml_unescape(char *s)
++{
++    char *r = s, *w = s;
++    while (*r) {
++        if (*r == '&') {
++            if (!strncmp(r, "&amp;",  5)) { *w++ = '&';  r += 5; continue; }
++            if (!strncmp(r, "&lt;",   4)) { *w++ = '<';  r += 4; continue; }
++            if (!strncmp(r, "&gt;",   4)) { *w++ = '>';  r += 4; continue; }
++            if (!strncmp(r, "&quot;", 6)) { *w++ = '"';  r += 6; continue; }
++            if (!strncmp(r, "&apos;", 6)) { *w++ = '\''; r += 6; continue; }
++            if (!strncmp(r, "&#39;",  5)) { *w++ = '\''; r += 5; continue; }
++        }
++        *w++ = *r++;
++    }
++    *w = 0;
++}
++
++/* Affinity drops a "<document>~lock~" sidecar next to every OPEN document and
++ * removes it on clean close, so this distinguishes open documents from merely
++ * recent ones. Do NOT order by its mtime - the heartbeat is ~12 minutes and
++ * fires per document at its own offset, so mtime order just repeats open order. */
++static BOOL doc_is_open(const WCHAR *doc_path)
++{
++    WCHAR lock[MAX_PATH];
++    if (!doc_path || lstrlenW(doc_path) + 7 >= ARRAY_SIZE(lock)) return FALSE;
++    lstrcpyW(lock, doc_path);
++    lstrcatW(lock, L"~lock~");
++    return GetFileAttributesW(lock) != INVALID_FILE_ATTRIBUTES;
++}
++
++static void copy_wchar_to_unix_path(char *dst, size_t dst_len, const WCHAR *wstr);
++
++/* Emit a folder only if it survives validation, so a bad candidate falls through
++ * to the next precedence step instead of silently blanking current_folder. */
++static BOOL set_portal_dir(char *dst, size_t dst_len, const WCHAR *dir)
++{
++    DWORD a;
++    if (!dir || !*dir) return FALSE;
++    a = GetFileAttributesW(dir);
++    if (a == INVALID_FILE_ATTRIBUTES || !(a & FILE_ATTRIBUTE_DIRECTORY)) return FALSE;
++    copy_wchar_to_unix_path(dst, dst_len, dir);
++    if (dst[0] != '/') { dst[0] = 0; return FALSE; }   /* KDE drops non-absolute silently */
++    return TRUE;
++}
++
++/* This is a generic Windows DLL; keep the Affinity-specific lookups off every
++ * other Wine application on the machine. */
++static BOOL host_is_affinity(void)
++{
++    static int cached = -1;
++    WCHAR exe[MAX_PATH], *base;
++    if (cached >= 0) return cached;
++    cached = 0;
++    if (GetModuleFileNameW(GetModuleHandleW(NULL), exe, ARRAY_SIZE(exe)))
++    {
++        base = wcsrchr(exe, '\\');
++        base = base ? base + 1 : exe;
++        if (!wcsicmp(base, L"Affinity.exe")   || !wcsicmp(base, L"Affinity.real.exe") ||
++            !wcsicmp(base, L"Photo.exe")      || !wcsicmp(base, L"Designer.exe")      ||
++            !wcsicmp(base, L"Publisher.exe"))
++            cached = 1;
++    }
++    return cached;
++}
++
++/* Folder of the last file chosen through a portal dialog.
++ * Save As already gets a starting folder from the document path, but Open/Place/
++ * Export pass nothing, so the portal falls back to its own default. Remembering
++ * the last folder makes those dialogs behave like a native chooser. */
++static WCHAR last_portal_dir_w[MAX_PATH];
++static FILETIME last_portal_dir_time;
++
++/* Affinity keeps its Recents list here, newest first, as plain UTF-8 XML:
++ *   %APPDATA%\Affinity\Affinity\3.0\Settings\RecentFiles.xml
++ * Opening a document from the Recents list never goes through a file dialog, so
++ * comdlg32 would otherwise have no idea the working folder changed. Reading the
++ * newest entry lets Place/Export follow the document the user actually opened.
++ * Returns TRUE and fills dir[] with the folder, plus the file's mtime so the
++ * caller can tell whether it is fresher than the last dialog. */
++/* Compare two path components ignoring case and ignoring the extension. */
++static BOOL stem_matches(const WCHAR *a, const WCHAR *b)
++{
++    const WCHAR *da, *db;
++    size_t la, lb;
++    if (!a || !b || !*a || !*b) return FALSE;
++    da = wcsrchr(a, '.'); la = da ? (size_t)(da - a) : lstrlenW(a);
++    db = wcsrchr(b, '.'); lb = db ? (size_t)(db - b) : lstrlenW(b);
++    if (!la || la != lb) return FALSE;
++    return CompareStringW(LOCALE_INVARIANT, NORM_IGNORECASE, a, la, b, lb) == CSTR_EQUAL;
++}
++
++/* If want_stem is non-NULL, return the folder of the newest Recents entry whose
++ * filename stem matches it (i.e. the folder of THAT document, whichever position
++ * it holds in the list). Otherwise return the folder of the newest entry. */
++static BOOL get_recent_doc_folder_pass(WCHAR *dir, size_t dir_len, FILETIME *mtime,
++                                       const WCHAR *want_stem, BOOL open_only)
++{
++    static const WCHAR rel[] = L"\\Affinity\\Affinity\\3.0\\Settings\\RecentFiles.xml";
++    WCHAR path[MAX_PATH];
++    HANDLE f;
++    DWORD size, got;
++    char *buf, *start, *end;
++    WCHAR *wide;
++    int wlen, probes = 0;
++    BOOL ok = FALSE;
++
++    if (FAILED(SHGetFolderPathW(NULL, CSIDL_APPDATA, NULL, 0, path))) return FALSE;
++    if (lstrlenW(path) + ARRAY_SIZE(rel) >= ARRAY_SIZE(path)) return FALSE;
++    lstrcatW(path, rel);
++
++    f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
++                    OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
++    if (f == INVALID_HANDLE_VALUE) return FALSE;
++
++    if (mtime) GetFileTime(f, NULL, NULL, mtime);
++
++    size = GetFileSize(f, NULL);
++    if (size == INVALID_FILE_SIZE || size > 1024 * 1024) { CloseHandle(f); return FALSE; }
++    if (!(buf = malloc(size + 1))) { CloseHandle(f); return FALSE; }
++    if (!ReadFile(f, buf, size, &got, NULL)) got = 0;
++    CloseHandle(f);
++    buf[got] = 0;
++
++    /* entries are newest-first; take the first match (or simply the first entry) */
++    start = buf;
++    while (!ok && (start = strstr(start, "<Path>")) && (end = strstr(start, "</Path>")))
++    {
++        char saved = *end;
++        start += 6;
++        *end = 0;
++        xml_unescape(start);
++        wlen = MultiByteToWideChar(CP_UTF8, 0, start, -1, NULL, 0);
++        if (wlen > 0 && (wide = malloc(wlen * sizeof(WCHAR))))
++        {
++            WCHAR *slash;
++            MultiByteToWideChar(CP_UTF8, 0, start, -1, wide, wlen);
++            slash = wcsrchr(wide, '\\');
++            if (!slash) slash = wcsrchr(wide, '/');
++            if (slash && slash != wide)
++            {
++                if (!want_stem || stem_matches(slash + 1, want_stem))
++                {
++                    /* pass 1 insists the document is still open; pass 2 accepts any match */
++                    if (!open_only || (probes++ < 16 && doc_is_open(wide)))
++                    {
++                        *slash = 0;
++                        lstrcpynW(dir, wide, dir_len);
++                        ok = dir[0] != 0;
++                    }
++                }
++            }
++            free(wide);
++        }
++        *end = saved;
++        start = end;
++    }
++    free(buf);
++    return ok;
++}
++
+ static void set_result_folder(FileDialogImpl *This, const WCHAR *path)
+ {
+     IShellItem *psi = NULL;
+@@ -518,6 +684,10 @@
+     memcpy(dir, path, len * sizeof(WCHAR));
+     dir[len] = 0;
+ 
++    lstrcpynW(last_portal_dir_w, dir, ARRAY_SIZE(last_portal_dir_w));
++    GetSystemTimeAsFileTime(&last_portal_dir_time);
++    TRACE("remembered last portal dir: %s\n", debugstr_w(last_portal_dir_w));
++
+     if (SUCCEEDED(SHParseDisplayName(dir, NULL, &pidl, 0, NULL)))
+     {
+         if (SUCCEEDED(SHCreateShellItem(NULL, NULL, pidl, &psi)))
+@@ -2638,7 +2808,8 @@
+     thread = CreateThread(NULL, 0, portal_call_thread, &thread_params, 0, NULL);
+     if (!thread)
+     {
+-        if (owner_disabled) EnableWindow(hwndOwner, TRUE);
++        if (owner_disabled)
++            EnableWindow(hwndOwner, TRUE);
+         return STATUS_INTERNAL_ERROR;
+     }
+ 
+@@ -2654,7 +2825,8 @@
+ 
+     /* Re-enable before returning, so the caller can legitimately show another
+      * dialog straight afterwards. */
+-    if (owner_disabled) EnableWindow(hwndOwner, TRUE);
++    if (owner_disabled)
++        EnableWindow(hwndOwner, TRUE);
+     return thread_params.status;
+ }
+ 
+@@ -2942,6 +3114,37 @@
+     return PORTAL_POLICY_AUTO;
+ }
+ 
++static BOOL get_recent_doc_folder_ex(WCHAR *dir, size_t dir_len, FILETIME *mtime, const WCHAR *want_stem)
++{
++    if (get_recent_doc_folder_pass(dir, dir_len, mtime, want_stem, TRUE)) return TRUE;
++    return get_recent_doc_folder_pass(dir, dir_len, mtime, want_stem, FALSE);
++}
++
++static BOOL get_recent_doc_folder(WCHAR *dir, size_t dir_len, FILETIME *mtime)
++{
++    return get_recent_doc_folder_ex(dir, dir_len, mtime, NULL);
++}
++
++
++/* Pick the best "recently used" folder: the folder from the last file dialog, or
++ * the folder of the newest Recents entry - whichever happened more recently. */
++static BOOL get_recent_folder(WCHAR *out, size_t out_len)
++{
++    WCHAR mru_dir[MAX_PATH];
++    FILETIME mru_time;
++    BOOL have_mru = get_recent_doc_folder(mru_dir, ARRAY_SIZE(mru_dir), &mru_time);
++
++    if (have_mru && (!last_portal_dir_w[0] ||
++                     CompareFileTime(&mru_time, &last_portal_dir_time) > 0))
++    {
++        lstrcpynW(out, mru_dir, out_len);
++        return TRUE;
++    }
++    if (last_portal_dir_w[0]) { lstrcpynW(out, last_portal_dir_w, out_len); return TRUE; }
++    if (have_mru) { lstrcpynW(out, mru_dir, out_len); return TRUE; }
++    return FALSE;
++}
++
+ /* The XDG portal needs "x11:<XID>" for its parent_window argument, so the file
+  * chooser can be kept above the window it is modal for. Wine exposes the X
+  * drawable behind a HWND through the graphics driver escape.
+@@ -3013,15 +3216,37 @@
+         else
+             default_portal_title(open_params.title_utf8, sizeof(open_params.title_utf8), FALSE);
+         open_params.initial_dir_utf8[0] = 0;
+-        if (This->psi_setfolder || This->psi_defaultfolder)
+-        {
+-			if (get_shellitem_filesys_path(This->psi_setfolder ? This->psi_setfolder : This->psi_defaultfolder,
+-			                               folder_w, ARRAY_SIZE(folder_w)))
+-			{
+-				copy_wchar_to_unix_path(open_params.initial_dir_utf8,
+-				                        sizeof(open_params.initial_dir_utf8), folder_w);
+-			}
+-		}
++
++		/* Precedence per the Windows API contract:
++		 *   1. SetFolder        - an explicit instruction, always wins
++		 *   2. recently-used    - SetDefaultFolder is documented as applying only
++		 *                         "if there is not a recently used folder value
++		 *                         available", so it must NOT override this
++		 *   3. SetDefaultFolder - the app's fallback suggestion
++		 * Treating 1 and 3 as equivalent (the original code) makes an app that
++		 * calls SetDefaultFolder pin every dialog to that folder forever. */
++		if (This->psi_setfolder &&
++		    get_shellitem_filesys_path(This->psi_setfolder, folder_w, ARRAY_SIZE(folder_w)))
++			copy_wchar_to_unix_path(open_params.initial_dir_utf8,
++			                        sizeof(open_params.initial_dir_utf8), folder_w);
++
++		if (!open_params.initial_dir_utf8[0] && host_is_affinity() &&
++		    get_recent_folder(folder_w, ARRAY_SIZE(folder_w)))
++			set_portal_dir(open_params.initial_dir_utf8,
++			               sizeof(open_params.initial_dir_utf8), folder_w);
++
++		if (!open_params.initial_dir_utf8[0] && This->app_set_defaultfolder && This->psi_defaultfolder &&
++		    get_shellitem_filesys_path(This->psi_defaultfolder, folder_w, ARRAY_SIZE(folder_w)))
++			set_portal_dir(open_params.initial_dir_utf8,
++			               sizeof(open_params.initial_dir_utf8), folder_w);
++
++
++		TRACE("probe: title=%s ownertext=%s\\n", debugstr_w(This->custom_title),
++		      debugstr_w(({ static WCHAR ot[256]; ot[0]=0; if (hwndOwner) GetWindowTextW(hwndOwner, ot, ARRAY_SIZE(ot)); ot; })));
++
++		TRACE("portal OPEN: setfolder=%p defaultfolder=%p lastdir=%s initial_dir=%s\n",
++		      This->psi_setfolder, This->psi_defaultfolder,
++		      debugstr_w(last_portal_dir_w), debugstr_a(open_params.initial_dir_utf8));
+ 
+ 		build_filters_blob_from_specs(open_params.filters_blob, sizeof(open_params.filters_blob),
+ 		                              This->filterspecs, This->filterspec_count,
+@@ -3192,16 +3417,49 @@
+ 			}
+ 		}
+ 
+-		if (!save_params.initial_dir_utf8[0] && (This->psi_setfolder || This->psi_defaultfolder))
++		/* Same precedence as the open case; the folder derived from the document
++		 * path above already took priority over all of these. */
++		if (!save_params.initial_dir_utf8[0] && This->psi_setfolder &&
++		    get_shellitem_filesys_path(This->psi_setfolder, folder_w, ARRAY_SIZE(folder_w)))
++			copy_wchar_to_unix_path(save_params.initial_dir_utf8,
++			                        sizeof(save_params.initial_dir_utf8), folder_w);
++
++		/* Per-document: Affinity prefills the export/save name from the ACTIVE document
++		 * (e.g. "SMH_Check_Layout.pdf" for SMH_Check_Layout.af). Matching that stem in the
++		 * Recents list finds THAT document's folder, which is correct even when several
++		 * documents are open and a different one was opened more recently. */
++		if (!save_params.initial_dir_utf8[0] && This->set_filename && *This->set_filename)
+ 		{
+-			if (get_shellitem_filesys_path(This->psi_setfolder ? This->psi_setfolder : This->psi_defaultfolder,
+-			                               folder_w, ARRAY_SIZE(folder_w)))
++			const WCHAR *stem = file_part_from_path(This->set_filename);
++			if (stem && *stem &&
++			    host_is_affinity() &&
++			    get_recent_doc_folder_ex(folder_w, ARRAY_SIZE(folder_w), NULL, stem))
+ 			{
+-				copy_wchar_to_unix_path(save_params.initial_dir_utf8,
+-				                        sizeof(save_params.initial_dir_utf8), folder_w);
++				TRACE("matched document %s -> %s\n", debugstr_w(stem), debugstr_w(folder_w));
++				set_portal_dir(save_params.initial_dir_utf8,
++				               sizeof(save_params.initial_dir_utf8), folder_w);
+ 			}
+ 		}
+ 
++
++		if (!save_params.initial_dir_utf8[0] && host_is_affinity() &&
++		    get_recent_folder(folder_w, ARRAY_SIZE(folder_w)))
++			set_portal_dir(save_params.initial_dir_utf8,
++			               sizeof(save_params.initial_dir_utf8), folder_w);
++
++		if (!save_params.initial_dir_utf8[0] && This->app_set_defaultfolder && This->psi_defaultfolder &&
++		    get_shellitem_filesys_path(This->psi_defaultfolder, folder_w, ARRAY_SIZE(folder_w)))
++			set_portal_dir(save_params.initial_dir_utf8,
++			               sizeof(save_params.initial_dir_utf8), folder_w);
++
++
++		TRACE("probe: title=%s ownertext=%s\\n", debugstr_w(This->custom_title),
++		      debugstr_w(({ static WCHAR ot[256]; ot[0]=0; if (hwndOwner) GetWindowTextW(hwndOwner, ot, ARRAY_SIZE(ot)); ot; })));
++
++		TRACE("portal SAVE: setfolder=%p defaultfolder=%p set_filename=%s lastdir=%s initial_dir=%s\n",
++		      This->psi_setfolder, This->psi_defaultfolder, debugstr_w(This->set_filename),
++		      debugstr_w(last_portal_dir_w), debugstr_a(save_params.initial_dir_utf8));
++
+ 		build_filters_blob_from_specs(save_params.filters_blob, sizeof(save_params.filters_blob),
+ 		                              This->filterspecs, This->filterspec_count,
+ 		                              &save_params.filter_count, &save_params.filters_blob_len);
+@@ -3506,6 +3764,7 @@
+ {
+     FileDialogImpl *This = impl_from_IFileDialog2(iface);
+     TRACE("%p (%p)\n", This, psi);
++    This->app_set_defaultfolder = TRUE;
+     if(This->psi_defaultfolder)
+         IShellItem_Release(This->psi_defaultfolder);
+ 

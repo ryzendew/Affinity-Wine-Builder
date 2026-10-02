@@ -1,0 +1,90 @@
+win32u: end the SC_MOVE/SC_SIZE loop when the moved window is destroyed.
+
+An application can complete the operation itself while sys_command_size_move is
+still looping. Affinity's dockable panels do exactly that: the panel docks as
+soon as it is dragged over a dock target -- not when the button is released --
+and its floating window is destroyed there and then.
+
+Traced with +message,+win while dragging a panel into a tab strip. The floating
+window 0x200a8 gets WM_CLOSE and is destroyed 670 log events before the button
+comes up; the loop keeps running on the dead handle for all of them, and the
+WM_EXITSIZEMOVE sent afterwards appears nowhere in the message trace because
+there is no longer a window to send it to.
+
+Two visible consequences, both long-standing complaints:
+
+  - the loop goes on calling NtUserSetWindowPos on the destroyed window, which
+    pulls the panel back out of the dock it just entered -- "it docks, then
+    jumps back out unless you jiggle the mouse"
+  - the loop swallows the WM_LBUTTONUP (NtUserGetMessage removes it and the
+    loop breaks without dispatching), so the application never takes down its
+    own drag adornment. The dragged tab stays drawn where it was dropped, on
+    top of the strip's real tabs, until an unrelated click delivers the input
+    that finishes the gesture. That is the "click another tab to fix it"
+    workaround users report.
+
+Windows ends the move when the window goes away. Do the same, and dispatch the
+message that revealed it rather than dropping it -- in the observed case that
+message is the private one WPF uses to drain its dispatcher queue, and losing
+it leaves the application in a worse state than the bug being fixed.
+
+Verified against Affinity 3 on the Intel Arc: three consecutive drags of a panel
+into an existing tab strip, each ending with a correctly laid out and fully
+repainted strip, where every previous attempt left it drawn mid-drag. A plain
+move of a floating panel that does not dock still tracks the cursor exactly, and
+tools/kbmove.c confirms the keyboard path still moves the window and still exits
+on Return.
+
+--- a/dlls/win32u/defwnd.c
++++ b/dlls/win32u/defwnd.c
+@@ -676,7 +676,7 @@
+ static void sys_command_size_move( HWND hwnd, WPARAM wparam )
+ {
+     DWORD msg_pos = NtUserGetMessagePos();
+-    BOOL thickframe, drag_full_windows = TRUE, moved = FALSE, mouse_drag;
++    BOOL thickframe, drag_full_windows = TRUE, moved = FALSE, mouse_drag, window_gone = FALSE;
+     RECT sizing_rect, mouse_rect, orig_rect;
+     UINT hittest = wparam & 0x0f;
+     UINT syscommand = wparam & 0xfff0;
+@@ -788,6 +788,28 @@
+         if (!NtUserGetMessage( &msg, 0, 0, 0 )) break;
+         if (NtUserCallMsgFilter( &msg, MSGF_SIZE )) continue;
+ 
++        /* The application can finish the operation itself while we are still
++         * looping. A dockable panel docks the moment it is dragged over a dock
++         * target and destroys its floating window there and then, without
++         * waiting for the button to come up. Windows ends the move when the
++         * window being moved goes away; we kept going, driving a destroyed
++         * window with SetWindowPos -- which pulled the panel straight back out
++         * of the dock -- and then swallowed the WM_LBUTTONUP the application
++         * needed to take down its own drag adornment, leaving the tab strip
++         * that received the drop drawn mid-drag until some later click. */
++        if (!is_window( hwnd ))
++        {
++            TRACE( "window %p was destroyed, ending the move at msg %04x\n", hwnd, msg.message );
++            /* deliver the message we just took: the application is in the middle
++             * of its own bookkeeping and swallowing it here loses, among other
++             * things, the private message a UI toolkit uses to drain its
++             * dispatcher queue. */
++            NtUserTranslateMessage( &msg, 0 );
++            NtUserDispatchMessage( &msg );
++            window_gone = TRUE;
++            break;
++        }
++
+         /* An application can consume the WM_LBUTTONUP itself: a dockable panel
+          * accepting a drop does exactly that, as does a window that is
+          * re-parented or destroyed as part of the drop. The check further down
+@@ -914,6 +936,12 @@
+ 
+     set_capture_window( 0, GUI_INMOVESIZE, NULL );
+     NtUserReleaseDC( parent, hdc );
++
++    /* None of the below means anything for a window that no longer exists: the
++     * two send_message calls would be silently dropped and the CBT hook would
++     * be handed a dead handle. Say so rather than relying on that. */
++    if (window_gone) return;
++
+     if (parent) map_window_points( 0, parent, (POINT *)&sizing_rect, 2, get_thread_dpi() );
+ 
+     if (call_hooks( WH_CBT, HCBT_MOVESIZE, (WPARAM)hwnd, (LPARAM)&sizing_rect, sizeof(sizing_rect) ))

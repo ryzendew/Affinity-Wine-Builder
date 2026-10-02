@@ -1,0 +1,94 @@
+--- a/dlls/wintypes/main.c
++++ b/dlls/wintypes/main.c
+@@ -1812,19 +1812,89 @@
+     return S_OK;
+ }
+ 
++/* Locate the .winmd holding a namespace. Metadata files are named after the
++ * namespace they cover, and a file may cover nested namespaces too, so walk
++ * from the most specific name to the least: Windows.A.B.winmd, Windows.A.winmd,
++ * Windows.winmd. */
++static HRESULT find_metadata_file( const WCHAR *dir, const WCHAR *namespace, HSTRING *path )
++{
++    WCHAR file[MAX_PATH], name[MAX_PATH];
++    WCHAR *dot;
++
++    if (wcslen( namespace ) >= ARRAY_SIZE(name)) return RO_E_METADATA_NAME_NOT_FOUND;
++    wcscpy( name, namespace );
++
++    for (;;)
++    {
++        if (swprintf( file, ARRAY_SIZE(file), L"%s\\%s.winmd", dir, name ) > 0 &&
++            GetFileAttributesW( file ) != INVALID_FILE_ATTRIBUTES)
++        {
++            TRACE( "namespace %s found in %s\n", debugstr_w(namespace), debugstr_w(file) );
++            return WindowsCreateString( file, wcslen( file ), path );
++        }
++        if (!(dot = wcsrchr( name, '.' ))) return RO_E_METADATA_NAME_NOT_FOUND;
++        *dot = 0;
++    }
++}
++
+ HRESULT WINAPI RoResolveNamespace(HSTRING name, HSTRING windowsMetaDataDir,
+                                   DWORD packageGraphDirsCount, const HSTRING *packageGraphDirs,
+                                   DWORD *metaDataFilePathsCount, HSTRING **metaDataFilePaths,
+                                   DWORD *subNamespacesCount, HSTRING **subNamespaces)
+ {
+-    FIXME("name %s, windowsMetaDataDir %s, metaDataFilePaths %p, subNamespaces %p stub!\n",
++    WCHAR dir[MAX_PATH];
++    HSTRING file, *paths;
++    const WCHAR *buffer;
++    HRESULT hr;
++
++    TRACE("name %s, windowsMetaDataDir %s, metaDataFilePaths %p, subNamespaces %p\n",
+             debugstr_hstring(name), debugstr_hstring(windowsMetaDataDir),
+             metaDataFilePaths, subNamespaces);
+ 
+     if (!metaDataFilePaths && !subNamespaces)
+         return E_INVALIDARG;
+ 
+-    return RO_E_METADATA_NAME_NOT_FOUND;
++    if (metaDataFilePathsCount) *metaDataFilePathsCount = 0;
++    if (metaDataFilePaths) *metaDataFilePaths = NULL;
++    /* Sub-namespace enumeration is not implemented; callers resolving a type
++     * only need the metadata file. */
++    if (subNamespacesCount) *subNamespacesCount = 0;
++    if (subNamespaces) *subNamespaces = NULL;
++
++    if (!name || !WindowsGetStringLen( name )) return RO_E_METADATA_NAME_NOT_FOUND;
++
++    if (windowsMetaDataDir && WindowsGetStringLen( windowsMetaDataDir ))
++    {
++        buffer = WindowsGetStringRawBuffer( windowsMetaDataDir, NULL );
++        if (wcslen( buffer ) >= ARRAY_SIZE(dir)) return E_INVALIDARG;
++        wcscpy( dir, buffer );
++    }
++    else
++    {
++        if (!GetSystemDirectoryW( dir, ARRAY_SIZE(dir) )) return E_UNEXPECTED;
++        if (wcslen( dir ) + ARRAY_SIZE(L"\\WinMetadata") >= ARRAY_SIZE(dir)) return E_UNEXPECTED;
++        wcscat( dir, L"\\WinMetadata" );
++    }
++
++    if (FAILED(hr = find_metadata_file( dir, WindowsGetStringRawBuffer( name, NULL ), &file )))
++        return hr;
++
++    if (!metaDataFilePaths)
++    {
++        WindowsDeleteString( file );
++        return S_OK;
++    }
++
++    if (!(paths = CoTaskMemAlloc( sizeof(*paths) )))
++    {
++        WindowsDeleteString( file );
++        return E_OUTOFMEMORY;
++    }
++
++    paths[0] = file;
++    *metaDataFilePaths = paths;
++    if (metaDataFilePathsCount) *metaDataFilePathsCount = 1;
++    return S_OK;
+ }
+ 
+ struct parse_type_context

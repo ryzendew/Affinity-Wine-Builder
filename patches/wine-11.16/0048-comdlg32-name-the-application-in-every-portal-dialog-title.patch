@@ -1,0 +1,93 @@
+comdlg32: name the application in every portal dialog title, not only untitled ones.
+
+0021 named the application when it set no title -- "Select file (Affinity)" --
+so a window-manager rule could pin the dialog above its parent. That rule is
+the only thing that does under Wayland: xdg-desktop-portal-kde ignores the
+x11: parent handle there (KDE bug 523825). A dialog the application titles
+itself kept its own title and nothing else, matched no rule, and fell behind
+the window it was modal for: Affinity's "Select Folder" from the Resource
+Manager's relink.
+
+Append " (<exe>)" to an application's own title, unless it already ends with
+it. Untitled dialogs are unchanged.
+
+---
+--- a/dlls/comdlg32/itemdlg.c
++++ b/dlls/comdlg32/itemdlg.c
+@@ -3180,17 +3180,47 @@
+  * anything matching on it, such as a window-manager rule pinning it above its
+  * parent. Name the application rather than hardcoding one, so this is useful for
+  * every app and not just the one it was written for. */
+-static void default_portal_title( char *buf, size_t len, BOOL saving )
++/*
++ * The application's own title is kept, with the name after it: "Select Folder
++ * (Affinity)". Without the name, an app-titled dialog could not be told apart
++ * from any other program's by such a rule -- and under Wayland that rule is the
++ * only thing keeping the dialog above its parent, because xdg-desktop-portal-kde
++ * ignores the x11: parent handle there (KDE bug 523825). Affinity's export
++ * chooser carried no title and matched; its "Select Folder" carried one and fell
++ * behind the window it was modal for.
++ */
++static void portal_title( char *buf, size_t len, const WCHAR *custom, BOOL saving )
+ {
+-    WCHAR path[MAX_PATH], title[MAX_PATH], *name, *dot;
++    WCHAR path[MAX_PATH], title[MAX_PATH * 2], suffix[MAX_PATH + 3], *name, *dot;
++    size_t custom_len, suffix_len;
+ 
+-    if (!GetModuleFileNameW( NULL, path, ARRAY_SIZE(path) )) return;
++    if (custom && !*custom) custom = NULL;
++    if (!GetModuleFileNameW( NULL, path, ARRAY_SIZE(path) )) goto fallback;
+     if (!(name = wcsrchr( path, '\\' ))) name = path; else name++;
+     if ((dot = wcsrchr( name, '.' )) && dot != name) *dot = 0;
+-    if (!*name) return;
++    if (!*name) goto fallback;
+ 
+-    swprintf( title, ARRAY_SIZE(title), saving ? L"Save file (%s)" : L"Select file (%s)", name );
++    if (!custom)
++    {
++        swprintf( title, ARRAY_SIZE(title), saving ? L"Save file (%s)" : L"Select file (%s)", name );
++        copy_wchar_to_utf8( buf, len, title );
++        return;
++    }
++    /* Already named -- by the app, or by a caller passing a title through twice. */
++    swprintf( suffix, ARRAY_SIZE(suffix), L" (%s)", name );
++    custom_len = wcslen( custom );
++    suffix_len = wcslen( suffix );
++    if (custom_len >= suffix_len && !wcsicmp( custom + custom_len - suffix_len, suffix ))
++    {
++        copy_wchar_to_utf8( buf, len, custom );
++        return;
++    }
++    swprintf( title, ARRAY_SIZE(title), L"%s%s", custom, suffix );
+     copy_wchar_to_utf8( buf, len, title );
++    return;
++
++fallback:
++    if (custom) copy_wchar_to_utf8( buf, len, custom );
+ }
+ 
+ static UINT64 get_owner_x11_window( HWND hwnd )
+@@ -3233,10 +3263,7 @@
+         WCHAR **paths = NULL;
+ 
+         /* Open file dialog */
+-        if (This->custom_title && *This->custom_title)
+-			copy_wchar_to_utf8(open_params.title_utf8, sizeof(open_params.title_utf8), This->custom_title);
+-        else
+-            default_portal_title(open_params.title_utf8, sizeof(open_params.title_utf8), FALSE);
++        portal_title(open_params.title_utf8, sizeof(open_params.title_utf8), This->custom_title, FALSE);
+         open_params.initial_dir_utf8[0] = 0;
+ 
+ 		/* Precedence per the Windows API contract:
+@@ -3405,10 +3432,7 @@
+     else
+     {
+ 		/* Save file dialog */
+-		if (This->custom_title && *This->custom_title)
+-			copy_wchar_to_utf8(save_params.title_utf8, sizeof(save_params.title_utf8), This->custom_title);
+-		else
+-			default_portal_title(save_params.title_utf8, sizeof(save_params.title_utf8), TRUE);
++		portal_title(save_params.title_utf8, sizeof(save_params.title_utf8), This->custom_title, TRUE);
+ 		save_params.initial_dir_utf8[0] = 0;
+ 		save_params.initial_filename_utf8[0] = 0;
+ 		save_params.current_file_unix[0] = 0;

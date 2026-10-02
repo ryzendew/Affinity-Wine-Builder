@@ -1,0 +1,70 @@
+comdlg32: put the keyboard focus back after the portal dialog.
+
+EnableWindow(FALSE) on a window that holds the focus clears the focus,
+and EnableWindow(TRUE) does not put it back. The dialog manager on the
+non-portal path saves and restores it; this path disables the owner
+itself and so has to do the same.
+
+Without it the application returns from every file dialog focused
+nowhere. It is still the foreground window, so its accelerators keep
+working, while everything routed through a focused control silently
+stops until the user clicks into it again. Against a WPF application
+that is every shortcut the focused element owns -- Delete, Ctrl+Z,
+Save As -- so it reads as the keyboard having become unreliable rather
+than as anything to do with dialogs.
+
+Distinct from 0022, which fixes the case where no key reaches the
+application at all. This one is about which control inside it receives
+them once they do, and the two were confused for each other for most of
+a day because both present as "the keyboard stopped after a dialog".
+
+--- a/dlls/comdlg32/itemdlg.c
++++ b/dlls/comdlg32/itemdlg.c
+@@ -2786,6 +2786,7 @@
+     HANDLE thread;
+     MSG msg;
+     BOOL owner_disabled = FALSE;
++    HWND saved_focus = GetFocus();
+ 
+     /* IFileDialog::Show is modal: the owner is disabled for the duration and
+      * re-enabled when the dialog returns. The non-portal path gets that from the
+@@ -2809,7 +2810,10 @@
+     if (!thread)
+     {
+         if (owner_disabled)
++        {
+             EnableWindow(hwndOwner, TRUE);
++            if (saved_focus && IsWindow(saved_focus)) SetFocus(saved_focus);
++        }
+         return STATUS_INTERNAL_ERROR;
+     }
+ 
+@@ -2824,9 +2828,27 @@
+     CloseHandle(thread);
+ 
+     /* Re-enable before returning, so the caller can legitimately show another
+-     * dialog straight afterwards. */
++     * dialog straight afterwards, and put the keyboard focus back where it was.
++     *
++     * EnableWindow(FALSE) on a window that holds the focus clears the focus, and
++     * EnableWindow(TRUE) does not restore it -- the dialog manager on the
++     * non-portal path saves and restores it, and this path has to do the same.
++     * Without it the application comes back from every file dialog focused
++     * nowhere: it is still the foreground window, so its accelerators keep
++     * working, while everything routed through a focused control silently stops
++     * until the user alt-tabs away and back. Against a WPF application that is
++     * every shortcut the focused element owns -- Delete, Ctrl+Z, Save As -- and
++     * it reads as the keyboard having become unreliable rather than as anything
++     * to do with dialogs. */
+     if (owner_disabled)
++    {
+         EnableWindow(hwndOwner, TRUE);
++
++        if (saved_focus && IsWindow(saved_focus) && IsWindowEnabled(saved_focus))
++            SetFocus(saved_focus);
++        else if (hwndOwner && IsWindow(hwndOwner))
++            SetFocus(hwndOwner);
++    }
+     return thread_params.status;
+ }
+ 
