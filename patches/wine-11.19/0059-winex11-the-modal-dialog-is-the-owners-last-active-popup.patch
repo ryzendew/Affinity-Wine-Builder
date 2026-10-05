@@ -1,0 +1,134 @@
+winex11: The modal dialog is the owner's last active popup, not its first enabled one.
+
+0020 advertises _NET_WM_STATE_MODAL on the window it takes for the modal
+dialog: owned, owner disabled, not a tool window, and the owner's
+GW_ENABLEDPOPUP. GW_ENABLEDPOPUP is the first enabled, visible window the
+owner owns in z-order, and an owned palette that is not a tool window --
+Affinity's sub-tool panel is one, a borderless WPF window -- comes first
+and stays enabled while a dialog is up. It was marked modal as soon as the
+owner was disabled, which is what 0020's own comment warns against: the
+window manager hands the owner's activation to a modal transient.
+
+Take the owner's last active popup instead, the window Windows activates
+when a disabled owner is clicked. A dialog is activated when it is shown;
+a palette shown without activation never is. A dialog that has opened a
+modal dialog of its own owns the last active popup rather than being it,
+and stays modal too. The dialog is mapped before it is activated, so
+recompute the owned windows' state on activation as well.
+
+With a palette shown before the dialog, KWin saw both as modal; now only
+the dialog. With nested dialogs, the outer one lost the state whenever its
+owner's windows were recomputed (GW_ENABLEDPOPUP skips it, since it is
+disabled); now both keep it. Affinity's recovery prompt is modal; its
+sub-tool panel is not.
+
+diff --git a/dlls/winex11.drv/event.c b/dlls/winex11.drv/event.c
+index a1e11d6..226adc7 100644
+--- a/dlls/winex11.drv/event.c
++++ b/dlls/winex11.drv/event.c
+@@ -1260,6 +1260,7 @@ void X11DRV_ActivateWindow( HWND hwnd, HWND previous )
+ {
+     struct x11drv_win_data *data;
+     BOOL flush = FALSE;
++    HWND owner;
+ 
+     if (!is_virtual_desktop())
+     {
+@@ -1278,6 +1279,12 @@ void X11DRV_ActivateWindow( HWND hwnd, HWND previous )
+     }
+ 
+     if (flush) XFlush( x11drv_thread_data()->display );
++
++    /* A modal dialog is activated after it is mapped, and _NET_WM_STATE_MODAL
++     * follows the owner's last active popup; recompute it for the owner's
++     * windows now that this one is active. */
++    if (hwnd && (owner = NtUserGetWindowRelative( hwnd, GW_OWNER )) && !NtUserIsWindowEnabled( owner ))
++        update_owned_windows_net_wm_states( owner );
+ }
+ 
+ static void drag_drop_enter( UINT entries_size, struct format_entry *entries )
+diff --git a/dlls/winex11.drv/window.c b/dlls/winex11.drv/window.c
+index 319244a..7f12cd1 100644
+--- a/dlls/winex11.drv/window.c
++++ b/dlls/winex11.drv/window.c
+@@ -1476,6 +1476,20 @@ static void window_set_config( struct x11drv_win_data *data, RECT rect, BOOL abo
+     XReconfigureWMWindow( data->display, data->whole_window, data->vis.screen, mask, &changes );
+ }
+ 
++/* whether hwnd is the owner's last active popup, or owns it: a modal dialog
++ * that has opened a modal dialog of its own is still modal */
++static BOOL owns_last_active_popup( HWND owner, HWND hwnd )
++{
++    HWND popup = NtUserGetLastActivePopup( owner );
++
++    while (popup && popup != owner)
++    {
++        if (popup == hwnd) return TRUE;
++        popup = NtUserGetWindowRelative( popup, GW_OWNER );
++    }
++    return FALSE;
++}
++
+ /***********************************************************************
+  *     update_net_wm_states
+  */
+@@ -1531,13 +1545,18 @@ static void update_net_wm_states( struct x11drv_win_data *data )
+      *    It is what rules out the palettes when the owner is disabled and there
+      *    is no Win32 dialog at all, which is exactly the shape the XDG portal
+      *    file chooser produces.
+-     *  - it is the owner's GW_ENABLEDPOPUP, the window Windows itself activates
+-     *    when a disabled owner is clicked. That is the modal dialog by
+-     *    definition, and it guarantees at most one window per owner claims the
+-     *    state. */
++     *  - it is the owner's last active popup, the window Windows activates when
++     *    a disabled owner is clicked. A modal dialog is activated when it is
++     *    shown; a palette shown without activation never is, even when it is
++     *    not a tool window -- Affinity's sub-tool panel is not -- and comes
++     *    first in z-order, where GW_ENABLEDPOPUP found it and marked it modal.
++     *    At most one window per owner claims the state; a dialog that owns
++     *    the last active popup keeps it, so nested dialogs both stay modal.
++     *    The dialog is mapped before it is activated, so activation
++     *    recomputes it (see X11DRV_ActivateWindow). */
+     if ((owner = NtUserGetWindowRelative( data->hwnd, GW_OWNER )) &&
+         !NtUserIsWindowEnabled( owner ) && !(ex_style & WS_EX_TOOLWINDOW) &&
+-        NtUserGetWindowRelative( owner, GW_ENABLEDPOPUP ) == data->hwnd)
++        owns_last_active_popup( owner, data->hwnd ))
+         new_state |= (1 << NET_WM_STATE_MODAL);
+     if (!data->add_taskbar)
+     {
+@@ -2644,7 +2663,7 @@ void X11DRV_SetWindowText( HWND hwnd, LPCWSTR text )
+  * changed, and nothing else will do it. Without this the state is computed once
+  * when the dialog is created -- before the owner is disabled -- and never
+  * corrected, so a modal dialog is never advertised as modal. */
+-static void update_owned_windows_net_wm_states( HWND owner )
++void update_owned_windows_net_wm_states( HWND owner )
+ {
+     HWND *list;
+     UINT i;
+@@ -2704,10 +2723,10 @@ done:
+         HWND owner;
+ 
+         update_owned_windows_net_wm_states( hwnd );
+-        /* MODAL now depends on GW_ENABLEDPOPUP, which is a property of the whole
+-         * set of windows one owner owns: enabling or disabling any one of them
+-         * can move it to a different window. So refresh this window's siblings
+-         * too, not only the windows it owns itself. */
++        /* MODAL depends on the owner's last active popup, which is a property
++         * of the whole set of windows one owner owns: enabling or disabling any
++         * one of them can move it to a different window. So refresh this
++         * window's siblings too, not only the windows it owns itself. */
+         if ((owner = NtUserGetWindowRelative( hwnd, GW_OWNER )))
+             update_owned_windows_net_wm_states( owner );
+     }
+diff --git a/dlls/winex11.drv/x11drv.h b/dlls/winex11.drv/x11drv.h
+index 138a0b3..0f5924d 100644
+--- a/dlls/winex11.drv/x11drv.h
++++ b/dlls/winex11.drv/x11drv.h
+@@ -772,6 +772,7 @@ extern XContext cursor_context;
+ 
+ extern BOOL is_current_process_focused(void);
+ extern void X11DRV_ActivateWindow( HWND hwnd, HWND previous );
++extern void update_owned_windows_net_wm_states( HWND owner );
+ extern void reapply_cursor_clipping(void);
+ extern void ungrab_clipping_window(void);
+ extern void move_resize_window( HWND hwnd, int dir, POINT pos );

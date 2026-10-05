@@ -1,0 +1,41 @@
+winex11: Do not draw a window surface over client surface windows.
+
+A window's X children are its client surface windows: the X windows a
+Vulkan or OpenGL client surface presents to when it is onscreen. The window
+surface draws with IncludeInferiors, so whatever of it is flushed lands on
+top of them. Its region normally keeps it off the client area -- the server
+excludes the client rectangle of a window with a pixel format -- but that
+region is only updated when the window's state is, on the window's thread.
+A client surface created on another thread, as a renderer thread does,
+leaves a stretch where the surface still covers the client area, and any
+flush in that stretch (an expose, a shape change) paints its contents over
+the client surface's frame. A surface no one painted is white since
+18339eb0, so the window flashes white until the client surface presents
+again.
+
+Draw with ClipByChildren instead. The client area of a window with a pixel
+format is excluded from the surface anyway, so this only changes what the
+races above show.
+
+In Affinity under WPF hardware rendering, the main window turned white for
+572-725 ms at every start, between the splash and the interface, measured
+from what KWin composites at 120 captures a second. With this, 0 ms, in
+three starts.
+
+diff --git a/dlls/winex11.drv/bitblt.c b/dlls/winex11.drv/bitblt.c
+index 1f91040..1b9c888 100644
+--- a/dlls/winex11.drv/bitblt.c
++++ b/dlls/winex11.drv/bitblt.c
+@@ -1945,7 +1945,11 @@ static struct window_surface *create_surface( HWND hwnd, Window window, const XV
+         surface->byteswap = byteswap;
+         surface->window = window;
+         surface->gc = XCreateGC( gdi_display, window, 0, NULL );
+-        XSetSubwindowMode( gdi_display, surface->gc, IncludeInferiors );
++        /* The window's only X children are client surface windows, which the
++         * surface must not draw over: they are clipped out of its region once
++         * the window state is updated, but that can come late, when another
++         * thread created the client surface. */
++        XSetSubwindowMode( gdi_display, surface->gc, ClipByChildren );
+     }
+ 
+     return window_surface;

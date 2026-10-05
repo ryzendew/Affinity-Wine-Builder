@@ -1,0 +1,80 @@
+widl metadata: resolve nested namespaces to their parent's assembly (ported to 11.18)
+
+Upstream 09eba117 moved the import list into struct winmd
+(current_winmd->imports, get_import()), still matching exact names only.
+Same walk-up, same exclusion of this module's own namespace, new home.
+
+---
+diff --git a/tools/widl/metadata.c b/tools/widl/metadata.c
+index 8f10d80..4d70254 100644
+--- a/tools/widl/metadata.c
++++ b/tools/widl/metadata.c
+@@ -1572,13 +1572,65 @@ static void append_import( const char *import )
+     current_winmd->imports[current_winmd->num_imports++] = name;
+ }
+ 
++/* Is "ancestor" the same namespace as "name", or a parent of it?
++ * Windows.ApplicationModel is an ancestor of Windows.ApplicationModel.Core;
++ * Windows.ApplicationModelFoo is not. */
++static int is_ancestor_namespace( const char *ancestor, const char *name )
++{
++    size_t len = strlen( ancestor );
++    return !strncasecmp( name, ancestor, len ) && (!name[len] || name[len] == '.');
++}
++
+ static const char *get_import( const char *name )
+ {
++    char *tmp, *ptr;
+     UINT i;
+-    for (i = 0; i < current_winmd->num_imports; i++)
+-    {
+-        if (!strcasecmp( name, current_winmd->imports[i] )) return current_winmd->imports[i];
++    int walked = 0;
++
++    /* A metadata file covers nested namespaces as well as its own, so a type in
++     * Windows.Foundation.Collections belongs to the Windows.Foundation assembly.
++     * Match the most specific import first and then walk up, the same way
++     * RoResolveNamespace locates a .winmd. An exact-only match leaves any
++     * namespace without an import of its very own unresolved, and create_typeref()
++     * then falls through to module scope -- emitting a TypeRef that claims the
++     * foreign type is defined in the file being compiled. The CLR duly fails to
++     * find it: "Could not load type 'System.Collections.Generic.IDictionary`2'
++     * from assembly 'windows.applicationmodel.datatransfer'". */
++    tmp = xstrdup( name );
++    for (;;)
++    {
++        for (i = 0; i < current_winmd->num_imports; i++)
++        {
++            if (strcasecmp( tmp, current_winmd->imports[i] )) continue;
++
++            /* A match reached by walking UP must not be this module's own
++             * namespace or an ancestor of it. Those types are defined in the
++             * file being compiled and belong to module scope. Wine has ten
++             * headers that import their own parent -- windows.ui.xaml imports
++             * windows.ui, windows.applicationmodel.core imports
++             * windows.applicationmodel, windows.devices.bluetooth.rfcomm imports
++             * windows.devices.bluetooth -- so without this the walk-up hands
++             * every locally defined type to the parent assembly and the CLR
++             * cannot find it there. That is the same TypeLoadException this
++             * walk-up was added to fix, pointed the other way. Measured on
++             * windows.ui.xaml.winmd: an AssemblyRef to windows.ui, gone now.
++             *
++             * An EXACT match is always honoured: a namespace with an import of
++             * its very own is genuinely foreign. */
++            if (walked && current_winmd->name && is_ancestor_namespace( current_winmd->imports[i], current_winmd->name ))
++            {
++                free( tmp );
++                return NULL;
++            }
++
++            free( tmp );
++            return current_winmd->imports[i];
++        }
++        if (!(ptr = strrchr( tmp, '.' ))) break;
++        *ptr = 0;
++        walked = 1;
+     }
++    free( tmp );
+     return NULL;
+ }
+ 

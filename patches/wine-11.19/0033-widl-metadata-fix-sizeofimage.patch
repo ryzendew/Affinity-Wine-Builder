@@ -1,0 +1,35 @@
+diff --git a/tools/widl/metadata.c b/tools/widl/metadata.c
+index 01650e9..52e80e8 100644
+--- a/tools/widl/metadata.c
++++ b/tools/widl/metadata.c
+@@ -141,11 +141,6 @@ static void write_headers( UINT image_size )
+ 
+     put_data( &dos_header, sizeof(dos_header) );
+ 
+-    image_size += nt_header.OptionalHeader.SizeOfHeaders + sizeof(section_header);
+-    nt_header.OptionalHeader.SizeOfImage = (image_size + 0x1fff) & ~0x1fff;
+-
+-    put_data( &nt_header, sizeof(nt_header) );
+-
+     for (i = 0; i < WINMD_STREAM_MAX; i++)
+     {
+         if (!streams[i].data_size) continue;
+@@ -158,6 +153,18 @@ static void write_headers( UINT image_size )
+     section_header.Misc.VirtualSize = sizeof(cor_header) + sizeof(metadata_header) + streams_size + 8;
+     section_header.SizeOfRawData = (section_header.Misc.VirtualSize + FILE_ALIGNMENT - 1) & ~(FILE_ALIGNMENT - 1);
+ 
++    /* SizeOfImage must span the whole section: its virtual address plus its
++     * virtual size, rounded up to SectionAlignment. The previous expression
++     * rounded an unrelated byte count (headers + stream sizes) up to 0x2000,
++     * which is merely *usually* large enough -- when the section's virtual size
++     * crosses a 0x1000 boundary that the 0x2000 rounding does not, the declared
++     * image is a page short of the section and the loader rejects the file with
++     * STATUS_INVALID_IMAGE_FORMAT. Two of Wine's own shipped winmds
++     * (windows.networking, windows.ui.xaml) are unloadable for this reason. */
++    nt_header.OptionalHeader.SizeOfImage = section_header.VirtualAddress +
++        ((section_header.Misc.VirtualSize + SECTION_ALIGNMENT - 1) & ~(SECTION_ALIGNMENT - 1));
++
++    put_data( &nt_header, sizeof(nt_header) );
+     put_data( &section_header, sizeof(section_header) );
+ 
+     for (i = 0; i < FILE_ALIGNMENT - sizeof(dos_header) - sizeof(nt_header) - sizeof(section_header); i++)

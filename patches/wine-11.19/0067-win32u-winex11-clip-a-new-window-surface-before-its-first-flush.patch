@@ -1,0 +1,73 @@
+win32u, winex11: Clip a new window surface before its first flush, and clip an empty region out.
+
+A window whose client surface goes offscreen gets a window surface again, and
+a new window surface is white until painted. Two things let that white reach
+the screen over the window's client surface:
+
+  - update_surface_region() set the surface's shape before its clip. A
+    changed shape flushes the whole surface, so the new surface was flushed
+    in full with no clip at all, and the window turned white until its client
+    surface was copied in again.
+
+  - x11drv_surface_set_clip() took a region with no rectangles for the
+    absence of a region and removed the clip. win32u passes NULL rects for
+    that; an empty region means nothing of the surface is visible, as when a
+    client surface covers the whole window. So every later flush painted
+    white over the client surface too.
+
+Set the clip first, and clip everything out for an empty region.
+
+In Affinity, opening the first document makes the main window's Vulkan
+surface go offscreen. A trace from the desktop where the whole window flashed
+bright, then the canvas area: surface created at +15 ms, flushed in full at
++24 ms, clip set (empty) at +29 ms. With this, under a nested KWin, the
+window's pixels and KWin's output show no white or black frame when the
+document opens, and starting Affinity and showing dialogs stay free of
+flashes.
+
+diff --git a/dlls/win32u/window.c b/dlls/win32u/window.c
+index 4b16446..92dc6e6 100644
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -2118,8 +2118,10 @@ static void update_surface_region( HWND hwnd )
+         if (win->dwExStyle & WS_EX_LAYOUTRTL) NtUserMirrorRgn( hwnd, shape );
+         NtGdiDeleteObjectApp( region );
+     }
+-    window_surface_set_shape( win->surface, shape );
+ 
++    /* Clip before setting the shape: a changed shape flushes the whole surface,
++     * and a new surface is white until painted, so without its clip that flush
++     * covers what is clipped out -- client surfaces among it -- in white. */
+     if (get_window_region( hwnd, TRUE, &region, &visible )) goto done;
+     if (!region) window_surface_set_clip( win->surface, shape );
+     else
+@@ -2130,6 +2132,8 @@ static void update_surface_region( HWND hwnd )
+         NtGdiDeleteObjectApp( region );
+     }
+ 
++    window_surface_set_shape( win->surface, shape );
++
+ done:
+     if (shape) NtGdiDeleteObjectApp( shape );
+     release_win_ptr( win );
+diff --git a/dlls/winex11.drv/bitblt.c b/dlls/winex11.drv/bitblt.c
+index 1b9c888..edc9017 100644
+--- a/dlls/winex11.drv/bitblt.c
++++ b/dlls/winex11.drv/bitblt.c
+@@ -1776,8 +1776,15 @@ static void x11drv_surface_set_clip( struct window_surface *window_surface, cons
+ 
+     TRACE( "surface %p, rects %p, count %u\n", surface, rects, count );
+ 
+-    if (!count)
++    if (!rects)
+         XSetClipMask( gdi_display, surface->gc, None );
++    else if (!count)
++    {
++        /* An empty region, not the absence of one: nothing of the surface is
++         * visible, typically because client surfaces cover all of it. */
++        XRectangle none = {0};
++        XSetClipRectangles( gdi_display, surface->gc, 0, 0, &none, 0, YXBanded );
++    }
+     else if ((xrects = xrectangles_from_rects( rects, count )))
+     {
+         XSetClipRectangles( gdi_display, surface->gc, 0, 0, xrects, count, YXBanded );

@@ -1,0 +1,71 @@
+winex11: Keep a client window's last frame while its surface goes offscreen.
+
+A Vulkan surface on a window that gains clipping children goes offscreen:
+winex11 redirects its client window and detaches it, and from then on its
+presents are copied into the window. The first copy comes a frame or more
+later. Meanwhile the window shows its background: redirecting the client
+window, which was drawn straight into the window's pixels, uncovers that
+area and the server paints it, black, before anything is copied there.
+
+Affinity's main window goes offscreen when the first document opens and the
+canvas window appears in it, and the whole window flashed black -- or white,
+depending on what was flushed there -- for 65-90 ms each time.
+
+Clear the window's background before redirecting the client window, so the
+uncovered pixels keep its last frame until the first copy replaces them, and
+restore the background once the client window is detached.
+
+Under a nested KWin, opening the first document from Affinity's welcome
+screen: a probe reading the window's pixels every 5 ms saw it go black in
+4 of 4 opens before, 0 of 5 after; KWin's output was black in 3 of 7 opens
+before (its capture is slower) and 0 of 6 after.
+
+diff --git a/dlls/winex11.drv/init.c b/dlls/winex11.drv/init.c
+index cf032cb..9e0dc00 100644
+--- a/dlls/winex11.drv/init.c
++++ b/dlls/winex11.drv/init.c
+@@ -356,6 +356,20 @@ static void client_surface_update_offscreen( HWND hwnd, struct x11drv_client_sur
+         surface->hdc_src = NtGdiOpenDCW( &device_str, NULL, NULL, 0, TRUE, NULL, NULL, NULL );
+         set_dc_drawable( surface->hdc_src, surface->window, &rect, IncludeInferiors );
+ 
++        /* Redirecting the client window takes its last frame off the window, which
++         * then shows its background until the first offscreen present is copied in,
++         * a frame or more later. Without a background the frame stays where it is;
++         * detach_client_window() puts the background back. */
++        if ((data = get_win_data( hwnd )))
++        {
++            if (data->whole_window && data->client_window == surface->window)
++            {
++                XSetWindowAttributes attr = {.background_pixmap = None};
++                XChangeWindowAttributes( gdi_display, data->whole_window, CWBackPixmap, &attr );
++            }
++            release_win_data( data );
++        }
++
+ #ifdef SONAME_LIBXCOMPOSITE
+         if (usexcomposite) pXCompositeRedirectWindow( gdi_display, surface->window, CompositeRedirectManual );
+ #endif
+diff --git a/dlls/winex11.drv/window.c b/dlls/winex11.drv/window.c
+index a4b8278..4d60b02 100644
+--- a/dlls/winex11.drv/window.c
++++ b/dlls/winex11.drv/window.c
+@@ -2375,8 +2375,19 @@ void detach_client_window( struct x11drv_win_data *data, Window client_window )
+ 
+     if (data->whole_window)
+     {
++        XSetWindowAttributes attr;
++
+         client_window_events_disable( data, client_window );
++        /* The client window's last frame is in the window's own pixels where it was;
++         * with a background, taking it out repaints that area at once -- black, or
++         * white once the window surface is flushed there -- until the next present
++         * reaches the window, which for a surface going offscreen is a whole frame
++         * later. Leave the frame in place while it goes. */
++        attr.background_pixmap = None;
++        XChangeWindowAttributes( gdi_display, data->whole_window, CWBackPixmap, &attr );
+         XReparentWindow( gdi_display, client_window, get_dummy_parent(), 0, 0 );
++        attr.background_pixel = 0;
++        XChangeWindowAttributes( gdi_display, data->whole_window, CWBackPixel, &attr );
+     }
+ 
+     data->client_window = 0;

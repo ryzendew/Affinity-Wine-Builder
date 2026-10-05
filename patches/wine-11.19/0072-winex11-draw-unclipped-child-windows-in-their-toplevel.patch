@@ -1,0 +1,218 @@
+winex11: Draw a shown, unclipped child window's client surface in its toplevel's X window.
+
+The Vulkan and OpenGL surfaces of child windows are always rendered
+offscreen: their client window is redirected, and each present is copied
+into the toplevel. Under Xwayland that copy waits for the present to
+complete (0035), which Xwayland signals on a timer for windows that are not
+mapped, and the copy itself is one more step before the compositor.
+Affinity's canvas is such a child.
+
+Draw a child's client window directly as an X child of its toplevel's
+window when the toplevel has one, and nothing clips the child: shown,
+not covered by siblings or its own children, not cut by its parent. A
+hidden child has an empty visible region, so other document tabs' canvases
+stay offscreen. The window moves back to the dummy parent when that
+changes, when the surface is detached, and before the toplevel's window is
+destroyed, which would destroy it too.
+
+needs_client_window_clipping() compared the visible region, which SYSRGN
+returns in screen coordinates, with the client rectangle at the origin, so
+any window whose client area is not at the screen's top left counted as
+clipped. Compare the sizes instead.
+
+Measured with 0050-0051 on an Arc A750 under a nested KWin (brush tip
+behind the cursor, medians of nine strokes):
+
+                 before    after
+  OpenCL off      51 ms    35 ms
+  OpenCL on       62 ms    54 ms
+
+Menus over the canvas, tab and studio switches drew correctly.
+
+diff --git a/dlls/winex11.drv/init.c b/dlls/winex11.drv/init.c
+index 9e0dc00..6cca9c4 100644
+--- a/dlls/winex11.drv/init.c
++++ b/dlls/winex11.drv/init.c
+@@ -212,7 +212,10 @@ static BOOL needs_client_window_clipping( HWND hwnd )
+     {
+         ret = NtGdiGetRandomRgn( hdc, region, SYSRGN );
+         if (ret > 0 && (ret = NtGdiGetRgnBox( region, &rect )) < NULLREGION) ret = 0;
+-        if (ret == SIMPLEREGION && EqualRect( &rect, &client )) ret = 0;
++        /* SYSRGN is in screen coordinates, so compare the size only; a visible region
++         * the size of the client area is the whole of it */
++        if (ret == SIMPLEREGION && rect.right - rect.left == client.right &&
++            rect.bottom - rect.top == client.bottom) ret = 0;
+         NtGdiDeleteObjectApp( region );
+     }
+     NtUserReleaseDC( hwnd, hdc );
+@@ -223,7 +226,14 @@ static BOOL needs_client_window_clipping( HWND hwnd )
+ static BOOL needs_offscreen_rendering( HWND hwnd, BOOL raw )
+ {
+     if (!raw && NtUserGetDpiForWindow( hwnd ) != NtUserGetWinMonitorDpi( hwnd, MDT_RAW_DPI )) return TRUE; /* needs DPI scaling */
+-    if (NtUserGetAncestor( hwnd, GA_PARENT ) != NtUserGetDesktopWindow()) return TRUE; /* child window, needs compositing */
++    if (NtUserGetAncestor( hwnd, GA_PARENT ) != NtUserGetDesktopWindow())
++    {
++        /* A child window that is shown and that nothing clips can be drawn in its
++         * toplevel's X window directly, like a toplevel's own client window. A hidden
++         * window has an empty visible region, so it is clipped too. */
++        if (!X11DRV_get_whole_window( NtUserGetAncestor( hwnd, GA_ROOT ) )) return TRUE;
++        return needs_client_window_clipping( hwnd );
++    }
+     if (NtUserGetWindowRelative( hwnd, GW_CHILD )) return needs_client_window_clipping( hwnd ); /* window has children, needs compositing */
+     return FALSE;
+ }
+@@ -266,6 +276,7 @@ static void x11drv_client_surface_destroy( struct client_surface *client )
+     TRACE( "%s\n", debugstr_client_surface( client ) );
+ 
+     if (surface->colormap != default_colormap) XFreeColormap( gdi_display, surface->colormap );
++    if (surface->window && surface->parent) XDeleteContext( gdi_display, surface->window, child_client_context );
+     if (surface->window) destroy_client_window( hwnd, surface->window );
+     if (surface->hdc_dst) NtGdiDeleteObjectApp( surface->hdc_dst );
+     if (surface->hdc_src) NtGdiDeleteObjectApp( surface->hdc_src );
+@@ -285,6 +296,12 @@ static void x11drv_client_surface_detach( struct client_surface *client )
+         detach_client_window( data, client_window );
+         release_win_data( data );
+     }
++    if (surface->parent)
++    {
++        XDeleteContext( gdi_display, client_window, child_client_context );
++        XReparentWindow( gdi_display, client_window, get_dummy_parent(), 0, 0 );
++        surface->parent = 0;
++    }
+ }
+ 
+ static void client_surface_update_geometry( HWND hwnd, struct x11drv_client_surface *surface )
+@@ -310,6 +327,28 @@ static void client_surface_update_geometry( HWND hwnd, struct x11drv_client_surf
+     XConfigureWindow( gdi_display, surface->window, mask, &changes );
+ }
+ 
++/* Put a child window's client window in its toplevel's X window while it is drawn there
++ * directly, or back in the dummy parent. Toplevels' client windows are attached to their
++ * own window data instead. */
++static void client_surface_update_parent( HWND hwnd, struct x11drv_client_surface *surface, BOOL offscreen )
++{
++    HWND toplevel = NtUserGetAncestor( hwnd, GA_ROOT );
++    Window parent = 0;
++
++    if (toplevel == hwnd) return;
++    if (!offscreen) parent = X11DRV_get_whole_window( toplevel );
++    if (parent == surface->parent) return;
++
++    TRACE( "%s client window %lx parent %lx -> %lx\n", debugstr_client_surface( &surface->client ),
++           surface->window, surface->parent, parent );
++    if (parent) XSaveContext( gdi_display, surface->window, child_client_context, (char *)hwnd );
++    else XDeleteContext( gdi_display, surface->window, child_client_context );
++    XReparentWindow( gdi_display, surface->window, parent ? parent : get_dummy_parent(),
++                     surface->changes.x, surface->changes.y );
++    XFlush( gdi_display );
++    surface->parent = parent;
++}
++
+ static void client_surface_update_offscreen( HWND hwnd, struct x11drv_client_surface *surface )
+ {
+     BOOL offscreen = needs_offscreen_rendering( hwnd, surface->client.raw );
+@@ -322,6 +361,7 @@ static void client_surface_update_offscreen( HWND hwnd, struct x11drv_client_sur
+             attach_client_window( data, surface->window );
+             release_win_data( data );
+         }
++        client_surface_update_parent( hwnd, surface, offscreen );
+         return;
+     }
+     else
+@@ -381,6 +421,7 @@ static void client_surface_update_offscreen( HWND hwnd, struct x11drv_client_sur
+         else attach_client_window( data, surface->window );
+         release_win_data( data );
+     }
++    client_surface_update_parent( hwnd, surface, offscreen );
+ }
+ 
+ static void x11drv_client_surface_update( struct client_surface *client )
+diff --git a/dlls/winex11.drv/window.c b/dlls/winex11.drv/window.c
+index 4d60b02..2812dc3 100644
+--- a/dlls/winex11.drv/window.c
++++ b/dlls/winex11.drv/window.c
+@@ -95,6 +95,9 @@ BOOL clipping_cursor = FALSE;
+ /* X context to associate a hwnd to an X window */
+ XContext winContext = 0;
+ 
++/* client windows of child windows drawn directly in their toplevel's X window */
++XContext child_client_context = 0;
++
+ /* X context to associate a struct x11drv_win_data to an hwnd */
+ static XContext win_data_context = 0;
+ static XContext host_window_context = 0;
+@@ -2439,6 +2442,30 @@ void destroy_client_window( HWND hwnd, Window client_window )
+ }
+ 
+ 
++/**********************************************************************
++ *		detach_child_client_windows
++ *
++ * Move the client windows of child windows out of a toplevel X window that
++ * is going away; destroying it would destroy them too. They are put back
++ * when their surfaces are next updated.
++ */
++void detach_child_client_windows( Window window )
++{
++    Window root, parent, *children;
++    unsigned int i, count;
++    char *ptr;
++
++    if (!XQueryTree( gdi_display, window, &root, &parent, &children, &count )) return;
++    for (i = 0; i < count; i++)
++    {
++        if (XFindContext( gdi_display, children[i], child_client_context, &ptr )) continue;
++        TRACE( "moving child client window %lx out of %lx\n", children[i], window );
++        XReparentWindow( gdi_display, children[i], get_dummy_parent(), 0, 0 );
++    }
++    if (children) XFree( children );
++}
++
++
+ /**********************************************************************
+  *		create_client_window
+  */
+@@ -2578,6 +2605,7 @@ static void destroy_whole_window( struct x11drv_win_data *data, BOOL already_des
+         XDeleteContext( data->display, data->whole_window, winContext );
+         if (!already_destroyed)
+         {
++            detach_child_client_windows( data->whole_window );
+             XSync( gdi_display, False ); /* make sure XReparentWindow requests have completed before destroying whole_window */
+             XDestroyWindow( data->display, data->whole_window );
+         }
+@@ -3911,6 +3939,7 @@ void init_win_context(void)
+     init_recursive_mutex( &win_data_mutex );
+ 
+     winContext = XUniqueContext();
++    child_client_context = XUniqueContext();
+     win_data_context = XUniqueContext();
+     host_window_context = XUniqueContext();
+     cursor_context = XUniqueContext();
+diff --git a/dlls/winex11.drv/x11drv.h b/dlls/winex11.drv/x11drv.h
+index 0f5924d..b4aa020 100644
+--- a/dlls/winex11.drv/x11drv.h
++++ b/dlls/winex11.drv/x11drv.h
+@@ -371,6 +371,7 @@ struct x11drv_client_surface
+     XWindowChanges changes;
+     Colormap colormap;
+     Window window;
++    Window parent;  /* toplevel X window a child window's client window is drawn in directly */
+ 
+     HDC hdc_src;
+     HDC hdc_dst;
+@@ -723,6 +724,7 @@ extern void release_win_data( struct x11drv_win_data *data );
+ extern void set_window_parent( struct x11drv_win_data *data, Window parent );
+ extern Window X11DRV_get_whole_window( HWND hwnd );
+ extern Window get_dummy_parent(void);
++extern void detach_child_client_windows( Window window );
+ 
+ extern BOOL window_is_reparenting( HWND hwnd );
+ extern BOOL window_should_take_focus( HWND hwnd, Time time );
+@@ -767,6 +769,7 @@ static inline void mirror_rect( const RECT *window_rect, RECT *rect )
+ 
+ /* X context to associate a hwnd to an X window */
+ extern XContext winContext;
++extern XContext child_client_context;
+ /* X context to associate an X cursor to a Win32 cursor handle */
+ extern XContext cursor_context;
+ 
