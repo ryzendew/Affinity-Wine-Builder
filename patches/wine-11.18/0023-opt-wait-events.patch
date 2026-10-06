@@ -1,0 +1,35 @@
+From: ryzendew
+Date: 2026-06-23
+Subject: Skip clWaitForEvents thunk when all events already completed
+
+Before the thunk call, checks event execution status. If all events
+are CL_COMPLETE, returns immediately without blocking.
+
+diff -uNarp a/dlls/opencl/pe_thunks.c b/dlls/opencl/pe_thunks.c
+--- a/dlls/opencl/pe_thunks.c	2026-06-23 04:48:09.157353992 -0300
++++ b/dlls/opencl/pe_thunks.c	2026-06-23 04:48:09.158119377 -0300
+@@ -849,9 +849,24 @@ cl_int WINAPI clUnloadPlatformCompiler(
+ 
+ cl_int WINAPI clWaitForEvents( cl_uint num_events, const cl_event* event_list )
+ {
++    cl_uint i;
+     cl_int ret;
+     struct clWaitForEvents_params params = { num_events, event_list };
+     TRACE( "(%u, %p)\n", num_events, event_list );
++
++    for (i = 0; i < num_events; i++)
++    {
++        cl_int status;
++        struct clGetEventInfo_params info_params = { event_list[i], CL_EVENT_COMMAND_EXECUTION_STATUS, sizeof(status), &status, NULL };
++        OPENCL_CALL( clGetEventInfo, &info_params );
++        if (status != CL_COMPLETE) break;
++    }
++    if (i == num_events)
++    {
++        TRACE( "all events already completed, skipping thunk\n" );
++        return CL_SUCCESS;
++    }
++
+     ret = OPENCL_CALL( clWaitForEvents, &params );
+     check_completed_callbacks();
+     return ret;

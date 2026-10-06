@@ -1,0 +1,73 @@
+widl metadata: two fixes (ported to 11.18)
+
+11.16's 0011 carried three. The third -- serialize_methodimpl_table passed
+row->class as its own target table -- is upstream as 8b963e98 ("widl: Pass
+correct target table in serialize_methodimpl_table()"), so it is dropped.
+The two left: a parameterized interface with no contract of its own
+(IMap<K,V>, IIterable<T>) no longer dereferences NULL in
+add_method_contract_attrs, and every static() attribute on a runtimeclass
+gets its MemberRef, not only the first -- the rest were emitted as the
+invalid token 0x0a000000.
+
+---
+--- a/tools/widl/metadata.c
++++ b/tools/widl/metadata.c
+@@ -2834,11 +2834,22 @@ static void add_method_contract_attrs( const type_t *class, const type_t *iface,
+ {
+     UINT parent, attr_type, value_size;
+     BYTE value[MAX_NAME + sizeof(UINT) + 5];
++    const attr_t *class_attr = class ? get_attr( class->attrs, ATTR_CONTRACT ) : NULL;
+     const attr_t *attr = get_attr( iface->attrs, ATTR_CONTRACT );
+ 
++    /* A parameterized interface such as IMap<K,V>, IMapView<K,V> or IIterable<T>
++     * carries no contract of its own -- those are versioned in Windows.Foundation,
++     * not in the file being compiled -- so get_attr() returns NULL and we would
++     * dereference it. The attribute is only needed for its ContractVersionAttribute
++     * .ctor MemberRef; the value stamped is the class's contract either way, so
++     * fall back to the class, whose contract is registered first (see
++     * add_runtimeclass_type_step2). */
++    if (!attr || !attr->md_member) attr = class_attr;
++    if (!attr || !attr->md_member || !class_attr) return;
++
+     parent = has_customattribute( TABLE_METHODDEF, method->md.def );
+     attr_type = customattribute_type( TABLE_MEMBERREF, attr->md_member );
+-    value_size = make_contract_value( get_attr(class->attrs, ATTR_CONTRACT), value );
++    value_size = make_contract_value( class_attr, value );
+     add_customattribute_row( parent, attr_type, add_blob(value, value_size) );
+ 
+     if (method->md.class_property)
+@@ -2889,18 +2900,25 @@ static void add_static_attr_step1( const type_t *type )
+     BYTE sig[32];
+     attr_t *attr;
+ 
+-    if (!(attr = get_attr( type->attrs, ATTR_STATIC ))) return;
++    /* A runtimeclass may carry several static() attributes; step2 emits a custom
++     * attribute for every one of them and reads attr->md_member from each, so a
++     * MemberRef has to be recorded on each. get_attr() returns only the first,
++     * which left the rest with md_member 0 -- an invalid 0x0a000000 token. */
++    if (type->attrs) LIST_FOR_EACH_ENTRY_REV( attr, type->attrs, attr_t, entry )
++    {
++        if (attr->type != ATTR_STATIC) continue;
+ 
+-    assemblyref = add_assemblyref_row( 0x200, 0, add_string("Windows.Foundation") );
+-    scope = resolution_scope( TABLE_ASSEMBLYREF, assemblyref );
+-    typeref = add_typeref_row( scope, add_string("StaticAttribute"), add_string("Windows.Foundation.Metadata") );
++        assemblyref = add_assemblyref_row( 0x200, 0, add_string("Windows.Foundation") );
++        scope = resolution_scope( TABLE_ASSEMBLYREF, assemblyref );
++        typeref = add_typeref_row( scope, add_string("StaticAttribute"), add_string("Windows.Foundation.Metadata") );
+ 
+-    scope = resolution_scope( TABLE_ASSEMBLYREF, MSCORLIB_ROW );
+-    typeref_type = add_typeref_row( scope, add_string("Type"), add_string("System") );
++        scope = resolution_scope( TABLE_ASSEMBLYREF, MSCORLIB_ROW );
++        typeref_type = add_typeref_row( scope, add_string("Type"), add_string("System") );
+ 
+-    class = memberref_parent( TABLE_TYPEREF, typeref );
+-    sig_size = make_member_sig3( typedef_or_ref(TABLE_TYPEREF, typeref_type), sig );
+-    attr->md_member = add_memberref_row( class, add_string(".ctor"), add_blob(sig, sig_size) );
++        class = memberref_parent( TABLE_TYPEREF, typeref );
++        sig_size = make_member_sig3( typedef_or_ref(TABLE_TYPEREF, typeref_type), sig );
++        attr->md_member = add_memberref_row( class, add_string(".ctor"), add_blob(sig, sig_size) );
++    }
+ }
+ 
+ static void add_static_attr_step2( const type_t *type )

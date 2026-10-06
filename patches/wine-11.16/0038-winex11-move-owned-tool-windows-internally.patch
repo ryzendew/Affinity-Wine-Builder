@@ -1,0 +1,34 @@
+--- a/dlls/winex11.drv/window.c
++++ b/dlls/winex11.drv/window.c
+@@ -3623,6 +3623,31 @@
+     switch (wparam & 0xfff0)
+     {
+     case SC_MOVE:
++        /* An owned tool window is a floating palette. Applications drag these
++         * back onto their main window to dock them, and to work out where the
++         * drop lands they need the mouse messages for the whole drag. Handing
++         * the move to the window manager does not give them that:
++         * move_resize_window() calls XUngrabPointer() and sends
++         * _NET_WM_MOVERESIZE, after which the application sits in
++         * WM_ENTERSIZEMOVE seeing no WM_MOUSEMOVE until the window manager is
++         * finished. It can poll GetWindowRect for where the window is, but
++         * never learns where the cursor is, so a dock target can never be hit.
++         *
++         * Returning -1 lets win32u run its own move loop, which keeps
++         * delivering mouse messages to the application. Only owned tool
++         * windows take this path, so ordinary windows -- including the
++         * application's main window -- are still moved by the window manager
++         * and keep its snapping and tiling.
++         *
++         * Without this, panels in Affinity undock but cannot be re-docked
++         * under KWin. Undocking starts from a client-area press and never
++         * reaches here; re-docking grabs the palette's caption, which does. */
++        if ((NtUserGetWindowLongW( hwnd, GWL_EXSTYLE ) & WS_EX_TOOLWINDOW) &&
++            NtUserGetWindowRelative( hwnd, GW_OWNER ))
++        {
++            TRACE( "hwnd %p is an owned tool window, moving it internally\n", hwnd );
++            goto failed;
++        }
+         if (!hittest) dir = _NET_WM_MOVERESIZE_MOVE_KEYBOARD;
+         else dir = _NET_WM_MOVERESIZE_MOVE;
+         break;

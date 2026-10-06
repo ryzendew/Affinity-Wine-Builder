@@ -1,0 +1,75 @@
+win32u: end the SC_MOVE/SC_SIZE loop when the mouse button is released.
+
+sys_command_size_move() only tests for the end of a drag on messages it
+dispatches. An application can consume the WM_LBUTTONUP itself -- a dockable
+panel accepting a drop does exactly that -- and a stream of WM_MOUSEMOVE takes
+the other path through the loop, so the loop can spin holding the
+GUI_INMOVESIZE capture long after the button came up. The layout has already
+changed underneath; the UI stays stuck until some unrelated click finally
+delivers a message that trips the existing check.
+
+Test the button state every iteration instead, and only for moves that began
+with the mouse, so a keyboard move still waits for Return or Escape.
+
+The message that revealed it is dispatched rather than dropped.
+NtUserGetMessage has already removed it from the queue, and it is whatever
+happened to arrive -- commonly the private message a UI toolkit uses to drain
+its dispatcher queue. Losing that leaves the application in a worse state than
+the spin being fixed, which is the same reasoning upstream gives for placing
+its own button check after the dispatch.
+
+Verified against Affinity 3: dragging a floating panel onto a dock target
+releases the capture as the button comes up rather than at the next unrelated
+click, and tools/kbmove.c confirms the keyboard path still moves a window and
+still exits on Return.
+
+--- a/dlls/win32u/defwnd.c
++++ b/dlls/win32u/defwnd.c
+@@ -676,7 +676,7 @@
+ static void sys_command_size_move( HWND hwnd, WPARAM wparam )
+ {
+     DWORD msg_pos = NtUserGetMessagePos();
+-    BOOL thickframe, drag_full_windows = TRUE, moved = FALSE;
++    BOOL thickframe, drag_full_windows = TRUE, moved = FALSE, mouse_drag;
+     RECT sizing_rect, mouse_rect, orig_rect;
+     UINT hittest = wparam & 0x0f;
+     UINT syscommand = wparam & 0xfff0;
+@@ -779,6 +779,7 @@
+ 
+     send_message( hwnd, WM_ENTERSIZEMOVE, 0, 0 );
+     set_capture_window( hwnd, GUI_INMOVESIZE, NULL );
++    mouse_drag = (NtUserGetKeyState( VK_LBUTTON ) & 0x8000) != 0;
+ 
+     for (;;)
+     {
+@@ -787,6 +788,30 @@
+         if (!NtUserGetMessage( &msg, 0, 0, 0 )) break;
+         if (NtUserCallMsgFilter( &msg, MSGF_SIZE )) continue;
+ 
++        /* An application can consume the WM_LBUTTONUP itself: a dockable panel
++         * accepting a drop does exactly that, as does a window that is
++         * re-parented or destroyed as part of the drop. The check further down
++         * only runs for messages we dispatch, and a stream of WM_MOUSEMOVE
++         * takes the other path, so we can spin here holding the
++         * GUI_INMOVESIZE capture long after the button came up -- the layout
++         * has changed underneath but the UI stays stuck until some unrelated
++         * click finally delivers a message that trips that check. Test the
++         * button every iteration instead. Only for moves that began with the
++         * mouse, so keyboard moves still wait for Return or Escape. */
++        if (mouse_drag && !(NtUserGetKeyState( VK_LBUTTON ) & 0x8000))
++        {
++            /* Deliver the message we just took. NtUserGetMessage has already
++             * removed it from the queue, so breaking here drops it -- and it is
++             * whatever happened to arrive, commonly the private message a UI
++             * toolkit uses to drain its dispatcher queue. Losing that leaves
++             * the application in a worse state than the spin this exits for,
++             * which is exactly the reasoning upstream gives for putting its own
++             * button check after the dispatch. */
++            NtUserTranslateMessage( &msg, 0 );
++            NtUserDispatchMessage( &msg );
++            break;
++        }
++
+         /* Exit on button-up, Return, or Esc */
+         if (msg.message == WM_LBUTTONUP ||
+             (msg.message == WM_KEYDOWN && (msg.wParam == VK_RETURN || msg.wParam == VK_ESCAPE)))

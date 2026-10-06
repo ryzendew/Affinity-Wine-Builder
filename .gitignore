@@ -28,3 +28,15 @@ Affinity.log
 
 wine-11.0.tar.xz
 .vscode/settings.json
+
+# Wine 11.16 build artifacts
+wine-11.16.tar.xz
+/wine-11.16/
+/ElementalWarrior-wine-11.16/
+/ElementalWarrior-wine-11.16.tar.xz
+
+# Wine 11.18 build artifacts
+wine-11.18.tar.xz
+/wine-11.18/
+/ElementalWarrior-wine-11.18/
+/ElementalWarrior-wine-11.18.tar.xz

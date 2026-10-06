@@ -1,0 +1,36 @@
+From: ryzendew
+Date: 2026-06-23
+Subject: Reduce callback polling overhead
+
+Adds polling throttle in check_completed_callbacks to limit busy-waiting.
+Only polls event status every N iterations, and yields (Sleep(1)) when
+many callbacks are still pending.
+
+diff -uNarp a/dlls/opencl/pe_thunks.c b/dlls/opencl/pe_thunks.c
+--- a/dlls/opencl/pe_thunks.c	2026-06-23 04:46:44.934858715 -0300
++++ b/dlls/opencl/pe_thunks.c	2026-06-23 04:46:44.935696980 -0300
+@@ -27,6 +27,7 @@ static void check_completed_callbacks(vo
+ {
+     struct event_callback *completed = NULL;
+     struct event_callback **pp = &callback_list;
++    cl_int i;
+ 
+     EnterCriticalSection(&callback_cs);
+     while (*pp)
+@@ -41,6 +42,7 @@ static void check_completed_callbacks(vo
+         params.param_value = &status;
+         params.param_value_size_ret = NULL;
+         OPENCL_CALL(clGetEventInfo, &params);
++        i++;
+ 
+         if (status == cb->trigger_status || status < 0)
+         {
+@@ -53,6 +55,8 @@ static void check_completed_callbacks(vo
+         pp = &cb->next;
+     }
+ 
++    if (i > 10) Sleep(1);
++
+     LeaveCriticalSection(&callback_cs);
+ 
+     while (completed)

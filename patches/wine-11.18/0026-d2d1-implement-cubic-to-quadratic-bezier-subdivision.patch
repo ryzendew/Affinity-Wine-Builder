@@ -1,0 +1,193 @@
+From 194c681545e4dff44bf066d6c9ffd9d3bd50927b Mon Sep 17 00:00:00 2001
+From: noahc3 <noahcuroe@gmail.com>
+Date: Sat, 28 Mar 2026 18:26:06 -0300
+Subject: [PATCH] =?UTF-8?q?d2d1:=20implement=20cubic-to-quadratic=20B?=
+ =?UTF-8?q?=C3=A9zier=20subdivision=20for=20accurate=20path=20rendering?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Wine's d2d1 approximated every cubic Bézier with a single quadratic
+using Q = (3·P1 + 3·P2 − P0 − P3)/4.  This is exact only when the
+cubic is a degree-elevated quadratic; for true cubics (as generated
+by Affinity and other DTP apps) the single-quadratic approximation
+introduces visible distortion on curves with high curvature or
+inflection points.
+
+Replace the single-quadratic FIXME path with recursive adaptive
+subdivision using de Casteljau splitting at t = 0.5.  At each level
+the squared approximation error at the midpoint is compared against
+a tolerance (0.25, i.e. 0.5² units); when the error is acceptable
+the cubic sub-segment is emitted as a quadratic, otherwise it is
+split and both halves are processed recursively (max depth 16).
+
+Each emitted quadratic stores its own pair of original_bezier_controls
+(the cubic sub-segment's cp1/cp2) so that Stream, Simplify and
+Outline continue to reconstruct correct cubic curves.
+
+Based on the cubic Bézier subdivision algorithm from
+AffinityPluginLoader/WineFix by noahc3.
+
+Co-authored-by: Arecsu <alejandro9r@gmail.com>
+---
+ dlls/d2d1/geometry.c | 130 ++++++++++++++++++++++++++++++++++++-------
+ 1 file changed, 111 insertions(+), 19 deletions(-)
+
+diff --git a/dlls/d2d1/geometry.c b/dlls/d2d1/geometry.c
+index 0c2b2a2..1c80895 100644
+--- a/dlls/d2d1/geometry.c
++++ b/dlls/d2d1/geometry.c
+@@ -1057,39 +1057,131 @@ static BOOL d2d_figure_add_original_bezier_controls(struct d2d_figure *figure, s
+     return TRUE;
+ }
+ 
+-static bool d2d_figure_add_beziers(struct d2d_figure *figure, const D2D1_BEZIER_SEGMENT *beziers,
+-        UINT32 count)
++/* Subdivide a cubic Bézier at t=0.5 using de Casteljau's algorithm.
++ * Produces two cubic sub-segments (left, right) and the midpoint. */
++static void d2d_bezier_cubic_subdivide(const D2D1_POINT_2F *p0,
++        const D2D1_BEZIER_SEGMENT *b,
++        D2D1_BEZIER_SEGMENT *left, D2D1_BEZIER_SEGMENT *right, D2D1_POINT_2F *mid)
+ {
+-    D2D1_POINT_2F p;
+-    unsigned int i;
++    D2D1_POINT_2F q0, q1, q2, r0, r1;
+ 
+-    for (i = 0; i < count; ++i)
++    q0.x = (p0->x + b->point1.x) * 0.5f;
++    q0.y = (p0->y + b->point1.y) * 0.5f;
++    q1.x = (b->point1.x + b->point2.x) * 0.5f;
++    q1.y = (b->point1.y + b->point2.y) * 0.5f;
++    q2.x = (b->point2.x + b->point3.x) * 0.5f;
++    q2.y = (b->point2.y + b->point3.y) * 0.5f;
++
++    r0.x = (q0.x + q1.x) * 0.5f;
++    r0.y = (q0.y + q1.y) * 0.5f;
++    r1.x = (q1.x + q2.x) * 0.5f;
++    r1.y = (q1.y + q2.y) * 0.5f;
++
++    mid->x = (r0.x + r1.x) * 0.5f;
++    mid->y = (r0.y + r1.y) * 0.5f;
++
++    left->point1 = q0;
++    left->point2 = r0;
++    left->point3 = *mid;
++
++    right->point1 = r1;
++    right->point2 = q2;
++    right->point3 = b->point3;
++}
++
++/* Recursively convert a cubic Bézier to one or more quadratic Bézier
++ * segments using adaptive subdivision.
++ *
++ * The quadratic control point Q is computed with the standard optimal
++ * formula: Q = (3*P1 + 3*P2 - P0 - P3) / 4, which minimises the
++ * maximum approximation error.
++ *
++ * For this formula the error E(t) = D * t*(t-0.5)*(t-1) where
++ * D = P3 - 3*P2 + 3*P1 - P0.  E(0) = E(0.5) = E(1) = 0, and the
++ * maxima are at t = (3 ± sqrt(3))/6 with |E|_max = |D| * sqrt(3)/36.
++ * So max_error^2 = |D|^2 / 432 (since 3/36^2 = 1/432).
++ *
++ * Each emitted quadratic also stores two original_bezier_controls
++ * (the cubic sub-segment's cp1 and cp2) so that Stream, Simplify
++ * and Outline can reconstruct cubic segments later. */
++static bool d2d_figure_add_cubic_bezier_recursive(struct d2d_figure *figure,
++        const D2D1_POINT_2F *p0, const D2D1_BEZIER_SEGMENT *cubic,
++        float tol_sq, unsigned int depth)
++{
++    float dx, dy, d_sq;
++
++    /* At max depth, emit a single quadratic regardless of error. */
++    if (depth < 16)
++    {
++        /* D = P3 - 3*P2 + 3*P1 - P0  (the "cubic-ness" vector). */
++        dx = cubic->point3.x - 3.0f * cubic->point2.x
++                + 3.0f * cubic->point1.x - p0->x;
++        dy = cubic->point3.y - 3.0f * cubic->point2.y
++                + 3.0f * cubic->point1.y - p0->y;
++        d_sq = dx * dx + dy * dy;
++
++        /* max_error^2 = |D|^2 / 432.  Subdivide when this exceeds tol_sq. */
++        if (d_sq > tol_sq * 432.0f)
++        {
++            D2D1_BEZIER_SEGMENT left, right;
++            D2D1_POINT_2F mid;
++
++            d2d_bezier_cubic_subdivide(p0, cubic, &left, &right, &mid);
++
++            if (!d2d_figure_add_cubic_bezier_recursive(figure, p0, &left, tol_sq, depth + 1))
++                return false;
++            if (!d2d_figure_add_cubic_bezier_recursive(figure, &mid, &right, tol_sq, depth + 1))
++                return false;
++
++            return true;
++        }
++    }
++
++    /* Error acceptable (or max depth) — emit one quadratic segment. */
+     {
++        D2D1_POINT_2F q;
+         D2D1_RECT_F bezier_bounds;
+ 
+-        if (!d2d_figure_add_original_bezier_controls(figure, 1, &beziers[i].point1)
+-                || !d2d_figure_add_original_bezier_controls(figure, 1, &beziers[i].point2))
+-        {
++        /* Q = (3*P1 + 3*P2 - P0 - P3) / 4 */
++        q.x = (cubic->point1.x + cubic->point2.x) * 0.75f
++                - (p0->x + cubic->point3.x) * 0.25f;
++        q.y = (cubic->point1.y + cubic->point2.y) * 0.75f
++                - (p0->y + cubic->point3.y) * 0.25f;
++
++        /* Store this sub-segment's cubic control points so that
++         * Stream/Simplify/Outline can reconstruct cubics. */
++        if (!d2d_figure_add_original_bezier_controls(figure, 1, &cubic->point1)
++                || !d2d_figure_add_original_bezier_controls(figure, 1, &cubic->point2))
+             return false;
+-        }
+ 
+-        /* FIXME: This tries to approximate a cubic Bézier with a quadratic one. */
+-        p.x = (beziers[i].point1.x + beziers[i].point2.x) * 0.75f;
+-        p.y = (beziers[i].point1.y + beziers[i].point2.y) * 0.75f;
+-        p.x -= (figure->vertices[figure->vertex_count - 1].x + beziers[i].point3.x) * 0.25f;
+-        p.y -= (figure->vertices[figure->vertex_count - 1].y + beziers[i].point3.y) * 0.25f;
+         figure->vertex_types[figure->vertex_count - 1] = D2D_VERTEX_TYPE_BEZIER;
+ 
+-        d2d_rect_get_bezier_bounds(&bezier_bounds, &figure->vertices[figure->vertex_count - 1],
+-                &p, &beziers[i].point3);
++        d2d_rect_get_bezier_bounds(&bezier_bounds, p0, &q, &cubic->point3);
+ 
+-        if (!d2d_figure_add_bezier_controls(figure, 1, &p))
++        if (!d2d_figure_add_bezier_controls(figure, 1, &q))
+             return false;
+-
+-        if (!d2d_figure_add_vertex(figure, beziers[i].point3))
++        if (!d2d_figure_add_vertex(figure, cubic->point3))
+             return false;
+ 
+         d2d_rect_union(&figure->bounds, &bezier_bounds);
++        return true;
++    }
++}
++
++static bool d2d_figure_add_beziers(struct d2d_figure *figure, const D2D1_BEZIER_SEGMENT *beziers,
++        UINT32 count)
++{
++    /* Squared tolerance for cubic-to-quadratic conversion.
++     * 0.25 = 0.5^2 — half a unit in figure space. */
++    const float tol_sq = 0.25f;
++    unsigned int i;
++
++    for (i = 0; i < count; ++i)
++    {
++        const D2D1_POINT_2F *p0 = &figure->vertices[figure->vertex_count - 1];
++
++        if (!d2d_figure_add_cubic_bezier_recursive(figure, p0, &beziers[i], tol_sq, 0))
++            return false;
+     }
+ 
+     return true;
+-- 
+2.53.0
+

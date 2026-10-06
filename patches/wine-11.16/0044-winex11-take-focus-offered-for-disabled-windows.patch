@@ -1,0 +1,121 @@
+winex11: take the focus the window manager offers, even when disabled.
+
+WM_TAKE_FOCUS is the window manager's one and only offer. It sets
+_NET_ACTIVE_WINDOW first and then sends the message; it does not ask
+twice. can_activate_window() refuses a window with WS_DISABLED, so Wine
+declines the offer, falls through to looking for another window, finds
+the thread has neither a focus window nor an active window, and gives up
+without a word -- no error, nothing logged above trace level.
+
+The X input focus then stays where the window manager left it, which
+under KWin is its own null-focus window. The application is the active
+window as far as the window manager and the user are concerned, and
+unreachable from the keyboard at the same time. Clicking it or alt-tabbing
+away and back is what fixes it, so it reads as "the keyboard randomly
+stops working" rather than as anything to do with focus.
+
+A window is routinely disabled at exactly this moment. The owner of a
+modal dialog is disabled for the dialog's whole lifetime, and with the
+XDG portal file chooser the window manager hands the focus back when the
+portal's window is destroyed -- which happens before the D-Bus call
+returns, so the owner is still disabled when the offer arrives. That is
+also the Windows behaviour being modelled: a disabled top-level window
+can be the foreground window, and the owner of a modal dialog is exactly
+that for as long as the dialog is up.
+
+Traced with WINEDEBUG=-all,+event,+x11drv. Two WM_TAKE_FOCUS messages for
+the same window, seconds apart, differing in one style bit:
+
+  serial 569  foreground 0x14008a  enabled 1  style 0x17cf0000
+              set_focus setting foreground window to 0x14008a
+              set_focus setting focus to 0x14008a (180000b) time=9550464
+
+  serial 610  foreground 0x10020   enabled 0  style 0x1fcf0000
+              focus (nil), active (nil), last 0x14008a
+              (nothing)
+
+0x1fcf0000 ^ 0x17cf0000 == 0x08000000 == WS_DISABLED. The log then shows
+the window manager had already done its part:
+
+  warn:x11drv:handle_state_change unexpected _NET_ACTIVE_WINDOW 0x14008a/180000b
+
+Only the WM_TAKE_FOCUS path passes allow_disabled. Wine is no readier to
+pick a disabled window for itself than it was; it is only willing to
+accept one the window manager has already picked.
+
+Note that SetForegroundWindow cannot paper over this from the application
+side: set_net_active_window() returns early when
+pending_state.net_active_window already names the window, which it does
+here, so the request sends nothing at all.
+
+--- a/dlls/winex11.drv/event.c
++++ b/dlls/winex11.drv/event.c
+@@ -432,7 +432,7 @@
+  *
+  * Check if we can activate the specified window.
+  */
+-static inline BOOL can_activate_window( HWND hwnd )
++static inline BOOL can_activate_window( HWND hwnd, BOOL allow_disabled )
+ {
+     LONG style = NtUserGetWindowLongW( hwnd, GWL_STYLE );
+     struct x11drv_win_data *data;
+@@ -454,7 +454,12 @@
+     if (hwnd == NtUserGetDesktopWindow()) return FALSE;
+     if (NtUserGetPresentRect( hwnd, &rect, 0 )) return TRUE;
+     if (NtUserGetWindowRect( hwnd, &rect, NtUserGetDpiForWindow( hwnd ) ) && IsRectEmpty( &rect )) return FALSE;
+-    return !(style & WS_DISABLED);
++    /* A disabled window can still be the foreground window: the owner of a
++     * modal dialog is disabled for the dialog's whole lifetime and remains the
++     * active window throughout. Refusing to activate one is right when we are
++     * picking a window ourselves, and wrong when the window manager has already
++     * picked this one -- see the WM_TAKE_FOCUS handler. */
++    return allow_disabled || !(style & WS_DISABLED);
+ }
+ 
+ 
+@@ -618,7 +623,19 @@
+         }
+         SERVER_END_REQ;
+ 
+-        if (can_activate_window(hwnd))
++        /* Accept it even when the window is disabled. The window manager has
++         * already made this window active -- it set _NET_ACTIVE_WINDOW before
++         * sending this message -- and WM_TAKE_FOCUS is the only offer it makes;
++         * it does not ask twice. Declining leaves the X input focus wherever it
++         * was, typically the window manager's own null-focus window, so the
++         * application is active and unreachable from the keyboard at the same
++         * time, until the user clicks it or alt-tabs away and back.
++         *
++         * A window is routinely disabled at exactly this moment: an owner
++         * disabled for the duration of a modal dialog is re-enabled only after
++         * the dialog returns, while the window manager hands the focus back as
++         * soon as the dialog's window is destroyed. */
++        if (can_activate_window(hwnd, TRUE))
+         {
+             set_focus( event->display, hwnd, event_time );
+             return;
+@@ -636,7 +653,7 @@
+         if (hwnd) hwnd = NtUserGetAncestor( hwnd, GA_ROOT );
+         if (!hwnd) hwnd = get_active_window();
+         if (!hwnd) hwnd = last_focus;
+-        if (hwnd && can_activate_window(hwnd)) set_focus( event->display, hwnd, event_time );
++        if (hwnd && can_activate_window(hwnd, FALSE)) set_focus( event->display, hwnd, event_time );
+     }
+     else if (protocol == x11drv_atom(_NET_WM_PING))
+     {
+@@ -722,13 +739,13 @@
+ 
+     if (use_take_focus) return TRUE;
+ 
+-    if (!can_activate_window(hwnd))
++    if (!can_activate_window(hwnd, FALSE))
+     {
+         HWND hwnd = get_focus();
+         if (hwnd) hwnd = NtUserGetAncestor( hwnd, GA_ROOT );
+         if (!hwnd) hwnd = get_active_window();
+         if (!hwnd) hwnd = x11drv_thread_data()->last_focus;
+-        if (hwnd && can_activate_window(hwnd)) set_focus( event->display, hwnd, CurrentTime );
++        if (hwnd && can_activate_window(hwnd, FALSE)) set_focus( event->display, hwnd, CurrentTime );
+     }
+     else NtUserSetForegroundWindowInternal( hwnd );
+     return TRUE;

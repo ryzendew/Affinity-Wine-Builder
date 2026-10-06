@@ -1,0 +1,132 @@
+From: ElementalWarrior
+Date: 2026-06-23
+Subject: Add SRWLOCK synchronization to OpenCL caches and LRU eviction for info cache
+
+Wraps the extension cache and info cache access with SRWLOCK for thread safety.
+Adds LRU eviction to the info cache (max 256 entries) to prevent unbounded memory
+growth. Previously the caches had no synchronization and the info cache leaked
+HeapAlloc'd entries for the process lifetime.
+
+diff -uNarp a/dlls/opencl/pe_wrappers.c b/dlls/opencl/pe_wrappers.c
+--- a/dlls/opencl/pe_wrappers.c	2026-06-23 15:53:28.530245477 -0300
++++ b/dlls/opencl/pe_wrappers.c	2026-06-23 15:57:35.375584631 -0300
+@@ -31,6 +31,8 @@
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(opencl);
+ 
++static SRWLOCK opencl_cache_lock = SRWLOCK_INIT;
++
+ static struct
+ {
+     char *raw;
+@@ -52,17 +54,26 @@
+     TRACE( "got host extension string %s\n", debugstr_a( unix_exts ) );
+ 
+     unix_len = strlen( unix_exts ) + 1;
+-    if (ext_cache.raw && unix_len == ext_cache.raw_len && !memcmp( unix_exts, ext_cache.raw, unix_len ))
++
++    AcquireSRWLockShared( &opencl_cache_lock );
++    BOOL cache_hit = (ext_cache.raw && unix_len == ext_cache.raw_len
++                      && !memcmp( unix_exts, ext_cache.raw, unix_len ));
++    if (cache_hit)
+     {
+         TRACE( "using cached extensions\n" );
+-        if (ret_size) *ret_size = ext_cache.filtered_len;
++        SIZE_T cached_len = ext_cache.filtered_len;
++        ReleaseSRWLockShared( &opencl_cache_lock );
++        if (ret_size) *ret_size = cached_len;
+         if (win_exts)
+         {
+-            if (size < ext_cache.filtered_len) return CL_INVALID_VALUE;
+-            memcpy( win_exts, ext_cache.filtered, ext_cache.filtered_len );
++            if (size < cached_len) return CL_INVALID_VALUE;
++            AcquireSRWLockShared( &opencl_cache_lock );
++            memcpy( win_exts, ext_cache.filtered, cached_len );
++            ReleaseSRWLockShared( &opencl_cache_lock );
+         }
+         return CL_SUCCESS;
+     }
++    ReleaseSRWLockShared( &opencl_cache_lock );
+ 
+     ext = unix_exts;
+     win_size = 0;
+@@ -125,12 +136,18 @@
+ 
+     TRACE( "returning extension string %s\n", debugstr_a(win_exts) );
+ 
+-    free( ext_cache.raw );
+-    free( ext_cache.filtered );
+-    ext_cache.raw = strdup( unix_exts );
+-    ext_cache.raw_len = unix_len;
+-    ext_cache.filtered = strdup( win_exts );
+-    ext_cache.filtered_len = strlen( win_exts ) + 1;
++    {
++        char *new_raw = strdup( unix_exts );
++        char *new_filtered = strdup( win_exts );
++        AcquireSRWLockExclusive( &opencl_cache_lock );
++        free( ext_cache.raw );
++        free( ext_cache.filtered );
++        ext_cache.raw = new_raw;
++        ext_cache.raw_len = unix_len;
++        ext_cache.filtered = new_filtered;
++        ext_cache.filtered_len = strlen( win_exts ) + 1;
++        ReleaseSRWLockExclusive( &opencl_cache_lock );
++    }
+ 
+     return CL_SUCCESS;
+ }
+@@ -428,26 +445,43 @@
+ };
+ 
+ static struct info_cache_entry *info_cache_head;
++static unsigned int info_cache_count;
++#define INFO_CACHE_MAX_ENTRIES 256
+ 
+ static void *info_cache_find( void *object, cl_uint name, int is_platform, size_t *out_size )
+ {
++    AcquireSRWLockShared( &opencl_cache_lock );
+     struct info_cache_entry *entry = info_cache_head;
+     while (entry)
+     {
+         if (entry->object == object && entry->name == name && entry->is_platform == is_platform)
+         {
+             *out_size = entry->size;
+-            return entry->data;
++            void *data = entry->data;
++            ReleaseSRWLockShared( &opencl_cache_lock );
++            return data;
+         }
+         entry = entry->next;
+     }
++    ReleaseSRWLockShared( &opencl_cache_lock );
+     return NULL;
+ }
+ 
+ static void info_cache_store( void *object, cl_uint name, int is_platform, const void *data, size_t size )
+ {
++    AcquireSRWLockExclusive( &opencl_cache_lock );
++
++    if (info_cache_count >= INFO_CACHE_MAX_ENTRIES)
++    {
++        struct info_cache_entry **pp = &info_cache_head;
++        while ((*pp)->next) pp = &(*pp)->next;
++        HeapFree( GetProcessHeap(), 0, *pp );
++        *pp = NULL;
++        info_cache_count--;
++    }
++
+     struct info_cache_entry *entry = HeapAlloc( GetProcessHeap(), 0, sizeof(*entry) + size );
+-    if (!entry) return;
++    if (!entry) { ReleaseSRWLockExclusive( &opencl_cache_lock ); return; }
+     entry->object = object;
+     entry->name = name;
+     entry->is_platform = is_platform;
+@@ -455,5 +489,8 @@
+     memcpy( entry->data, data, size );
+     entry->next = info_cache_head;
+     info_cache_head = entry;
++    info_cache_count++;
++
++    ReleaseSRWLockExclusive( &opencl_cache_lock );
+ }
+ 

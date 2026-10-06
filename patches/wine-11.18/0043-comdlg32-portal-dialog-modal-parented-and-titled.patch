@@ -1,0 +1,237 @@
+--- a/dlls/comdlg32/itemdlg.c
++++ b/dlls/comdlg32/itemdlg.c
+@@ -2610,14 +2610,37 @@
+ 
+ /* Like call_unix_portal but pumps the Windows message loop while waiting,
+  * preventing the calling window from appearing frozen during long portal calls. */
+-static NTSTATUS call_unix_portal_pumping(enum comdlg32_unix_funcs code, void *params)
++static NTSTATUS call_unix_portal_pumping(enum comdlg32_unix_funcs code, void *params, HWND hwndOwner)
+ {
+     struct portal_call_thread_params thread_params = { code, params, STATUS_INTERNAL_ERROR };
+     HANDLE thread;
+     MSG msg;
++    BOOL owner_disabled = FALSE;
++
++    /* IFileDialog::Show is modal: the owner is disabled for the duration and
++     * re-enabled when the dialog returns. The non-portal path gets that from the
++     * dialog manager; this path has to do it itself.
++     *
++     * Pumping the owner's message loop keeps the application repainting, but
++     * without disabling it the application also keeps *accepting input* -- menus,
++     * accelerators and buttons all still work while the file chooser is up. That
++     * is not cosmetic. The user can start a second Export while the first chooser
++     * is still open; the first is then orphaned behind the main window, and
++     * closing them out of order crashes the application with an
++     * AccessViolationException in a dialog callback still holding a released
++     * DataSource. */
++    if (hwndOwner && IsWindowEnabled(hwndOwner))
++    {
++        EnableWindow(hwndOwner, FALSE);
++        owner_disabled = TRUE;
++    }
+ 
+     thread = CreateThread(NULL, 0, portal_call_thread, &thread_params, 0, NULL);
+-    if (!thread) return STATUS_INTERNAL_ERROR;
++    if (!thread)
++    {
++        if (owner_disabled) EnableWindow(hwndOwner, TRUE);
++        return STATUS_INTERNAL_ERROR;
++    }
+ 
+     while (MsgWaitForMultipleObjects(1, &thread, FALSE, INFINITE, QS_ALLINPUT) != WAIT_OBJECT_0)
+     {
+@@ -2628,6 +2651,10 @@
+         }
+     }
+     CloseHandle(thread);
++
++    /* Re-enable before returning, so the caller can legitimately show another
++     * dialog straight afterwards. */
++    if (owner_disabled) EnableWindow(hwndOwner, TRUE);
+     return thread_params.status;
+ }
+ 
+@@ -2915,6 +2942,57 @@
+     return PORTAL_POLICY_AUTO;
+ }
+ 
++/* The XDG portal needs "x11:<XID>" for its parent_window argument, so the file
++ * chooser can be kept above the window it is modal for. Wine exposes the X
++ * drawable behind a HWND through the graphics driver escape.
++ *
++ * The struct is laid out explicitly rather than reusing winex11's definition:
++ * that header is private to the driver, and its Drawable is an 8-byte unix
++ * unsigned long, which a PE build would size at 4. */
++/* The portal uses this as the dialog's window title. An application that sets
++ * one gets its own; the rest fall back to the portal's generic caption, which
++ * leaves the dialog unidentifiable -- to the user with several open, and to
++ * anything matching on it, such as a window-manager rule pinning it above its
++ * parent. Name the application rather than hardcoding one, so this is useful for
++ * every app and not just the one it was written for. */
++static void default_portal_title( char *buf, size_t len, BOOL saving )
++{
++    WCHAR path[MAX_PATH], title[MAX_PATH], *name, *dot;
++
++    if (!GetModuleFileNameW( NULL, path, ARRAY_SIZE(path) )) return;
++    if (!(name = wcsrchr( path, '\\' ))) name = path; else name++;
++    if ((dot = wcsrchr( name, '.' )) && dot != name) *dot = 0;
++    if (!*name) return;
++
++    swprintf( title, ARRAY_SIZE(title), saving ? L"Save file (%s)" : L"Select file (%s)", name );
++    copy_wchar_to_utf8( buf, len, title );
++}
++
++static UINT64 get_owner_x11_window( HWND hwnd )
++{
++#define COMDLG32_X11DRV_ESCAPE       6789
++#define COMDLG32_X11DRV_GET_DRAWABLE 1
++    struct
++    {
++        DWORD  code;
++        DWORD  pad;
++        UINT64 drawable;
++        RECT   dc_rect;
++    } escape = { COMDLG32_X11DRV_GET_DRAWABLE };
++    UINT64 ret = 0;
++    HDC hdc;
++
++    if (!hwnd) return 0;
++    if (!(hdc = GetDC( hwnd ))) return 0;
++    if (ExtEscape( hdc, COMDLG32_X11DRV_ESCAPE, sizeof(escape), (const char *)&escape,
++                   sizeof(escape), (char *)&escape ) > 0)
++        ret = escape.drawable;
++    ReleaseDC( hwnd, hdc );
++
++    TRACE("owner %p -> x11 drawable %#llx\n", hwnd, (unsigned long long)ret);
++    return ret;
++}
++
+ static HRESULT try_portal_itemdlg(FileDialogImpl *This, HWND hwndOwner)
+ {
+     struct portal_open_file_params open_params = {0};
+@@ -2930,7 +3008,10 @@
+         WCHAR **paths = NULL;
+ 
+         /* Open file dialog */
+-        copy_wchar_to_utf8(open_params.title_utf8, sizeof(open_params.title_utf8), This->custom_title);
++        if (This->custom_title && *This->custom_title)
++			copy_wchar_to_utf8(open_params.title_utf8, sizeof(open_params.title_utf8), This->custom_title);
++        else
++            default_portal_title(open_params.title_utf8, sizeof(open_params.title_utf8), FALSE);
+         open_params.initial_dir_utf8[0] = 0;
+         if (This->psi_setfolder || This->psi_defaultfolder)
+         {
+@@ -2955,6 +3036,7 @@
+ 		if (This->options & FOS_PICKFOLDERS)
+ 			open_params.flags |= PORTAL_OPEN_FLAG_DIRECTORY;
+ 
++		open_params.parent_xid = get_owner_x11_window( hwndOwner );
+ 		open_params.max_results = (This->options & FOS_ALLOWMULTISELECT) ? 1024 : 1;
+ 		open_params.result_count = 0;
+ 		open_params.result_grouped = 0;
+@@ -2962,7 +3044,7 @@
+ 		open_params.result_buffer_len = 0;
+ 
+         /* Call Unix library — use pumping variant to keep message loop alive */
+-        status = call_unix_portal_pumping(unix_portal_open_file, &open_params);
++        status = call_unix_portal_pumping(unix_portal_open_file, &open_params, hwndOwner);
+ 
+         /* Handle result */
+         TRACE("portal open result: status=0x%08lx count=%u first_char=%04x grouped=%u\n",
+@@ -3076,7 +3158,10 @@
+     else
+     {
+ 		/* Save file dialog */
+-		copy_wchar_to_utf8(save_params.title_utf8, sizeof(save_params.title_utf8), This->custom_title);
++		if (This->custom_title && *This->custom_title)
++			copy_wchar_to_utf8(save_params.title_utf8, sizeof(save_params.title_utf8), This->custom_title);
++		else
++			default_portal_title(save_params.title_utf8, sizeof(save_params.title_utf8), TRUE);
+ 		save_params.initial_dir_utf8[0] = 0;
+ 		save_params.initial_filename_utf8[0] = 0;
+ 		save_params.current_file_unix[0] = 0;
+@@ -3127,7 +3212,8 @@
+ 		save_params.flags = 0;
+ 
+         /* Call Unix library — use pumping variant to keep message loop alive */
+-        status = call_unix_portal_pumping(unix_portal_save_file, &save_params);
++        save_params.parent_xid = get_owner_x11_window( hwndOwner );
++        status = call_unix_portal_pumping(unix_portal_save_file, &save_params, hwndOwner);
+         TRACE("portal save: status=%08lx len=%u first=%04x path=%s\n",
+               status, save_params.result_path_len,
+               save_params.result_path[0], debugstr_w(save_params.result_path));
+--- a/dlls/comdlg32/unixlib.h
++++ b/dlls/comdlg32/unixlib.h
+@@ -23,6 +23,7 @@
+     UINT filters_blob_len;
+     UINT filter_count;         /* number of (name, pattern) pairs */
+     UINT current_filter_index; /* 1-based index, 0 if unset */
++    UINT64 parent_xid;         /* X11 window of the owner, 0 if unknown */
+     DWORD flags;
+     UINT max_results;
+     UINT result_count; /* 0 if none */
+@@ -41,6 +42,7 @@
+     UINT filters_blob_len;
+     UINT filter_count;         /* number of (name, pattern) pairs */
+     UINT current_filter_index; /* 1-based index, 0 if unset */
++    UINT64 parent_xid;         /* X11 window of the owner, 0 if unknown */
+     DWORD flags;
+     WCHAR result_path[PORTAL_PATH_MAX]; /* Out: selected path */
+     UINT result_path_len; /* characters, excluding NUL; 0 if none */
+--- a/dlls/comdlg32/portal_dbus.c
++++ b/dlls/comdlg32/portal_dbus.c
+@@ -658,11 +658,18 @@
+                                       UINT filters_len,
+                                       UINT filter_count,
+                                       UINT current_filter_index,
+-                                      DWORD flags)
++                                      DWORD flags,
++                                      UINT64 parent_xid)
+ {
+     DBusMessage *request, *reply;
+     DBusMessageIter args, options_dict;
+     DBusError error;
++    /* Under X11 the portal expects "x11:<XID>" in hex. Passing "" leaves the
++     * dialog parentless: the compositor has nothing to keep it above, so it can
++     * sink behind the very window it is modal for -- and since the owner is
++     * disabled while it is up, the application then looks frozen with no visible
++     * dialog to dismiss. */
++    char parent_window_buf[32];
+     const char *parent_window = "";
+     const char *request_handle;
+     char match_rule[512];
+@@ -690,6 +697,14 @@
+ 		return STATUS_NO_MEMORY;
+ 	}
+ 
++	if (parent_xid)
++	{
++		snprintf(parent_window_buf, sizeof(parent_window_buf), "x11:%llx",
++		         (unsigned long long)parent_xid);
++		parent_window = parent_window_buf;
++	}
++	TRACE("portal parent_window=%s\n", parent_window);
++
+ 	p_dbus_message_iter_init_append(request, &args);
+ 	p_dbus_message_iter_append_basic(&args, DBUS_TYPE_STRING, &parent_window);
+ 	p_dbus_message_iter_append_basic(&args, DBUS_TYPE_STRING, &title_ptr);
+@@ -959,7 +974,8 @@
+                                   params->filters_blob_len,
+                                   params->filter_count,
+                                   params->current_filter_index,
+-                                  params->flags);
++                                  params->flags,
++                                  params->parent_xid);
+     TRACE("portal_open_file: portal_call_and_wait returned 0x%08x\n", (unsigned int)status);
+ 
+     params->result_count = 0;
+@@ -1130,7 +1146,8 @@
+                                   params->filters_blob_len,
+                                   params->filter_count,
+                                   params->current_filter_index,
+-                                  params->flags);
++                                  params->flags,
++                                  params->parent_xid);
+     TRACE("portal_save_file: portal_call_and_wait returned 0x%08x\n", (unsigned int)status);
+ 
+     if (status == STATUS_SUCCESS && ctx.result_uris && ctx.result_uris[0])
