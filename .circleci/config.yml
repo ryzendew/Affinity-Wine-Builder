@@ -3,7 +3,7 @@ version: 2.1
 executors:
   wine-builder:
     docker:
-      - image: fedora:43
+      - image: fedora:44
     resource_class: large
     environment:
       BUILD_THREADS: 4
@@ -80,8 +80,80 @@ jobs:
           destination: build-logs
           when: on_fail
 
+  build-wine-11.18:
+    executor: wine-builder
+    steps:
+      - checkout
+
+      - run:
+          name: Install build dependencies
+          command: |
+            dnf install -y -q --skip-unavailable \
+              make gcc gcc-c++ flex bison autoconf automake libtool \
+              pkg-config diffutils patch which \
+              freetype-devel fontconfig-devel \
+              libX11-devel libXext-devel \
+              libXxf86vm-devel libXrandr-devel libXcursor-devel \
+              libXrender-devel libXi-devel libXinerama-devel \
+              libXcomposite-devel libXfixes-devel \
+              mesa-libGL-devel mesa-libGLU-devel mesa-compat-libOSMesa-devel \
+              mesa-libEGL-devel libglvnd-devel mesa-libgbm-devel \
+              wayland-devel wayland-protocols-devel libxkbcommon-devel \
+              pulseaudio-libs-devel \
+              gstreamer1-devel gstreamer1-plugins-base-devel \
+              cups-devel sane-backends-devel \
+              vulkan-loader-devel vulkan-headers \
+              opencl-headers ocl-icd-devel \
+              mingw64-gcc-c++ mingw32-gcc-c++ \
+              mingw64-binutils mingw32-binutils \
+              libudev-devel dbus-devel libunwind-devel \
+              glibc-devel.i686 libgcc.i686
+
+      - run:
+          name: Add missing wayland-egl.pc pkg-config file
+          command: |
+            if ! pkg-config --exists wayland-egl 2>/dev/null; then
+              mkdir -p /usr/lib64/pkgconfig
+              printf '%s\n' \
+                'prefix=/usr' \
+                'exec_prefix=${prefix}' \
+                'libdir=${exec_prefix}/lib64' \
+                'includedir=${prefix}/include' \
+                '' \
+                'Name: wayland-egl' \
+                'Description: Wayland EGL library' \
+                'Version: 1.22.0' \
+                'Libs: -L${libdir} -lwayland-egl' \
+                'Cflags: -I${includedir}' \
+                > /usr/lib64/pkgconfig/wayland-egl.pc
+            fi
+
+      - run:
+          name: Build Wine 11.18
+          command: |
+            ./Build-Wine-11.18.sh
+          no_output_timeout: 2h
+
+      - run:
+          name: Collect build logs
+          command: |
+            mkdir -p /tmp/build-logs-11.18
+            cp wine64-build/*.log /tmp/build-logs-11.18/ 2>/dev/null || true
+          when: always
+
+      - store_artifacts:
+          path: ElementalWarrior-wine-11.18.tar.xz
+          destination: /
+          when: on_success
+
+      - store_artifacts:
+          path: /tmp/build-logs-11.18
+          destination: build-logs-11.18
+          when: on_fail
+
 workflows:
   version: 2.1
   build:
     jobs:
       - build-wine
+      - build-wine-11.18

@@ -1,0 +1,42 @@
+From: opencode
+Date: 2026-10-08
+Subject: winspool: map PRINTER_ENUM_CONNECTIONS to local CUPS printers
+
+Affinity's print dialog enumerates with PRINTER_ENUM_CONNECTIONS
+(its booklet UI uses its own dropdown, not PrintDlgW like Notepad).
+WINSPOOL_EnumPrintersW stripped CONNECTIONS and, when it was the
+only flag, returned TRUE with zero printers. Result: Notepad
+(PRINTER_ENUM_LOCAL) listed CUPS printers while Affinity showed
+"No printers installed" on the same prefix.
+
+Wine has no separate connection concept: every CUPS destination is
+exposed as a local printer. Map CONNECTIONS to LOCAL instead of
+returning empty. CONN|LOCAL behaviour is unchanged, and Wine's own
+check_printer_setup fallback (LOCAL then CONNECTIONS) becomes
+meaningful.
+
+Reproduced with a virtual queue
+(lpadmin -p AffinityTest -E -m raw -v socket://127.0.0.1:9100):
+LOCAL L1 -> 1 printer, CONN-only L1 -> 0 printers before fix.
+
+--- a/dlls/winspool.drv/info.c	2026-10-01 00:00:00.000000000 -0300
++++ b/dlls/winspool.drv/info.c	2026-10-08 00:00:00.000000000 -0300
+@@ -4040,13 +4040,11 @@ static BOOL WINSPOOL_EnumPrintersW(DWORD
+ 	return TRUE;
+ 
+     if (dwType & PRINTER_ENUM_CONNECTIONS) {
+-        TRACE("ignoring PRINTER_ENUM_CONNECTIONS\n");
+-        dwType &= ~PRINTER_ENUM_CONNECTIONS; /* we don't handle that */
+-        if (!dwType) {
+-            FIXME("We don't handle PRINTER_ENUM_CONNECTIONS\n");
+-            return TRUE;
+-        }
+-
++        TRACE("mapping PRINTER_ENUM_CONNECTIONS to local CUPS printers\n");
++        dwType &= ~PRINTER_ENUM_CONNECTIONS;
++        /* Wine exposes every CUPS destination as local; there is no
++           separate connection namespace, so answer with local printers. */
++        dwType |= PRINTER_ENUM_LOCAL;
+     }
+ 
+     if (!((dwType & PRINTER_ENUM_LOCAL) || (dwType & PRINTER_ENUM_NAME))) {
