@@ -1,0 +1,57 @@
+From: opencode
+Date: 2026-10-08
+Subject: dxgi: implement d3d11 CheckColorSpaceSupport/SetColorSpace1 semi-stubs
+
+Affinity's DXRenderer calls IDXGISwapChain::SetColorSpace1 with the
+default SDR colorspace during Direct3D device creation. Wine's d3d11
+variants returned E_NOTIMPL, Affinity logged DXRenderer.cpp(1014)
+E_NOTIMPL and dropped off the hardware path (7 calls / 7 errors in a
+traced session).
+
+Mirror the existing d3d12 semi-stubs in the same file: report PRESENT
+support for DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709 and accept it in
+SetColorSpace1, E_INVALIDARG for anything else. True wide-gamut/HDR
+swapchain colorspaces can be wired through later; the default SDR
+colorspace needs no backend work.
+
+diff -uNarp a/dlls/dxgi/swapchain.c b/dlls/dxgi/swapchain.c
+--- a/dlls/dxgi/swapchain.c	2026-09-18 15:55:04.000000000 -0300
++++ b/dlls/dxgi/swapchain.c	2026-10-08 00:00:00.000000000 -0300
+@@ -883,18 +883,33 @@
+ static HRESULT STDMETHODCALLTYPE d3d11_swapchain_CheckColorSpaceSupport(IDXGISwapChain4 *iface,
+         DXGI_COLOR_SPACE_TYPE colour_space, UINT *colour_space_support)
+ {
+-    FIXME("iface %p, colour_space %#x, colour_space_support %p stub!\n",
++    UINT support_flags = 0;
++
++    FIXME("iface %p, colour_space %#x, colour_space_support %p semi-stub!\n",
+             iface, colour_space, colour_space_support);
+ 
+-    return E_NOTIMPL;
++    if (!colour_space_support)
++        return E_INVALIDARG;
++
++    if (colour_space == DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709)
++        support_flags |= DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT;
++
++    *colour_space_support = support_flags;
++    return S_OK;
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE d3d11_swapchain_SetColorSpace1(IDXGISwapChain4 *iface,
+         DXGI_COLOR_SPACE_TYPE colour_space)
+ {
+-    FIXME("iface %p, colour_space %#x stub!\n", iface, colour_space);
++    FIXME("iface %p, colour_space %#x semi-stub!\n", iface, colour_space);
++
++    if (colour_space != DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709)
++    {
++        WARN("Colour space %u not supported.\n", colour_space);
++        return E_INVALIDARG;
++    }
+ 
+-    return E_NOTIMPL;
++    return S_OK;
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE d3d11_swapchain_ResizeBuffers1(IDXGISwapChain4 *iface,

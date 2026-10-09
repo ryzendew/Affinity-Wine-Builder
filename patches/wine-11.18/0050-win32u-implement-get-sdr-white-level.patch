@@ -1,0 +1,60 @@
+From: opencode
+Date: 2026-10-08
+Subject: win32u: implement DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL
+
+Affinity's DXRenderer calls DisplayConfigGetDeviceInfo with
+DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL (packet type 11) when
+creating its Direct3D device. Wine fell through to the default
+unimplemented branch and returned STATUS_INVALID_PARAMETER (Win32
+error 87), after which Affinity logged DXRenderer.cpp(1014)
+E_NOTIMPL and fell back from the hardware path.
+
+Implement the query: match the target by output id and adapter LUID
+like the neighboring GET_ADVANCED_COLOR_INFO case and report the
+default SDR white level. Per MS-DN the value is a multiplier of
+80 nits times 1000, so 1000 means the default 80 nits.
+
+diff -uNarp a/dlls/win32u/sysparams.c b/dlls/win32u/sysparams.c
+--- a/dlls/win32u/sysparams.c	2026-09-18 15:55:04.000000000 -0300
++++ b/dlls/win32u/sysparams.c	2026-10-08 00:00:00.000000000 -0300
+@@ -7982,12 +7982,39 @@ NTSTATUS WINAPI NtUserDisplayConfigGetDe
+         unlock_display_devices();
+         return ret;
+     }
++    case DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL:
++    {
++        DISPLAYCONFIG_SDR_WHITE_LEVEL *white_level = (DISPLAYCONFIG_SDR_WHITE_LEVEL *)packet;
++        struct monitor *monitor;
++
++        TRACE( "DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL.\n" );
++
++        if (packet->size < sizeof(*white_level))
++            return STATUS_INVALID_PARAMETER;
++
++        if (!lock_display_devices( FALSE )) return STATUS_UNSUCCESSFUL;
++
++        LIST_FOR_EACH_ENTRY(monitor, &monitors, struct monitor, entry)
++        {
++            if (white_level->header.id != monitor->output_id) continue;
++            if (memcmp( &white_level->header.adapterId, &monitor->source->gpu->luid,
++                        sizeof(monitor->source->gpu->luid) ))
++                continue;
++
++            /* Multiplier of 80 nits times 1000; 1000 is the default 80 nits. */
++            white_level->SDRWhiteLevel = 1000;
++            ret = STATUS_SUCCESS;
++            break;
++        }
++
++        unlock_display_devices();
++        return ret;
++    }
+     case DISPLAYCONFIG_DEVICE_INFO_SET_TARGET_PERSISTENCE:
+     case DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_BASE_TYPE:
+     case DISPLAYCONFIG_DEVICE_INFO_GET_SUPPORT_VIRTUAL_RESOLUTION:
+     case DISPLAYCONFIG_DEVICE_INFO_SET_SUPPORT_VIRTUAL_RESOLUTION:
+     case DISPLAYCONFIG_DEVICE_INFO_SET_ADVANCED_COLOR_STATE:
+-    case DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL:
+     default:
+         FIXME( "Unimplemented packet type %u.\n", packet->type );
+         return STATUS_INVALID_PARAMETER;

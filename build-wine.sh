@@ -147,12 +147,41 @@ BUILD_WAYLAND="${BUILD_WAYLAND:-1}"
 
 # Detect package manager and distribution
 detect_package_manager() {
-  if command -v apt >/dev/null 2>&1; then
+  # Never probe binaries first: foreign package managers can be installed
+  # (e.g. Debian's apt as a pacman package on Arch) and probing would pick
+  # the wrong one. Trust the distro identity, fall back to markers/binaries.
+  local os_id="" os_like=""
+  if [ -f /etc/os-release ]; then
+    os_id=$(grep -E "^ID=" /etc/os-release | cut -d= -f2 | tr -d '"' | tr '[:upper:]' '[:lower:]')
+    os_like=$(grep -E "^ID_LIKE=" /etc/os-release | cut -d= -f2 | tr -d '"' | tr '[:upper:]' '[:lower:]')
+  fi
+  case " $os_id $os_like " in
+    *" arch "*|*" cachyos "*|*" endeavouros "*|*" manjaro "*|*" garuda "*)
+      echo "pacman"
+      return
+      ;;
+    *" fedora "*|*" rhel "*|*" centos "*|*" rocky "*|*" alma "*)
+      echo "dnf"
+      return
+      ;;
+    *" debian "*|*" ubuntu "*|*" pikaos "*|*" linuxmint "*|*" zorin "*|*" pop "*)
+      echo "apt"
+      return
+      ;;
+  esac
+  # Fallback: distro marker files (minimal containers without os-release)
+  if [ -f /etc/arch-release ]; then
+    echo "pacman"
+  elif [ -f /etc/fedora-release ] || [ -f /etc/redhat-release ]; then
+    echo "dnf"
+  elif [ -f /etc/debian_version ]; then
     echo "apt"
+  elif command -v pacman >/dev/null 2>&1 && [ -f /etc/pacman.conf ]; then
+    echo "pacman"
   elif command -v dnf >/dev/null 2>&1; then
     echo "dnf"
-  elif command -v pacman >/dev/null 2>&1; then
-    echo "pacman"
+  elif command -v apt >/dev/null 2>&1; then
+    echo "apt"
   else
     echo "unknown"
   fi
@@ -1231,35 +1260,51 @@ install_packages_64bit() {
         # MinGW cross-compilers
         "mingw-w64-gcc"
         # Core development libraries (Arch packages include dev files)
-        "samba" "libcups" "opencl-headers" "ocl-icd"
-        # Audio libraries
-        "alsa-lib" "pulseaudio"
+        # Note: use smbclient (provides libsmbclient), not the full samba suite
+        "smbclient" "libcups" "opencl-headers" "ocl-icd"
+        # Audio libraries (libpulse, not the pulseaudio daemon: it conflicts
+        # with pipewire-pulse setups; Wine only needs the client lib)
+        "alsa-lib" "libpulse"
         # Font libraries
         "fontconfig" "freetype2"
-        # X11 libraries
+        # X11 libraries (libxxf86vm is required by Wine's x11drv)
         "libx11" "libxext" "libxrender" "libxrandr"
         "libxinerama" "libxi" "libxcursor" "libxfixes"
-        "libxcomposite" "libxkbcommon" "xorgproto"
-        # Graphics libraries
-        "mesa" "libgl" "vulkan-headers" "vulkan-icd-loader"
-        "lib32-mesa" "lib32-libgl"
+        "libxcomposite" "libxkbcommon" "libxxf86vm" "xorgproto"
+        # Graphics libraries (libglvnd provides libGL; there is no "libgl" package)
+        "mesa" "libglvnd" "vulkan-headers" "vulkan-icd-loader"
+        # 32-bit runtime libs for --enable-archs=i386,x86_64
+        "lib32-glibc" "lib32-gcc-libs" "lib32-zlib"
+        "lib32-mesa" "lib32-libglvnd" "lib32-vulkan-icd-loader"
+        "lib32-ocl-icd" "lib32-alsa-lib" "lib32-libpulse"
+        "lib32-gnutls" "lib32-libldap" "lib32-libcups"
+        "lib32-dbus" "lib32-fontconfig" "lib32-freetype2"
+        "lib32-libjpeg-turbo" "lib32-libpng" "lib32-libtiff"
+        "lib32-lcms2" "lib32-libusb" "lib32-libxml2" "lib32-krb5"
+        "lib32-wayland" "lib32-libxkbcommon"
+        "lib32-libx11" "lib32-libxext" "lib32-libxrender"
+        "lib32-libxrandr" "lib32-libxinerama" "lib32-libxi"
+        "lib32-libxcursor" "lib32-libxfixes" "lib32-libxcomposite"
+        "lib32-libxxf86vm"
         # Wayland support
         "wayland" "wayland-protocols"
-        # GStreamer
-        "gstreamer" "gst-plugins-base"
-        # SDL
-        "sdl2"
+        # GStreamer (the -libs package holds the actual libraries)
+        "gstreamer" "gst-plugins-base-libs"
+        # SDL (upstream renamed the v2 package to sdl2-compat)
+        "sdl2-compat"
         # System libraries
         "dbus" "systemd" "libunwind"
+        # TLS / directory (secur32, wldap32)
+        "gnutls" "libldap" "krb5"
+        # Codecs / audio backends (64-bit only: no multilib packages exist)
+        "mpg123" "openal" "faudio"
         # Optional but recommended
         "libxml2" "libxslt" "libjpeg-turbo" "libpng"
-        "libtiff" "lcms2" "libusb" "libpcap"
-        "ncurses" "krb5" "unixodbc" "v4l-utils"
-        "libgphoto2" "sane" "pcsc-tools"
+        "libtiff" "lcms2" "libusb" "libpcap" "giflib"
+        "ncurses" "unixodbc" "v4l-utils"
+        "libgphoto2" "sane" "pcsclite"
         # Multimedia (optional)
         "ffmpeg"
-        # ISDN (optional) - may not be available in all repos
-        "libcapi"
       )
       for pkg in "${required_packages[@]}"; do
         if check_package_installed_pacman "$pkg"; then
@@ -1272,8 +1317,15 @@ install_packages_64bit() {
       
       if [ ${#packages_to_install[@]} -gt 0 ]; then
         echo -e "${CYAN}Installing missing packages: ${packages_to_install[*]}${NC}"
-        sudo pacman -S --noconfirm "${packages_to_install[@]}" 2>/dev/null || \
-        sudo pacman -S --noconfirm "${packages_to_install[@]}"
+        if ! sudo pacman -S --noconfirm --needed "${packages_to_install[@]}"; then
+          # Rolling repos rename/drop packages; retry one by one so a single
+          # bad name can't fail the whole transaction.
+          echo -e "${YELLOW}Bulk install failed, retrying packages individually...${NC}"
+          for pkg in "${packages_to_install[@]}"; do
+            sudo pacman -S --noconfirm --needed "$pkg" || \
+              echo -e "  ${YELLOW}⚠ skipped unavailable package: $pkg${NC}"
+          done
+        fi
         echo -e "  ${GREEN}✓${NC} Package installation complete"
       else
         echo -e "  ${GREEN}✓${NC} All required packages are already installed"
@@ -1356,36 +1408,62 @@ apply_patches() {
   fi
   
   echo -e "${CYAN}Applying patches from: ${GREEN}$patch_dir${NC}"
-  
+
+  # Stamp file records applied patches by checksum, so re-running the
+  # script on an already-patched tree is a clean no-op. (Re-applying is
+  # NOT safe to detect via patch(1) alone: with overlapping patch stacks,
+  # fuzz can match shifted context and insert duplicate blocks.)
+  local stamp_file="$wine_src_dir/.applied-patches"
+  touch "$stamp_file" 2>/dev/null || true
+
   # Apply all .patch files in the directory (excluding SHA256SUMS.txt)
   local patch_count=0
   local saved_dir="$(pwd)"
-  
+
   # Change to wine source directory to apply patches
   if [ ! -d "$wine_src_dir" ]; then
     echo -e "${YELLOW}⚠ Warning: Wine source directory '$wine_src_dir' not found. Skipping patch application.${NC}"
     return
   fi
-  
+
   cd "$wine_src_dir" || return
-  
+
   # Sort patch files to apply in order
   for patch_file in $(ls "$patch_dir"/*.patch 2>/dev/null | sort); do
     if [ -f "$patch_file" ]; then
-      echo -e "${CYAN}Applying patch: ${BOLD}$(basename "$patch_file")${NC}"
-      # Try normal apply first, then with fuzz if needed
-      if patch -p1 --no-backup-if-mismatch -i "$patch_file" >/dev/null 2>&1; then
+      local patch_name="$(basename "$patch_file")"
+      local patch_sum=""
+      if command -v sha256sum >/dev/null 2>&1; then
+        patch_sum=$(sha256sum "$patch_file" | cut -d' ' -f1)
+      fi
+      if [ -n "$patch_sum" ] && grep -q "^${patch_name}:${patch_sum}\$" "$stamp_file" 2>/dev/null; then
+        echo -e "${CYAN}Patch: ${BOLD}$patch_name${NC}"
+        ((patch_count++))
+        echo -e "  ${GREEN}✓${NC} Already applied (skipped)"
+        continue
+      fi
+      echo -e "${CYAN}Applying patch: ${BOLD}$patch_name${NC}"
+      # NOTE: --forward (-N) is mandatory here. Without it, re-running the
+      # script on an already-patched tree re-inserts insertion-only hunks a
+      # second time (duplicated helper blocks -> compile errors) instead of
+      # reporting "already applied". Try normal apply first, then with fuzz.
+      if patch -p1 --forward --no-backup-if-mismatch -i "$patch_file" >/dev/null 2>&1; then
+        [ -n "$patch_sum" ] && echo "${patch_name}:${patch_sum}" >> "$stamp_file"
         ((patch_count++))
         echo -e "  ${GREEN}✓${NC} Successfully applied"
-      elif patch -p1 --no-backup-if-mismatch --fuzz=3 -i "$patch_file" >/dev/null 2>&1; then
+      elif patch -p1 --forward --no-backup-if-mismatch --fuzz=3 -i "$patch_file" >/dev/null 2>&1; then
+        [ -n "$patch_sum" ] && echo "${patch_name}:${patch_sum}" >> "$stamp_file"
         ((patch_count++))
         echo -e "  ${GREEN}✓${NC} Successfully applied (with fuzz)"
       elif patch -p1 --dry-run -i "$patch_file" 2>&1 | grep -q "Reversed (or previously applied)"; then
-        # Patch is already applied (reversed), count as success
+        # Patch is already applied (reversed), count as success.
+        # Adopt into the stamp file so future runs skip it up front.
+        [ -n "$patch_sum" ] && echo "${patch_name}:${patch_sum}" >> "$stamp_file"
         ((patch_count++))
         echo -e "  ${GREEN}✓${NC} Already applied (skipped)"
       elif patch -p1 --dry-run -i "$patch_file" 2>&1 | grep -q "already exists"; then
         # Files already exist, patch likely already applied
+        [ -n "$patch_sum" ] && echo "${patch_name}:${patch_sum}" >> "$stamp_file"
         ((patch_count++))
         echo -e "  ${GREEN}✓${NC} Already applied (files exist)"
       else
@@ -1622,6 +1700,9 @@ if ! check_opencl_headers; then
       fi
       if [ ${#opencl_packages[@]} -gt 0 ]; then
         echo -e "${CYAN}  Installing missing OpenCL packages: ${opencl_packages[*]}${NC}"
+        # Fresh images/containers often have empty apt lists, which makes
+        # even valid package names "unable to locate". Refresh first.
+        sudo apt-get update || true
         sudo apt install -y "${opencl_packages[@]}"
       else
         echo -e "  ${GREEN}✓${NC} OpenCL packages are already installed"
