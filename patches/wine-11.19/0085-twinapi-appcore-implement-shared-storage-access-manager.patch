@@ -1,0 +1,503 @@
+twinapi.appcore: implement Windows.ApplicationModel.DataTransfer.SharedStorageAccessManager
+
+Implement Windows.ApplicationModel.DataTransfer.SharedStorageAccessManager
+in twinapi.appcore, with the interfaces and runtime class it needs in the
+WinRT headers and its registration in wine.inf. A running Affinity asks for
+it when a second instance hands it a file. Not yet tested against that case
+on 11.19; the widl and include/Makefile.in parts of the 11.18 version are
+already in this set and were left out.
+---
+ dlls/twinapi.appcore/classes.idl                  |   1 +
+ dlls/twinapi.appcore/data_transfer.c              | 154 ++++++++++++++++++++++
+ dlls/twinapi.appcore/main.c                       |   2 +
+ dlls/twinapi.appcore/private.h                    |   3 +
+ include/windows.applicationmodel.datatransfer.idl |   1 +
+ include/windows.foundation.collections.idl        |  96 --------------
+ include/windows.foundation.idl                    | 101 ++++++++++++++
+ include/windows.storage.streams.idl               |   1 +
+ loader/wine.inf.in                                |   3 +
+ 9 files changed, 266 insertions(+), 96 deletions(-)
+
+diff --git a/dlls/twinapi.appcore/classes.idl b/dlls/twinapi.appcore/classes.idl
+index 48c0762..be95c84 100644
+--- a/dlls/twinapi.appcore/classes.idl
++++ b/dlls/twinapi.appcore/classes.idl
+@@ -51,4 +51,5 @@ namespace Windows.ApplicationModel.Core {
+ }
+ namespace Windows.ApplicationModel.DataTransfer {
+     runtimeclass DataTransferManager;
++    runtimeclass SharedStorageAccessManager;
+ }
+diff --git a/dlls/twinapi.appcore/data_transfer.c b/dlls/twinapi.appcore/data_transfer.c
+index f2897ac..020e023 100644
+--- a/dlls/twinapi.appcore/data_transfer.c
++++ b/dlls/twinapi.appcore/data_transfer.c
+@@ -275,3 +275,157 @@ static struct data_transfer_manager_statics data_transfer_manager_statics =
+ };
+ 
+ IActivationFactory *data_transfer_manager_statics_factory = &data_transfer_manager_statics.IActivationFactory_iface;
++
++/* SharedStorageAccessManager -- static-only runtimeclass.
++ *
++ * Serif.Affinity.Application.ProcessCommandLineArguments references
++ * SharedStorageAccessManager.RedeemTokenForFileAsync for its unrelated
++ * "affinity-open-file:" branch. The CLR resolves every type referenced in a
++ * method body when JITing it, so without WinRT metadata + an activation
++ * factory for this type any call into ProcessCommandLineArguments throws
++ * TypeLoadException -- including the "affinity://" OAuth callback path the
++ * Canva sign-in flow depends on (forwarded over a named pipe to
++ * SingleInstanceThread). Providing this stub lets the method JIT and the
++ * login callback proceed; the open-file branch itself simply fails with
++ * E_NOTIMPL, which Affinity does not need under Wine.
++ */
++
++struct shared_storage_manager_statics
++{
++    IActivationFactory IActivationFactory_iface;
++    ISharedStorageAccessManagerStatics ISharedStorageAccessManagerStatics_iface;
++    LONG ref;
++};
++
++static inline struct shared_storage_manager_statics *impl_from_shared_IActivationFactory( IActivationFactory *iface )
++{
++    return CONTAINING_RECORD( iface, struct shared_storage_manager_statics, IActivationFactory_iface );
++}
++
++static HRESULT WINAPI shared_factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    struct shared_storage_manager_statics *impl = impl_from_shared_IActivationFactory( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) ||
++        IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) ||
++        IsEqualGUID( iid, &IID_IActivationFactory ))
++    {
++        *out = &impl->IActivationFactory_iface;
++        IInspectable_AddRef( *out );
++        return S_OK;
++    }
++
++    if (IsEqualGUID( iid, &IID_ISharedStorageAccessManagerStatics ))
++    {
++        IInspectable_AddRef( (*out = &impl->ISharedStorageAccessManagerStatics_iface) );
++        return S_OK;
++    }
++
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI shared_factory_AddRef( IActivationFactory *iface )
++{
++    struct shared_storage_manager_statics *impl = impl_from_shared_IActivationFactory( iface );
++    ULONG ref = InterlockedIncrement( &impl->ref );
++    TRACE( "iface %p increasing refcount to %lu.\n", iface, ref );
++    return ref;
++}
++
++static ULONG WINAPI shared_factory_Release( IActivationFactory *iface )
++{
++    struct shared_storage_manager_statics *impl = impl_from_shared_IActivationFactory( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    TRACE( "iface %p decreasing refcount to %lu.\n", iface, ref );
++    return ref;
++}
++
++static HRESULT WINAPI shared_factory_GetIids( IActivationFactory *iface, ULONG *iid_count, IID **iids )
++{
++    FIXME( "iface %p, iid_count %p, iids %p stub!\n", iface, iid_count, iids );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI shared_factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *class_name )
++{
++    FIXME( "iface %p, class_name %p stub!\n", iface, class_name );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI shared_factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *trust_level )
++{
++    FIXME( "iface %p, trust_level %p stub!\n", iface, trust_level );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI shared_factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
++{
++    FIXME( "iface %p, instance %p stub!\n", iface, instance );
++    return E_NOTIMPL;
++}
++
++static const struct IActivationFactoryVtbl shared_factory_vtbl =
++{
++    shared_factory_QueryInterface,
++    shared_factory_AddRef,
++    shared_factory_Release,
++    /* IInspectable methods */
++    shared_factory_GetIids,
++    shared_factory_GetRuntimeClassName,
++    shared_factory_GetTrustLevel,
++    /* IActivationFactory methods */
++    shared_factory_ActivateInstance,
++};
++
++DEFINE_IINSPECTABLE( shared_storage_statics, ISharedStorageAccessManagerStatics, struct shared_storage_manager_statics, IActivationFactory_iface )
++
++static HRESULT WINAPI shared_storage_statics_AddFile( ISharedStorageAccessManagerStatics *iface,
++        IStorageFile *file, HSTRING *out_token )
++{
++    FIXME( "iface %p, file %p, out_token %p stub!\n", iface, file, out_token );
++    if (out_token) *out_token = NULL;
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI shared_storage_statics_RedeemTokenForFileAsync( ISharedStorageAccessManagerStatics *iface,
++        HSTRING token, __FIAsyncOperation_1_Windows__CStorage__CStorageFile **operation )
++{
++    FIXME( "iface %p, token %s, operation %p stub!\n", iface, debugstr_hstring(token), operation );
++    if (operation) *operation = NULL;
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI shared_storage_statics_RemoveFile( ISharedStorageAccessManagerStatics *iface, HSTRING token )
++{
++    FIXME( "iface %p, token %s stub!\n", iface, debugstr_hstring(token) );
++    return E_NOTIMPL;
++}
++
++static const struct ISharedStorageAccessManagerStaticsVtbl shared_storage_statics_vtbl =
++{
++    shared_storage_statics_QueryInterface,
++    shared_storage_statics_AddRef,
++    shared_storage_statics_Release,
++    /* IInspectable methods */
++    shared_storage_statics_GetIids,
++    shared_storage_statics_GetRuntimeClassName,
++    shared_storage_statics_GetTrustLevel,
++    /* ISharedStorageAccessManagerStatics methods */
++    shared_storage_statics_AddFile,
++    shared_storage_statics_RedeemTokenForFileAsync,
++    shared_storage_statics_RemoveFile,
++};
++
++static struct shared_storage_manager_statics shared_storage_manager_statics =
++{
++    {&shared_factory_vtbl},
++    {&shared_storage_statics_vtbl},
++    1,
++};
++
++IActivationFactory *shared_storage_manager_factory = &shared_storage_manager_statics.IActivationFactory_iface;
+diff --git a/dlls/twinapi.appcore/main.c b/dlls/twinapi.appcore/main.c
+index bc82361..7cdf8f2 100644
+--- a/dlls/twinapi.appcore/main.c
++++ b/dlls/twinapi.appcore/main.c
+@@ -81,6 +81,8 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
+         IActivationFactory_QueryInterface( core_application_factory, &IID_IActivationFactory, (void **)factory );
+     else if (!wcscmp( buffer, RuntimeClass_Windows_ApplicationModel_DataTransfer_DataTransferManager ))
+         IActivationFactory_QueryInterface( data_transfer_manager_statics_factory, &IID_IActivationFactory, (void **)factory );
++    else if (!wcscmp( buffer, RuntimeClass_Windows_ApplicationModel_DataTransfer_SharedStorageAccessManager ))
++        IActivationFactory_QueryInterface( shared_storage_manager_factory, &IID_IActivationFactory, (void **)factory );
+ 
+     if (*factory) return S_OK;
+     return CLASS_E_CLASSNOTAVAILABLE;
+diff --git a/dlls/twinapi.appcore/private.h b/dlls/twinapi.appcore/private.h
+index bcc1593..3663cd2 100644
+--- a/dlls/twinapi.appcore/private.h
++++ b/dlls/twinapi.appcore/private.h
+@@ -31,6 +31,8 @@
+ #define WIDL_using_Windows_Foundation
+ #define WIDL_using_Windows_Foundation_Collections
+ #include "windows.foundation.h"
++#define WIDL_using_Windows_Storage
++#include "windows.storage.h"
+ #define WIDL_using_Windows_Security_ExchangeActiveSyncProvisioning
+ #include "windows.security.exchangeactivesyncprovisioning.h"
+ #define WIDL_using_Windows_System_Profile
+@@ -52,6 +54,7 @@ extern IActivationFactory *analytics_info_factory;
+ extern IActivationFactory *advertising_manager_factory;
+ extern IActivationFactory *core_application_factory;
+ extern IActivationFactory *data_transfer_manager_statics_factory;
++extern IActivationFactory *shared_storage_manager_factory;
+ 
+ #define DEFINE_IINSPECTABLE_( pfx, iface_type, impl_type, impl_from, iface_mem, expr )             \
+     static inline impl_type *impl_from( iface_type *iface )                                        \
+diff --git a/include/windows.applicationmodel.datatransfer.idl b/include/windows.applicationmodel.datatransfer.idl
+index 7f84513..c72edd8 100644
+--- a/include/windows.applicationmodel.datatransfer.idl
++++ b/include/windows.applicationmodel.datatransfer.idl
+@@ -17,6 +17,7 @@
+  */
+ 
+ #ifdef __WIDL__
++#pragma makedep header install winmd
+ #pragma winrt ns_prefix
+ #endif
+ 
+diff --git a/include/windows.foundation.collections.idl b/include/windows.foundation.collections.idl
+index 2a8fd55..4915213 100644
+--- a/include/windows.foundation.collections.idl
++++ b/include/windows.foundation.collections.idl
+@@ -42,102 +42,6 @@ cpp_quote("extern \"C\" {")
+ cpp_quote("#endif")
+ 
+ #ifdef __WIDL__
+-        [
+-            contract(Windows.Foundation.FoundationContract, 1.0),
+-            uuid(9de1c535-6ae1-11e0-84e1-18a905bcc53f)
+-        ]
+-        delegate HRESULT EventHandler<T>([in] IInspectable *sender, [in] T args);
+-
+-        interface IAsyncOperation<TResult>;
+-
+-        [
+-            contract(Windows.Foundation.FoundationContract, 1.0),
+-            uuid(fcdcf02c-e5d8-4478-915a-4d90b74b83a5)
+-        ]
+-        delegate HRESULT AsyncOperationCompletedHandler<TResult>([in] Windows.Foundation.IAsyncOperation<TResult> *info,
+-                                                                 [in] AsyncStatus status);
+-
+-        [
+-            contract(Windows.Foundation.FoundationContract, 1.0),
+-            uuid(9fc2b0bb-e446-44e2-aa61-9cab8f636af2)
+-        ]
+-        interface IAsyncOperation<TResult> : IInspectable
+-        {
+-            [propput] HRESULT Completed([in] Windows.Foundation.AsyncOperationCompletedHandler<TResult> *handler);
+-            [propget] HRESULT Completed([out, retval] Windows.Foundation.AsyncOperationCompletedHandler<TResult> **handler);
+-            HRESULT GetResults([out, retval] TResult *results);
+-        }
+-
+-        interface IAsyncActionWithProgress<TProgress>;
+-
+-        [
+-            contract(Windows.Foundation.FoundationContract, 1.0),
+-            uuid(6d844858-0cff-4590-ae89-95a5a5c8b4b8)
+-        ]
+-        delegate HRESULT AsyncActionProgressHandler<TProgress>([in] Windows.Foundation.IAsyncActionWithProgress<TProgress> *info,
+-                                                               [in] TProgress progress);
+-        [
+-            contract(Windows.Foundation.FoundationContract, 1.0),
+-            uuid(9c029f91-cc84-44fd-ac26-0a6c4e555281)
+-        ]
+-        delegate HRESULT AsyncActionWithProgressCompletedHandler<TProgress>([in] Windows.Foundation.IAsyncActionWithProgress<TProgress> *info,
+-                                                                            [in] AsyncStatus status);
+-
+-        [
+-            contract(Windows.Foundation.FoundationContract, 1.0),
+-            uuid(1f6db258-e803-48a1-9546-eb7353398884)
+-        ]
+-        interface IAsyncActionWithProgress<TProgress> : IInspectable
+-        {
+-            [propput] HRESULT Progress([in] Windows.Foundation.AsyncActionProgressHandler<TProgress> *handler);
+-            [propget] HRESULT Progress([out, retval] Windows.Foundation.AsyncActionProgressHandler<TProgress> **handler);
+-            [propput] HRESULT Completed([in] Windows.Foundation.AsyncActionWithProgressCompletedHandler<TProgress> *handler);
+-            [propget] HRESULT Completed([out, retval] Windows.Foundation.AsyncActionWithProgressCompletedHandler<TProgress> **handler);
+-            HRESULT GetResults();
+-        }
+-
+-        interface IAsyncOperationWithProgress<TResult, TProgress>;
+-
+-        [
+-            contract(Windows.Foundation.FoundationContract, 1.0),
+-            uuid(55690902-0aab-421a-8778-f8ce5026d758)
+-        ]
+-        delegate HRESULT AsyncOperationProgressHandler<TResult, TProgress>([in] Windows.Foundation.IAsyncOperationWithProgress<TResult, TProgress> *info,
+-                                                                           [in] TProgress progress);
+-        [
+-            contract(Windows.Foundation.FoundationContract, 1.0),
+-            uuid(e85df41d-6aa7-46e3-a8e2-f009d840c627)
+-        ]
+-        delegate HRESULT AsyncOperationWithProgressCompletedHandler<TResult, TProgress>([in] Windows.Foundation.IAsyncOperationWithProgress<TResult, TProgress> *info,
+-                                                                                        [in] AsyncStatus status);
+-
+-        [
+-            contract(Windows.Foundation.FoundationContract, 1.0),
+-            uuid(b5d036d7-e297-498f-ba60-0289e76e23dd)
+-        ]
+-        interface IAsyncOperationWithProgress<TResult, TProgress> : IInspectable
+-        {
+-            [propput] HRESULT Progress([in] Windows.Foundation.AsyncOperationProgressHandler<TResult, TProgress> *handler);
+-            [propget] HRESULT Progress([out, retval] Windows.Foundation.AsyncOperationProgressHandler<TResult, TProgress> **handler);
+-            [propput] HRESULT Completed([in] Windows.Foundation.AsyncOperationWithProgressCompletedHandler<TResult, TProgress> *handler);
+-            [propget] HRESULT Completed([out, retval] Windows.Foundation.AsyncOperationWithProgressCompletedHandler<TResult, TProgress> **handler);
+-            HRESULT GetResults([out, retval] TResult *results);
+-        }
+-
+-        [
+-            contract(Windows.Foundation.FoundationContract, 1.0),
+-            uuid(9de1c534-6ae1-11e0-84e1-18a905bcc53f)
+-        ]
+-        delegate HRESULT TypedEventHandler<TSender, TArgs>([in] TSender sender, [in] TArgs args);
+-
+-        [
+-            contract(Windows.Foundation.FoundationContract, 1.0),
+-            uuid(61c17706-2d65-11e0-9ae8-d48564015472)
+-        ]
+-        interface IReference<T> : IInspectable
+-        {
+-            [propget] HRESULT Value([out, retval] T *value);
+-        }
+ 
+         namespace Collections
+         {
+diff --git a/include/windows.foundation.idl b/include/windows.foundation.idl
+index 7fbb454..a9918e8 100644
+--- a/include/windows.foundation.idl
++++ b/include/windows.foundation.idl
+@@ -17,6 +17,7 @@
+  */
+ 
+ #ifdef __WIDL__
++#pragma makedep header install winmd
+ #pragma winrt ns_prefix
+ #endif
+ 
+@@ -121,6 +122,105 @@ namespace Windows.Foundation {
+     runtimeclass WwwFormUrlDecoder;
+     runtimeclass WwwFormUrlDecoderEntry;
+ 
++#ifdef __WIDL__
++    [
++        contract(Windows.Foundation.FoundationContract, 1.0),
++        uuid(9de1c535-6ae1-11e0-84e1-18a905bcc53f)
++    ]
++    delegate HRESULT EventHandler<T>([in] IInspectable *sender, [in] T args);
++
++    interface IAsyncOperation<TResult>;
++
++    [
++        contract(Windows.Foundation.FoundationContract, 1.0),
++        uuid(fcdcf02c-e5d8-4478-915a-4d90b74b83a5)
++    ]
++    delegate HRESULT AsyncOperationCompletedHandler<TResult>([in] Windows.Foundation.IAsyncOperation<TResult> *info,
++                                                             [in] AsyncStatus status);
++
++    [
++        contract(Windows.Foundation.FoundationContract, 1.0),
++        uuid(9fc2b0bb-e446-44e2-aa61-9cab8f636af2)
++    ]
++    interface IAsyncOperation<TResult> : IInspectable
++    {
++        [propput] HRESULT Completed([in] Windows.Foundation.AsyncOperationCompletedHandler<TResult> *handler);
++        [propget] HRESULT Completed([out, retval] Windows.Foundation.AsyncOperationCompletedHandler<TResult> **handler);
++        HRESULT GetResults([out, retval] TResult *results);
++    }
++
++    interface IAsyncActionWithProgress<TProgress>;
++
++    [
++        contract(Windows.Foundation.FoundationContract, 1.0),
++        uuid(6d844858-0cff-4590-ae89-95a5a5c8b4b8)
++    ]
++    delegate HRESULT AsyncActionProgressHandler<TProgress>([in] Windows.Foundation.IAsyncActionWithProgress<TProgress> *info,
++                                                           [in] TProgress progress);
++    [
++        contract(Windows.Foundation.FoundationContract, 1.0),
++        uuid(9c029f91-cc84-44fd-ac26-0a6c4e555281)
++    ]
++    delegate HRESULT AsyncActionWithProgressCompletedHandler<TProgress>([in] Windows.Foundation.IAsyncActionWithProgress<TProgress> *info,
++                                                                        [in] AsyncStatus status);
++
++    [
++        contract(Windows.Foundation.FoundationContract, 1.0),
++        uuid(1f6db258-e803-48a1-9546-eb7353398884)
++    ]
++    interface IAsyncActionWithProgress<TProgress> : IInspectable
++    {
++        [propput] HRESULT Progress([in] Windows.Foundation.AsyncActionProgressHandler<TProgress> *handler);
++        [propget] HRESULT Progress([out, retval] Windows.Foundation.AsyncActionProgressHandler<TProgress> **handler);
++        [propput] HRESULT Completed([in] Windows.Foundation.AsyncActionWithProgressCompletedHandler<TProgress> *handler);
++        [propget] HRESULT Completed([out, retval] Windows.Foundation.AsyncActionWithProgressCompletedHandler<TProgress> **handler);
++        HRESULT GetResults();
++    }
++
++    interface IAsyncOperationWithProgress<TResult, TProgress>;
++
++    [
++        contract(Windows.Foundation.FoundationContract, 1.0),
++        uuid(55690902-0aab-421a-8778-f8ce5026d758)
++    ]
++    delegate HRESULT AsyncOperationProgressHandler<TResult, TProgress>([in] Windows.Foundation.IAsyncOperationWithProgress<TResult, TProgress> *info,
++                                                                       [in] TProgress progress);
++    [
++        contract(Windows.Foundation.FoundationContract, 1.0),
++        uuid(e85df41d-6aa7-46e3-a8e2-f009d840c627)
++    ]
++    delegate HRESULT AsyncOperationWithProgressCompletedHandler<TResult, TProgress>([in] Windows.Foundation.IAsyncOperationWithProgress<TResult, TProgress> *info,
++                                                                                    [in] AsyncStatus status);
++
++    [
++        contract(Windows.Foundation.FoundationContract, 1.0),
++        uuid(b5d036d7-e297-498f-ba60-0289e76e23dd)
++    ]
++    interface IAsyncOperationWithProgress<TResult, TProgress> : IInspectable
++    {
++        [propput] HRESULT Progress([in] Windows.Foundation.AsyncOperationProgressHandler<TResult, TProgress> *handler);
++        [propget] HRESULT Progress([out, retval] Windows.Foundation.AsyncOperationProgressHandler<TResult, TProgress> **handler);
++        [propput] HRESULT Completed([in] Windows.Foundation.AsyncOperationWithProgressCompletedHandler<TResult, TProgress> *handler);
++        [propget] HRESULT Completed([out, retval] Windows.Foundation.AsyncOperationWithProgressCompletedHandler<TResult, TProgress> **handler);
++        HRESULT GetResults([out, retval] TResult *results);
++    }
++
++    [
++        contract(Windows.Foundation.FoundationContract, 1.0),
++        uuid(9de1c534-6ae1-11e0-84e1-18a905bcc53f)
++    ]
++    delegate HRESULT TypedEventHandler<TSender, TArgs>([in] TSender sender, [in] TArgs args);
++
++    [
++        contract(Windows.Foundation.FoundationContract, 1.0),
++        uuid(61c17706-2d65-11e0-9ae8-d48564015472)
++    ]
++    interface IReference<T> : IInspectable
++    {
++        [propget] HRESULT Value([out, retval] T *value);
++    }
++#endif /* __WIDL__ async generics, see windows.foundation.collections.idl */
++
+     declare {
+         interface Windows.Foundation.Collections.IIterable<HSTRING>;
+         interface Windows.Foundation.Collections.IIterable<IInspectable *>;
+@@ -172,6 +272,7 @@ namespace Windows.Foundation {
+         interface Windows.Foundation.TypedEventHandler<Windows.Foundation.IMemoryBufferReference *, IInspectable *>;
+     }
+ 
++
+     [
+         contract(Windows.Foundation.FoundationContract, 1.0),
+         uuid(a4ed5c81-76c9-40bd-8be6-b1d90fb20ae7)
+diff --git a/include/windows.storage.streams.idl b/include/windows.storage.streams.idl
+index 161baa8..815c180 100644
+--- a/include/windows.storage.streams.idl
++++ b/include/windows.storage.streams.idl
+@@ -17,6 +17,7 @@
+  */
+ 
+ #ifdef __WIDL__
++#pragma makedep header install winmd
+ #pragma winrt ns_prefix
+ #endif
+ 
+diff --git a/loader/wine.inf.in b/loader/wine.inf.in
+index 965d3b2..a003534 100644
+--- a/loader/wine.inf.in
++++ b/loader/wine.inf.in
+@@ -1333,12 +1333,15 @@ sortdefault.nls
+ 
+ [WinmdFiles]
+ windows.applicationmodel.winmd
++windows.applicationmodel.datatransfer.winmd
++windows.foundation.winmd
+ windows.globalization.winmd
+ windows.graphics.winmd
+ windows.media.winmd
+ windows.networking.winmd
+ windows.perception.winmd
+ windows.storage.winmd
++windows.storage.streams.winmd
+ windows.system.winmd
+ windows.ui.winmd
+ windows.ui.xaml.winmd

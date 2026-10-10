@@ -1,0 +1,25 @@
+
+Change NVIDIA fallback driver from GEFORCE8 to KEPLER in guess_display_driver
+
+When an unknown NVIDIA GPU is encountered in the Vulkan adapter path,
+guess_display_driver() returns DRIVER_NVIDIA_GEFORCE8 as the fallback.
+This driver has an incomplete fixed-function state table (only covers G8x
+generation features), causing validate_state_table() errors for modern
+D3D render states.
+
+Changing the fallback to DRIVER_NVIDIA_KEPLER provides a state table that
+supports all modern D3D feature levels, preventing these validation errors
+for any unrecognized NVIDIA GPU.
+
+diff -uNarp a/dlls/wined3d/adapter_vk.c b/dlls/wined3d/adapter_vk.c
+--- a/dlls/wined3d/adapter_vk.c	2026-06-12 16:41:00.000000000 -0300
++++ b/dlls/wined3d/adapter_vk.c	2026-06-22 23:56:23.756652108 -0300
+@@ -2141,7 +2141,7 @@ static enum wined3d_display_driver guess
+     {
+         case HW_VENDOR_AMD:    return DRIVER_AMD_RX;
+         case HW_VENDOR_INTEL:  return DRIVER_INTEL_HD4000;
+-        case HW_VENDOR_NVIDIA: return DRIVER_NVIDIA_GEFORCE8;
++        case HW_VENDOR_NVIDIA: return DRIVER_NVIDIA_KEPLER;
+         default:               return DRIVER_WINE;
+     }
+ }

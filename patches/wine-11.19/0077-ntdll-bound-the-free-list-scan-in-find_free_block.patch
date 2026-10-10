@@ -1,0 +1,78 @@
+ntdll: Bound the free list scan in find_free_block().
+
+find_free_block() starts at the free list for the requested size class
+and walks it until a block is large enough. That first list holds blocks
+from somewhat smaller than the request upwards; every block in a later
+list fits. When fragmentation leaves many too-small blocks there, every
+allocation of that size walks all of them, and the cost grows with the
+square of their number.
+
+Affinity hit this opening a 100 MB SVG of 1.87 million rectangles in a
+session that had already been used for other documents: its UI thread
+spent 96% of its time in find_free_block(), called from group_allocate()
+(the low-fragmentation heap taking a new group from the backend heap),
+and the application never recovered.
+
+Check at most 32 blocks of the first list, then take the first block of
+the next non-empty one. Blocks of the first list that fit are still
+found and reused.
+
+A test that pins N free 36 KiB blocks between used blocks and then
+allocates N slightly larger ones:
+
+                        before      after
+  N = 5000              638 ms      19 ms
+  N = 20000           13824 ms      70 ms
+  N fitting allocs       19 ms      19 ms
+
+The kernel32 heap conformance tests give the same result before and
+after (278617 tests, 0 failures).
+
+diff --git a/dlls/ntdll/heap.c b/dlls/ntdll/heap.c
+index feee54e..d6102e7 100644
+--- a/dlls/ntdll/heap.c
++++ b/dlls/ntdll/heap.c
+@@ -1106,21 +1106,40 @@ static SUBHEAP *create_subheap( struct heap *heap, DWORD flags, SIZE_T total_siz
+ }
+ 
+ 
++/* how many blocks of the first free list find_free_block() checks before moving on to the next list */
++#define FREE_LIST_SCAN_MAX 32
++
+ static struct block *find_free_block( struct heap *heap, ULONG flags, SIZE_T block_size )
+ {
+-    struct list *ptr = &find_free_list( heap, block_size, FALSE )->entry;
++    struct entry *list = find_free_list( heap, block_size, FALSE );
++    struct list *ptr = &list->entry;
++    unsigned int scanned = 0;
++    BOOL first_list = TRUE;
+     struct entry *entry;
+     struct block *block;
+     SIZE_T total_size;
+     SUBHEAP *subheap;
+ 
+-    /* Find a suitable free list, and in it find a block large enough */
++    /* Find a suitable free list, and in it find a block large enough. The first list holds blocks
++     * from somewhat smaller than block_size up, and every block in the later lists fits. After a
++     * heavily fragmented heap left many too-small blocks in the first list, scanning all of them on
++     * every allocation made it quadratic, so give up on it after a few and take the next list's. */
+ 
+     while ((ptr = list_next( &heap->free_lists[0].entry, ptr )))
+     {
+         entry = LIST_ENTRY( ptr, struct entry, entry );
+         block = &entry->block;
+-        if (block_get_flags( block ) == BLOCK_FLAG_FREE_LINK) continue;
++        if (block_get_flags( block ) == BLOCK_FLAG_FREE_LINK)
++        {
++            first_list = FALSE;
++            continue;
++        }
++        if (first_list && ++scanned > FREE_LIST_SCAN_MAX && list + 1 < heap->free_lists + FREE_LIST_COUNT)
++        {
++            first_list = FALSE;
++            ptr = &list[1].entry;
++            continue;
++        }
+         if (block_get_size( block ) >= block_size)
+         {
+             if (!subheap_commit( heap, block_get_subheap( heap, block ), block, block_size )) return NULL;

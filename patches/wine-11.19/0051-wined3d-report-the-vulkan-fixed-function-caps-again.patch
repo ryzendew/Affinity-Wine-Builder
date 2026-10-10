@@ -1,0 +1,58 @@
+wined3d: Report the Vulkan renderer's fixed-function caps again.
+
+ElementalWarrior's builder carries 0009-revert-shader-spirv-caps, which
+reverts upstream bdc2fc0c ("wined3d/spirv: Set FFP caps.") out of concern
+that the caps open Direct3D paths that corrupt Affinity's rendering. On the
+Vulkan renderer that leaves D3DCAPS9 with no texture stages
+(MaxSimultaneousTextures 0). WPF's render tier 1 needs at least two, so
+every WPF window falls to tier 0: Affinity's whole interface -- panels,
+menus, dialogs, popups -- is rasterised on the CPU and copied to the window
+afterwards.
+
+This restores the upstream function. WPF then reports tier 2 on the Vulkan
+renderer and draws through Direct3D 9.
+
+The corruption EW saw is real, but it comes from presentation, not from the
+caps: at tier 2 some popups came up black and windows showed the frame
+before the latest. 0031-0034 fix those. Do not ship this patch without them.
+
+diff --git a/dlls/wined3d/shader_spirv.c b/dlls/wined3d/shader_spirv.c
+index 0ed8371..50474a0 100644
+--- a/dlls/wined3d/shader_spirv.c
++++ b/dlls/wined3d/shader_spirv.c
+@@ -1307,7 +1307,35 @@ static void spirv_fragment_pipe_vk_fp_disable(const struct wined3d_context *cont
+ static void spirv_fragment_pipe_vk_fp_get_caps(const struct wined3d_adapter *adapter, struct fragment_caps *caps)
+ {
+     memset(caps, 0, sizeof(*caps));
++    caps->PrimitiveMiscCaps = WINED3DPMISCCAPS_TSSARGTEMP
++            | WINED3DPMISCCAPS_PERSTAGECONSTANT;
++    caps->TextureOpCaps = WINED3DTEXOPCAPS_DISABLE
++            | WINED3DTEXOPCAPS_SELECTARG1
++            | WINED3DTEXOPCAPS_SELECTARG2
++            | WINED3DTEXOPCAPS_MODULATE4X
++            | WINED3DTEXOPCAPS_MODULATE2X
++            | WINED3DTEXOPCAPS_MODULATE
++            | WINED3DTEXOPCAPS_ADDSIGNED2X
++            | WINED3DTEXOPCAPS_ADDSIGNED
++            | WINED3DTEXOPCAPS_ADD
++            | WINED3DTEXOPCAPS_SUBTRACT
++            | WINED3DTEXOPCAPS_ADDSMOOTH
++            | WINED3DTEXOPCAPS_BLENDCURRENTALPHA
++            | WINED3DTEXOPCAPS_BLENDFACTORALPHA
++            | WINED3DTEXOPCAPS_BLENDTEXTUREALPHA
++            | WINED3DTEXOPCAPS_BLENDDIFFUSEALPHA
++            | WINED3DTEXOPCAPS_BLENDTEXTUREALPHAPM
++            | WINED3DTEXOPCAPS_MODULATEALPHA_ADDCOLOR
++            | WINED3DTEXOPCAPS_MODULATECOLOR_ADDALPHA
++            | WINED3DTEXOPCAPS_MODULATEINVCOLOR_ADDALPHA
++            | WINED3DTEXOPCAPS_MODULATEINVALPHA_ADDCOLOR
++            | WINED3DTEXOPCAPS_DOTPRODUCT3
++            | WINED3DTEXOPCAPS_MULTIPLYADD
++            | WINED3DTEXOPCAPS_LERP
++            | WINED3DTEXOPCAPS_BUMPENVMAP
++            | WINED3DTEXOPCAPS_BUMPENVMAPLUMINANCE;
+     caps->max_blend_stages = WINED3D_MAX_FFP_TEXTURES;
++    caps->max_textures = WINED3D_MAX_FFP_TEXTURES;
+ }
+ 
+ static unsigned int spirv_fragment_pipe_vk_fp_get_emul_mask(const struct wined3d_adapter *adapter)

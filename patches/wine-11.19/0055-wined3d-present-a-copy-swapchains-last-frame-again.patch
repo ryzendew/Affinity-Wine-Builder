@@ -1,0 +1,292 @@
+wined3d: Present a COPY swapchain's last frame again shortly after.
+
+Under Xwayland, a frame presented through a Vulkan swapchain to a Wine
+client window can stay unshown until the next present on that window
+(Mesa's X11 WSI; the GL renderer and software presents do not show it, and
+Mesa's present mode, image count and Xwayland options do not change it).
+Applications that present only when something changes then show the frame
+before the latest. In Affinity, under WPF, a click highlighted a tool or a
+layer only once the next thing was clicked, and a studio switch left its
+panels empty until a second click.
+
+After a windowed, immediate-interval COPY present, if the back buffer has not
+been written since, present it again 5 ms later and once more 45 ms after
+that. With a COPY swap effect the back buffer still holds exactly that frame,
+so the extra presents show nothing new; they push the frame out. Writes are
+counted per texture in wined3d_texture_invalidate_location(), which every
+write path goes through.
+
+The re-present runs on the command stream thread when its queue is empty.
+The application thread changes and frees swapchain state outside the command
+stream, under the wined3d mutex, so the re-present takes the mutex with a
+try-lock and checks the queue is still empty: whatever such a change leaves
+pending is in the queue. It skips windows that are not visible, and each
+swapchain keeps its own.
+
+In a WPF test that changes a window's color every 2 s, the screen showed
+each color as it was set; without this, the one before.
+
+diff --git a/dlls/wined3d/cs.c b/dlls/wined3d/cs.c
+index 050da34..8fde38d 100644
+--- a/dlls/wined3d/cs.c
++++ b/dlls/wined3d/cs.c
+@@ -726,6 +726,24 @@ static void wined3d_cs_exec_present(struct wined3d_cs *cs, const void *data)
+ 
+     swapchain->swapchain_ops->swapchain_present(swapchain, &op->src_rect, &op->dst_rect, op->swap_interval, op->flags);
+ 
++    if (wined3d_swapchain_wants_nudge(swapchain, &op->src_rect, &op->dst_rect, op->swap_interval))
++    {
++        swapchain->nudge_back_buffer = swapchain->back_buffers[0];
++        swapchain->nudge_write_count = swapchain->back_buffers[0]->write_count;
++        swapchain->nudge_src_rect = op->src_rect;
++        swapchain->nudge_dst_rect = op->dst_rect;
++        swapchain->nudge_swap_interval = op->swap_interval;
++        swapchain->nudge_flags = op->flags;
++        swapchain->nudge_stage = 0;
++        swapchain->nudge_due = GetTickCount64() + 5;
++        if (list_empty(&swapchain->nudge_entry))
++            list_add_tail(&cs->nudge_list, &swapchain->nudge_entry);
++    }
++    else
++    {
++        wined3d_cs_cancel_nudge(swapchain);
++    }
++
+     /* Discard buffers if the swap effect allows it. */
+     back_buffer = swapchain->back_buffers[desc->backbuffer_count - 1];
+     if (desc->swap_effect == WINED3D_SWAP_EFFECT_DISCARD || desc->swap_effect == WINED3D_SWAP_EFFECT_FLIP_DISCARD)
+@@ -3517,13 +3535,40 @@ static void poll_queries(struct wined3d_cs *cs)
+     }
+ }
+ 
++void wined3d_cs_cancel_nudge(struct wined3d_swapchain *swapchain)
++{
++    list_remove(&swapchain->nudge_entry);
++    list_init(&swapchain->nudge_entry);
++}
++
++static bool wined3d_cs_get_nudge_due(const struct wined3d_cs *cs, ULONG64 *due)
++{
++    const struct wined3d_swapchain *swapchain;
++
++    if (list_empty(&cs->nudge_list))
++        return false;
++    *due = ~(ULONG64)0;
++    LIST_FOR_EACH_ENTRY(swapchain, &cs->nudge_list, struct wined3d_swapchain, nudge_entry)
++        *due = min(*due, swapchain->nudge_due);
++    return true;
++}
++
+ static void wined3d_cs_wait_event(struct wined3d_cs *cs)
+ {
+     static const LARGE_INTEGER query_timeout = {.QuadPart = WINED3D_CS_COMMAND_WAIT_WITH_QUERIES_TIMEOUT * -10};
+     const LARGE_INTEGER *timeout = NULL;
++    LARGE_INTEGER nudge_timeout;
++    ULONG64 due, now;
+ 
+     if (!list_empty(&cs->query_poll_list))
+         timeout = &query_timeout;
++    if (wined3d_cs_get_nudge_due(cs, &due))
++    {
++        now = GetTickCount64();
++        nudge_timeout.QuadPart = due > now ? (LONGLONG)(due - now) * -10000 : -10000;
++        if (!timeout || nudge_timeout.QuadPart > timeout->QuadPart)
++            timeout = &nudge_timeout;
++    }
+ 
+     InterlockedExchange(&cs->waiting_for_event, TRUE);
+ 
+@@ -3617,6 +3662,62 @@ static void wined3d_cs_exec_execute_command_list(struct wined3d_cs *cs, const vo
+     }
+ }
+ 
++/* A frame presented through a Vulkan swapchain to a Wine child window under
++ * Xwayland can stay unshown until the next present arrives. Applications
++ * that present only when something changes, like WPF, then always show the
++ * frame before the current one. If the back buffer has not been written
++ * since such a present, present it again, a little later and once more after
++ * that: with a COPY swap effect it still holds exactly that frame.
++ *
++ * The application thread changes and frees swapchain state, back buffers
++ * included, under the wined3d mutex and outside the command stream. So
++ * present only while holding the mutex, and only with nothing queued: any
++ * such change that is still pending sits in the queue. */
++static void wined3d_cs_nudge(struct wined3d_cs *cs)
++{
++    struct wined3d_swapchain *swapchain, *next;
++    ULONG64 due, now;
++
++    if (!wined3d_cs_get_nudge_due(cs, &due) || (now = GetTickCount64()) < due)
++        return;
++    if (!wined3d_mutex_try_lock())
++        return;
++
++    if (wined3d_cs_queue_is_empty(cs, &cs->queue[WINED3D_CS_QUEUE_DEFAULT])
++            && wined3d_cs_queue_is_empty(cs, &cs->queue[WINED3D_CS_QUEUE_MAP]))
++    {
++        LIST_FOR_EACH_ENTRY_SAFE(swapchain, next, &cs->nudge_list, struct wined3d_swapchain, nudge_entry)
++        {
++            if (swapchain->back_buffers[0] != swapchain->nudge_back_buffer
++                    || swapchain->back_buffers[0]->write_count != swapchain->nudge_write_count)
++            {
++                wined3d_cs_cancel_nudge(swapchain);
++                continue;
++            }
++            if (now < swapchain->nudge_due)
++                continue;
++            if (!IsWindowVisible(swapchain->win_handle))
++            {
++                wined3d_cs_cancel_nudge(swapchain);
++                continue;
++            }
++
++            TRACE("Re-presenting swapchain %p.\n", swapchain);
++            wined3d_cs_command_lock(cs);
++            swapchain->swapchain_ops->swapchain_present(swapchain, &swapchain->nudge_src_rect,
++                    &swapchain->nudge_dst_rect, swapchain->nudge_swap_interval, swapchain->nudge_flags);
++            wined3d_cs_command_unlock(cs);
++
++            if (++swapchain->nudge_stage == 1)
++                swapchain->nudge_due = now + 45;
++            else
++                wined3d_cs_cancel_nudge(swapchain);
++        }
++    }
++
++    wined3d_mutex_unlock();
++}
++
+ static DWORD WINAPI wined3d_cs_run(void *ctx)
+ {
+     struct wined3d_cs_queue *queue;
+@@ -3651,6 +3752,7 @@ static DWORD WINAPI wined3d_cs_run(void *ctx)
+             queue = &cs->queue[WINED3D_CS_QUEUE_DEFAULT];
+             if (wined3d_cs_queue_is_empty(cs, queue))
+             {
++                wined3d_cs_nudge(cs);
+                 YieldProcessor();
+                 if (++spin_count >= WINED3D_CS_SPIN_COUNT)
+                 {
+@@ -3719,6 +3821,7 @@ struct wined3d_cs *wined3d_cs_create(struct wined3d_device *device,
+     cs->c.ops = &wined3d_cs_st_ops;
+     cs->c.device = device;
+     cs->serialize_commands = TRACE_ON(d3d_sync) || wined3d_settings.cs_multithreaded & WINED3D_CSMT_SERIALIZE;
++    list_init(&cs->nudge_list);
+ 
+     if (cs->serialize_commands)
+         ERR_(d3d_sync)("Forcing serialization of all command streams.\n");
+diff --git a/dlls/wined3d/swapchain.c b/dlls/wined3d/swapchain.c
+index 3ddd01c..258692f 100644
+--- a/dlls/wined3d/swapchain.c
++++ b/dlls/wined3d/swapchain.c
+@@ -139,6 +139,9 @@ static void wined3d_swapchain_vk_destroy_vulkan_swapchain(struct wined3d_swapcha
+ 
+ static void wined3d_swapchain_vk_destroy_object(void *object)
+ {
++    struct wined3d_swapchain_vk *swapchain_vk = object;
++
++    wined3d_cs_cancel_nudge(&swapchain_vk->s);
+     wined3d_swapchain_vk_destroy_vulkan_swapchain(object);
+ }
+ 
+@@ -1374,6 +1377,20 @@ static const struct wined3d_swapchain_ops swapchain_vk_ops =
+     swapchain_frontbuffer_updated,
+ };
+ 
++bool wined3d_swapchain_wants_nudge(const struct wined3d_swapchain *swapchain,
++        const RECT *src_rect, const RECT *dst_rect, unsigned int swap_interval)
++{
++    const struct wined3d_swapchain_desc *desc = &swapchain->state.desc;
++    RECT full_rect;
++
++    return swapchain->swapchain_ops == &swapchain_vk_ops
++            && wined3d_swapchain_vk((struct wined3d_swapchain *)swapchain)->vk_swapchain
++            && !swap_interval && desc->windowed && desc->backbuffer_count == 1
++            && (desc->swap_effect == WINED3D_SWAP_EFFECT_COPY || desc->swap_effect == WINED3D_SWAP_EFFECT_COPY_VSYNC)
++            && (!swapchain_present_is_partial_copy((struct wined3d_swapchain *)swapchain, dst_rect)
++            || swapchain_present_can_expand((struct wined3d_swapchain *)swapchain, src_rect, dst_rect, &full_rect));
++}
++
+ static void swapchain_gdi_frontbuffer_updated(struct wined3d_swapchain *swapchain)
+ {
+     struct wined3d_dc_info *front;
+@@ -1696,6 +1713,7 @@ static HRESULT wined3d_swapchain_init(struct wined3d_swapchain *swapchain, struc
+     }
+ 
+     swapchain->swapchain_ops = swapchain_ops;
++    list_init(&swapchain->nudge_entry);
+     swapchain->device = device;
+     swapchain->parent = parent;
+     swapchain->parent_ops = parent_ops;
+diff --git a/dlls/wined3d/texture.c b/dlls/wined3d/texture.c
+index 4ada3c3..1227193 100644
+--- a/dlls/wined3d/texture.c
++++ b/dlls/wined3d/texture.c
+@@ -176,6 +176,7 @@ void wined3d_texture_invalidate_location(struct wined3d_texture *texture,
+ 
+     if (location & (WINED3D_LOCATION_TEXTURE_RGB | WINED3D_LOCATION_TEXTURE_SRGB))
+         wined3d_texture_set_dirty(texture);
++    ++texture->write_count;
+ 
+     sub_resource = &texture->sub_resources[sub_resource_idx];
+     previous_locations = sub_resource->locations;
+diff --git a/dlls/wined3d/wined3d_main.c b/dlls/wined3d/wined3d_main.c
+index 8dff23e..ec34aa3 100644
+--- a/dlls/wined3d/wined3d_main.c
++++ b/dlls/wined3d/wined3d_main.c
+@@ -562,6 +562,11 @@ void WINAPI wined3d_mutex_unlock(void)
+     LeaveCriticalSection(&wined3d_cs);
+ }
+ 
++BOOL wined3d_mutex_try_lock(void)
++{
++    return TryEnterCriticalSection(&wined3d_cs);
++}
++
+ static void wined3d_wndproc_mutex_lock(void)
+ {
+     EnterCriticalSection(&wined3d_wndproc_cs);
+diff --git a/dlls/wined3d/wined3d_private.h b/dlls/wined3d/wined3d_private.h
+index 952b438..85344a6 100644
+--- a/dlls/wined3d/wined3d_private.h
++++ b/dlls/wined3d/wined3d_private.h
+@@ -3414,6 +3414,7 @@ struct wined3d_texture
+     unsigned int level_count;
+     unsigned int download_count;
+     unsigned int sysmem_count;
++    unsigned int write_count;
+     unsigned int lod;
+     uint32_t flags;
+     DWORD update_map_binding;
+@@ -3716,8 +3717,16 @@ struct wined3d_cs
+ 
+     HANDLE event;
+     LONG waiting_for_event;
++
++    /* Swapchains waiting to be presented again; see wined3d_cs_nudge(). */
++    struct list nudge_list;
+ };
+ 
++BOOL wined3d_mutex_try_lock(void);
++void wined3d_cs_cancel_nudge(struct wined3d_swapchain *swapchain);
++bool wined3d_swapchain_wants_nudge(const struct wined3d_swapchain *swapchain,
++        const RECT *src_rect, const RECT *dst_rect, unsigned int swap_interval);
++
+ static inline void wined3d_device_context_lock(struct wined3d_device_context *context)
+ {
+     if (context == &context->device->cs->c)
+@@ -4134,6 +4143,14 @@ struct wined3d_swapchain
+     struct wined3d_swapchain_state state;
+     HWND win_handle;
+     HDC dc;
++
++    /* Presenting the same frame again; see wined3d_cs_nudge(). */
++    struct list nudge_entry;
++    struct wined3d_texture *nudge_back_buffer;
++    unsigned int nudge_write_count, nudge_swap_interval, nudge_stage;
++    RECT nudge_src_rect, nudge_dst_rect;
++    uint32_t nudge_flags;
++    ULONG64 nudge_due;
+ };
+ 
+ void wined3d_swapchain_activate(struct wined3d_swapchain *swapchain, BOOL activate);

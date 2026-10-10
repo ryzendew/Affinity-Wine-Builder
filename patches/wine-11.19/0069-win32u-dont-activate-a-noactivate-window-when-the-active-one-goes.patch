@@ -1,0 +1,37 @@
+win32u: Do not activate a WS_EX_NOACTIVATE window when the active window goes away.
+
+When the active window is hidden or destroyed, activate_other_window()
+picks the next visible top-level window, including one created with
+WS_EX_NOACTIVATE. Windows documents that style as: "The system does not
+bring this window to the foreground when the user minimizes or closes the
+foreground window."
+
+Affinity's studio list is a WPF popup (WS_EX_NOACTIVATE). Reordering a
+studio drags a ghost window of the row, which takes activation when shown.
+When the drop hides it, Wine activated the popup; the window manager then
+moved focus on to the main window, and the X FocusOut on the popup, now the
+foreground window, sent it WM_CANCELMODE. WPF answers WM_CANCELMODE by
+releasing capture, and a popup that loses capture closes. So the list
+closed after every reorder.
+
+Skip WS_EX_NOACTIVATE windows in can_activate_window(), which only
+activate_other_window() uses.
+
+Checked with real pointer input under a nested KWin: after a reorder the
+list stays open, two reorders in a row work, and clicking outside it or on
+its button still closes it.
+
+diff --git a/dlls/win32u/window.c b/dlls/win32u/window.c
+index 92dc6e6..1293df5 100644
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -4498,6 +4498,9 @@ static BOOL can_activate_window( HWND hwnd )
+     if (!(style & WS_VISIBLE)) return FALSE;
+     if ((style & (WS_POPUP|WS_CHILD)) == WS_CHILD) return FALSE;
+     if (style & WS_MINIMIZE) return FALSE;
++    /* the system does not bring a WS_EX_NOACTIVATE window to the foreground
++     * when the foreground window is closed or hidden */
++    if (get_window_long( hwnd, GWL_EXSTYLE ) & WS_EX_NOACTIVATE) return FALSE;
+     return !(style & WS_DISABLED);
+ }
+ 

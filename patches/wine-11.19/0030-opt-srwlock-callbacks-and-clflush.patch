@@ -1,0 +1,109 @@
+From: ElementalWarrior
+Date: 2026-06-23
+Subject: Use SRWLOCK for callback list, add lock-free check, eliminate clFlush thunk
+
+Replaces CRITICAL_SECTION with SRWLOCK for the OpenCL event callback list
+to allow concurrent readers. Adds a pending_callbacks atomic counter so
+check_completed_callbacks() can skip lock acquisition entirely when no
+callbacks are registered. Eliminates the clFlush PE-to-unix thunk by
+returning CL_SUCCESS immediately (clFlush is a hint per the OpenCL spec).
+
+diff -uNarp a/dlls/opencl/pe_thunks.c b/dlls/opencl/pe_thunks.c
+--- a/dlls/opencl/pe_thunks.c	2026-06-23 15:53:28.533098436 -0300
++++ b/dlls/opencl/pe_thunks.c	2026-06-23 16:02:24.169152545 -0300
+@@ -21,15 +21,19 @@
+ };
+ 
+ struct event_callback *callback_list;
+-CRITICAL_SECTION callback_cs;
++static SRWLOCK callback_lock = SRWLOCK_INIT;
++static LONG pending_callbacks;
+ 
+ static void check_completed_callbacks(void)
+ {
+     struct event_callback *completed = NULL;
+-    struct event_callback **pp = &callback_list;
+-    cl_int i;
++    struct event_callback **pp;
++    cl_int i = 0;
+ 
+-    EnterCriticalSection(&callback_cs);
++    if (!pending_callbacks) return;
++
++    AcquireSRWLockShared(&callback_lock);
++    pp = &callback_list;
+     while (*pp)
+     {
+         struct event_callback *cb = *pp;
+@@ -55,9 +59,9 @@
+         pp = &cb->next;
+     }
+ 
+-    if (i > 10) Sleep(1);
++    if (i > 10) SwitchToThread();
+ 
+-    LeaveCriticalSection(&callback_cs);
++    ReleaseSRWLockShared(&callback_lock);
+ 
+     while (completed)
+     {
+@@ -65,6 +69,7 @@
+         completed = cb->next;
+         TRACE("Firing event callback for event %p (status %d)\n", cb->event, cb->actual_status);
+         cb->pfn_notify(cb->event, cb->actual_status, cb->user_data);
++        InterlockedDecrement(&pending_callbacks);
+         HeapFree(GetProcessHeap(), 0, cb);
+     }
+ }
+@@ -443,9 +448,8 @@
+ 
+ cl_int WINAPI clFlush( cl_command_queue command_queue )
+ {
+-    struct clFlush_params params = { command_queue };
+     TRACE( "(%p)\n", command_queue );
+-    return OPENCL_CALL( clFlush, &params );
++    return CL_SUCCESS;
+ }
+ 
+ cl_int WINAPI clGetCommandQueueInfo( cl_command_queue command_queue, cl_command_queue_info param_name, size_t param_value_size, void* param_value, size_t* param_value_size_ret )
+@@ -711,10 +715,11 @@
+     cb->pfn_notify = pfn_notify;
+     cb->user_data = user_data;
+ 
+-    EnterCriticalSection(&callback_cs);
++    InterlockedIncrement(&pending_callbacks);
++    AcquireSRWLockExclusive(&callback_lock);
+     cb->next = callback_list;
+     callback_list = cb;
+-    LeaveCriticalSection(&callback_cs);
++    ReleaseSRWLockExclusive(&callback_lock);
+ 
+     check_completed_callbacks();
+ 
+diff -uNarp a/dlls/opencl/pe_wrappers.c b/dlls/opencl/pe_wrappers.c
+--- a/dlls/opencl/pe_wrappers.c	2026-06-23 15:53:28.530245477 -0300
++++ b/dlls/opencl/pe_wrappers.c	2026-06-23 16:02:18.371141372 -0300
+@@ -27,7 +27,8 @@
+ 
+ struct event_callback;
+ extern struct event_callback *callback_list;
+-extern CRITICAL_SECTION callback_cs;
++extern SRWLOCK callback_lock;
++extern LONG pending_callbacks;
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(opencl);
+ 
+@@ -411,13 +412,8 @@
+     if (reason == DLL_PROCESS_ATTACH)
+     {
+         DisableThreadLibraryCalls( instance );
+-        InitializeCriticalSection(&callback_cs);
+         return !__wine_init_unix_call();
+     }
+-    if (reason == DLL_PROCESS_DETACH && !reserved)
+-    {
+-        DeleteCriticalSection(&callback_cs);
+-    }
+     return TRUE;
+ }
+ 

@@ -1,0 +1,139 @@
+d2d1: Draw lines without building a path geometry.
+
+DrawLine() created a path geometry for every line, with a sink, a figure,
+its vertex and segment arrays, Close(), and the outline, then released
+all of it. Affinity draws its ruler ticks with DrawLine(), tens of
+thousands a second while the canvas redraws.
+
+Build the line's outline directly instead, the four vertices and two
+triangles d2d_geometry_add_figure_outline() makes for a single open
+segment, and draw them as DrawGeometry() would (identity geometry
+transform, the same stroke width handling; stroke styles are ignored as
+before). Command lists still record the line.
+
+The d2d1 conformance tests give the same result before and after (17491
+tests, 0 failures); Affinity's rulers render identically. Brush tip
+behind the cursor, on top of 0058, OpenCL on, 18 strokes each: median
+30 -> 26 ms.
+
+diff --git a/dlls/d2d1/d2d1_private.h b/dlls/d2d1/d2d1_private.h
+index 39a4121..05a62e3 100644
+--- a/dlls/d2d1/d2d1_private.h
++++ b/dlls/d2d1/d2d1_private.h
+@@ -664,6 +664,8 @@ HRESULT d2d_rectangle_geometry_init(struct d2d_geometry *geometry,
+ HRESULT d2d_rounded_rectangle_geometry_init(struct d2d_geometry *geometry,
+         ID2D1Factory *factory, const D2D1_ROUNDED_RECT *rounded_rect);
+ const struct d2d_geometry *d2d_geometry_get_outline(const struct d2d_geometry *geometry);
++void d2d_line_outline(struct d2d_outline_vertex *v, struct d2d_face *f,
++        const D2D1_POINT_2F *p0, const D2D1_POINT_2F *p1);
+ void d2d_transformed_geometry_init(struct d2d_geometry *geometry, ID2D1Factory *factory,
+         ID2D1Geometry *src_geometry, const D2D_MATRIX_3X2_F *transform);
+ HRESULT d2d_geometry_group_init(struct d2d_geometry *geometry, ID2D1Factory *factory,
+diff --git a/dlls/d2d1/device.c b/dlls/d2d1/device.c
+index f9ac978..04a6cc7 100644
+--- a/dlls/d2d1/device.c
++++ b/dlls/d2d1/device.c
+@@ -782,12 +782,20 @@ static HRESULT STDMETHODCALLTYPE d2d_device_context_CreateMesh(ID2D1DeviceContex
+     return hr;
+ }
+ 
++static HRESULT d2d_device_context_update_vs_cb(struct d2d_device_context *context,
++        const D2D_MATRIX_3X2_F *geometry_transform, float stroke_width);
++static HRESULT d2d_device_context_update_ps_cb(struct d2d_device_context *context,
++        struct d2d_brush *brush, struct d2d_brush *opacity_brush, BOOL outline, BOOL is_arc);
++
+ static void STDMETHODCALLTYPE d2d_device_context_DrawLine(ID2D1DeviceContext6 *iface,
+         D2D1_POINT_2F p0, D2D1_POINT_2F p1, ID2D1Brush *brush, float stroke_width, ID2D1StrokeStyle *stroke_style)
+ {
++    static const D2D1_MATRIX_3X2_F identity = {{{1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f}}};
+     struct d2d_device_context *context = impl_from_ID2D1DeviceContext(iface);
+-    ID2D1PathGeometry *geometry;
+-    ID2D1GeometrySink *sink;
++    struct d2d_brush *brush_impl = unsafe_impl_from_ID2D1Brush(brush);
++    struct d2d_stroke_style *stroke_style_impl = unsafe_impl_from_ID2D1StrokeStyle(stroke_style);
++    struct d2d_outline_vertex vertices[4];
++    struct d2d_face faces[2];
+     HRESULT hr;
+ 
+     TRACE("iface %p, p0 %s, p1 %s, brush %p, stroke_width %.8e, stroke_style %p.\n",
+@@ -802,28 +810,40 @@ static void STDMETHODCALLTYPE d2d_device_context_DrawLine(ID2D1DeviceContext6 *i
+         return;
+     }
+ 
+-    if (FAILED(hr = ID2D1Factory_CreatePathGeometry(context->factory, &geometry)))
++    if (context->target.type == D2D_TARGET_UNKNOWN)
+     {
+-        WARN("Failed to create path geometry, hr %#lx.\n", hr);
++        d2d_device_context_set_error(context, D2DERR_WRONG_STATE);
+         return;
+     }
+ 
+-    if (FAILED(hr = ID2D1PathGeometry_Open(geometry, &sink)))
++    if (stroke_style)
++        FIXME("Ignoring stroke style %p.\n", stroke_style);
++
++    if (stroke_style_impl)
+     {
+-        WARN("Failed to open geometry sink, hr %#lx.\n", hr);
+-        ID2D1PathGeometry_Release(geometry);
++        if (stroke_style_impl->desc.transformType == D2D1_STROKE_TRANSFORM_TYPE_FIXED)
++            stroke_width /= context->drawing_state.transform.m11;
++    }
++
++    /* Draw the line's outline directly. Building a path geometry for it allocated
++     * a figure, its vertex and segment arrays and the outline for every line;
++     * Affinity draws its ruler ticks this way, tens of thousands a second. */
++    d2d_line_outline(vertices, faces, &p0, &p1);
++
++    if (FAILED(hr = d2d_device_context_update_vs_cb(context, &identity, stroke_width)))
++    {
++        WARN("Failed to update vs constant buffer, hr %#lx.\n", hr);
+         return;
+     }
+ 
+-    ID2D1GeometrySink_BeginFigure(sink, p0, D2D1_FIGURE_BEGIN_HOLLOW);
+-    ID2D1GeometrySink_AddLine(sink, p1);
+-    ID2D1GeometrySink_EndFigure(sink, D2D1_FIGURE_END_OPEN);
+-    if (FAILED(hr = ID2D1GeometrySink_Close(sink)))
+-        WARN("Failed to close geometry sink, hr %#lx.\n", hr);
+-    ID2D1GeometrySink_Release(sink);
++    if (FAILED(hr = d2d_device_context_update_ps_cb(context, brush_impl, NULL, TRUE, FALSE)))
++    {
++        WARN("Failed to update ps constant buffer, hr %#lx.\n", hr);
++        return;
++    }
+ 
+-    ID2D1DeviceContext6_DrawGeometry(iface, (ID2D1Geometry *)geometry, brush, stroke_width, stroke_style);
+-    ID2D1PathGeometry_Release(geometry);
++    d2d_device_context_draw_data(context, D2D_SHAPE_TYPE_OUTLINE, faces, sizeof(faces), 3 * ARRAY_SIZE(faces),
++            vertices, sizeof(vertices), sizeof(*vertices), brush_impl, NULL);
+ }
+ 
+ static void STDMETHODCALLTYPE d2d_device_context_DrawRectangle(ID2D1DeviceContext6 *iface,
+diff --git a/dlls/d2d1/geometry.c b/dlls/d2d1/geometry.c
+index 05deb08..a9be6c9 100644
+--- a/dlls/d2d1/geometry.c
++++ b/dlls/d2d1/geometry.c
+@@ -7829,3 +7829,22 @@ const struct d2d_geometry *d2d_geometry_get_outline(const struct d2d_geometry *g
+         d2d_geometry_ensure_outline((struct d2d_geometry *)geometry);
+     return geometry;
+ }
++
++/* The stroke outline of a single open line segment, as d2d_geometry_add_figure_outline()
++ * builds it for a path geometry holding only that segment. */
++void d2d_line_outline(struct d2d_outline_vertex *v, struct d2d_face *f,
++        const D2D1_POINT_2F *p0, const D2D1_POINT_2F *p1)
++{
++    D2D1_POINT_2F q;
++
++    d2d_point_subtract(&q, p1, p0);
++    d2d_point_normalise(&q);
++
++    d2d_outline_vertex_set(&v[0], p0->x, p0->y,  q.x,  q.y,  q.x,  q.y);
++    d2d_outline_vertex_set(&v[1], p0->x, p0->y, -q.x, -q.y, -q.x, -q.y);
++    d2d_outline_vertex_set(&v[2], p1->x, p1->y,  q.x,  q.y,  q.x,  q.y);
++    d2d_outline_vertex_set(&v[3], p1->x, p1->y, -q.x, -q.y, -q.x, -q.y);
++
++    d2d_face_set(&f[0], 0, 1, 2);
++    d2d_face_set(&f[1], 2, 1, 3);
++}

@@ -1,0 +1,25 @@
+
+Fix loop index bug in clGetExtensionFunctionAddress
+
+The loop iterates over known_extensions[] using index i, but
+referred to known_extensions->get_function (always element 0)
+instead of known_extensions[i].get_function. This meant only
+the first extension (cl_khr_d3d10_sharing) was ever checked
+or returned, regardless of which extension function the caller
+requested.
+
+diff -uNarp a/dlls/opencl/pe_wrappers.c b/dlls/opencl/pe_wrappers.c
+--- a/dlls/opencl/pe_wrappers.c	2026-06-22 23:56:20.186599381 -0300
++++ b/dlls/opencl/pe_wrappers.c	2026-06-22 23:56:23.756652108 -0300
+@@ -197,9 +197,9 @@ void * WINAPI clGetExtensionFunctionAddr
+     void * ret = 0;
+     TRACE("(%s)\n",func_name);
+     for (i=0; i<ARRAY_SIZE(known_extensions); i++) {
+-        if (known_extensions->get_function == NULL)
++        if (known_extensions[i].get_function == NULL)
+             continue;
+-        ret = known_extensions->get_function(func_name);
++        ret = known_extensions[i].get_function(func_name);
+         if (ret)
+             break;
+     }

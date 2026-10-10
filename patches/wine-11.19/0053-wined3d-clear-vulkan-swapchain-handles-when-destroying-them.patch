@@ -1,0 +1,90 @@
+wined3d: Clear Vulkan swapchain handles when destroying them.
+
+wined3d_swapchain_vk_destroy_vulkan_swapchain() destroys the swapchain, its
+surface, images and semaphores but leaves the handles and pointers in place.
+When the recreate that follows fails -- VK_ERROR_SURFACE_LOST_KHR as the
+window goes away, for one -- the next present and the final destroy use them
+again: vkDestroySemaphore or vkDestroySwapchainKHR faults in the Unix call
+and the process dies. The failure paths of swapchain creation leave freed
+pointers behind the same way. And wined3d_swapchain_vk_blit() carries on
+after a recreate in wined3d_swapchain_vk_set_swap_interval() fails, into a
+division by the zero image count.
+
+Clear everything that is destroyed, and have the blit report
+VK_ERROR_OUT_OF_DATE_KHR when no swapchain is left, so the caller tries one
+recreate and otherwise skips the frame.
+
+A WPF test that opens, recolors, resizes and closes popup windows every
+7 ms crashed in 5 of 7 runs with 0033 and 0034, which make recreates during
+window teardown more likely; with this, 6 of 6 complete. Upstream master
+has the same code.
+
+diff --git a/dlls/wined3d/swapchain.c b/dlls/wined3d/swapchain.c
+index 6d602b5..88f7142 100644
+--- a/dlls/wined3d/swapchain.c
++++ b/dlls/wined3d/swapchain.c
+@@ -120,14 +120,21 @@ static void wined3d_swapchain_vk_destroy_vulkan_swapchain(struct wined3d_swapcha
+     if ((vr = VK_CALL(vkQueueWaitIdle(device_vk->graphics_queue.vk_queue))) < 0)
+         ERR("Failed to wait on queue, vr %s.\n", wined3d_debug_vkresult(vr));
+     free(swapchain_vk->vk_images);
++    swapchain_vk->vk_images = NULL;
+     for (i = 0; i < swapchain_vk->image_count; ++i)
+     {
+         VK_CALL(vkDestroySemaphore(device_vk->vk_device, swapchain_vk->vk_semaphores[i].available, NULL));
+         VK_CALL(vkDestroySemaphore(device_vk->vk_device, swapchain_vk->vk_semaphores[i].presentable, NULL));
+     }
+     free(swapchain_vk->vk_semaphores);
++    swapchain_vk->vk_semaphores = NULL;
++    swapchain_vk->image_count = 0;
++    /* A failed recreate leaves these unset; the next present or the final
++     * destroy must not reach the ones destroyed here. */
+     VK_CALL(vkDestroySwapchainKHR(device_vk->vk_device, swapchain_vk->vk_swapchain, NULL));
++    swapchain_vk->vk_swapchain = VK_NULL_HANDLE;
+     VK_CALL(vkDestroySurfaceKHR(vk_info->instance, swapchain_vk->vk_surface, NULL));
++    swapchain_vk->vk_surface = VK_NULL_HANDLE;
+ }
+ 
+ static void wined3d_swapchain_vk_destroy_object(void *object)
+@@ -857,6 +864,7 @@ static bool wined3d_swapchain_vk_create_vulkan_swapchain_images(struct wined3d_s
+     {
+         ERR("Failed to get swapchain images, vr %s.\n", wined3d_debug_vkresult(vr));
+         free(swapchain_vk->vk_images);
++        swapchain_vk->vk_images = NULL;
+         return false;
+     }
+ 
+@@ -864,6 +872,7 @@ static bool wined3d_swapchain_vk_create_vulkan_swapchain_images(struct wined3d_s
+     {
+         ERR("Failed to allocate semaphores array.\n");
+         free(swapchain_vk->vk_images);
++        swapchain_vk->vk_images = NULL;
+         return false;
+     }
+ 
+@@ -899,7 +908,9 @@ fail:
+             VK_CALL(vkDestroySemaphore(device_vk->vk_device, swapchain_vk->vk_semaphores[i].presentable, NULL));
+     }
+     free(swapchain_vk->vk_semaphores);
++    swapchain_vk->vk_semaphores = NULL;
+     free(swapchain_vk->vk_images);
++    swapchain_vk->vk_images = NULL;
+     return false;
+ }
+ 
+@@ -1037,6 +1048,7 @@ static HRESULT wined3d_swapchain_vk_create_vulkan_swapchain(struct wined3d_swapc
+     if (!wined3d_swapchain_vk_create_vulkan_swapchain_images(swapchain_vk, vk_swapchain))
+     {
+         VK_CALL(vkDestroySwapchainKHR(device_vk->vk_device, vk_swapchain, NULL));
++        swapchain_vk->vk_swapchain = VK_NULL_HANDLE;
+         goto fail;
+     }
+ 
+@@ -1101,6 +1113,8 @@ static VkResult wined3d_swapchain_vk_blit(struct wined3d_swapchain_vk *swapchain
+             swapchain_vk, context_vk, wine_dbgstr_rect(src_rect), wine_dbgstr_rect(dst_rect), swap_interval);
+ 
+     wined3d_swapchain_vk_set_swap_interval(swapchain_vk, swap_interval);
++    if (!swapchain_vk->vk_swapchain)
++        return VK_ERROR_OUT_OF_DATE_KHR;
+ 
+     present_idx = swapchain_vk->current++ % swapchain_vk->image_count;
+     wined3d_context_vk_wait_command_buffer(context_vk, swapchain_vk->vk_semaphores[present_idx].command_buffer_id);
