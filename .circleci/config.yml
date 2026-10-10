@@ -9,7 +9,7 @@ executors:
       BUILD_THREADS: 4
 
 jobs:
-  build-wine:
+  build-wine-11.19:
     executor: wine-builder
     steps:
       - checkout
@@ -58,26 +58,26 @@ jobs:
             fi
 
       - run:
-          name: Build Wine 11.12
+          name: Build Wine 11.19
           command: |
-            ./Build-Wine-11.12.sh
+            ./Build-Wine-11.19.sh
           no_output_timeout: 2h
 
       - run:
           name: Collect build logs
           command: |
-            mkdir -p /tmp/build-logs
-            cp wine64-build/*.log /tmp/build-logs/ 2>/dev/null || true
+            mkdir -p /tmp/build-logs-11.19
+            cp wine64-build/*.log /tmp/build-logs-11.19/ 2>/dev/null || true
           when: always
 
       - store_artifacts:
-          path: ElementalWarrior-wine-11.12.tar.xz
+          path: ElementalWarrior-wine-11.19.tar.xz
           destination: /
           when: on_success
 
       - store_artifacts:
-          path: /tmp/build-logs
-          destination: build-logs
+          path: /tmp/build-logs-11.19
+          destination: build-logs-11.19
           when: on_fail
 
   build-wine-11.18:
@@ -155,5 +155,5 @@ workflows:
   version: 2.1
   build:
     jobs:
-      - build-wine
+      - build-wine-11.19
       - build-wine-11.18
