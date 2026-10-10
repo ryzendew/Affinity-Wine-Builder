@@ -1,0 +1,49 @@
+From: jfacemyer <1776340+jfacemyer@users.noreply.github.com>
+Subject: [PATCH] ole32: DoDragDrop handles mouse input itself instead of dispatching it.
+
+Wine's drag loop dispatched every non-keyboard message, relying on the
+tracker window's capture to route mouse input to the tracker. An
+application can take capture back during the drag: Affinity's
+FrameworkPopup re-captures the mouse when a child loses capture, which
+DoDragDrop's own SetCapture causes. The button release then went to the
+popup, Affinity's drag source took it as the end of its own drag and
+cleared its state, and dereferenced that state when DoDragDrop returned
+-- a NullReferenceException crash reordering Studio tabs.
+
+Windows' drag loop takes mouse input off the queue and tracks it itself;
+the drag source sees no mouse messages while DoDragDrop runs, which is
+why the same Affinity code does not crash there. Do the same: track
+button and move messages in the loop and do not dispatch them. Wheel
+messages are still dispatched.
+
+---
+diff --git a/dlls/ole32/ole2.c b/dlls/ole32/ole2.c
+index c18a46a..d048b35 100644
+--- a/dlls/ole32/ole2.c
++++ b/dlls/ole32/ole2.c
+@@ -812,10 +812,24 @@ HRESULT WINAPI DoDragDrop (
+ 	 */
+         OLEDD_TrackStateChange(&trackerInfo);
+       }
++      else if ((msg.message >= WM_MOUSEMOVE && msg.message <= WM_MBUTTONDBLCLK) ||
++               (msg.message >= WM_XBUTTONDOWN && msg.message <= WM_XBUTTONDBLCLK))
++      {
++        /*
++         * Mouse input is the drag loop's own, as on Windows: track it here
++         * and do not dispatch it. The tracker window holds capture, but an
++         * application can take capture back while the drag is running -- a
++         * popup re-capturing when it sees WM_CAPTURECHANGED does -- and the
++         * button release then reaches that window instead. Applications
++         * that treat a release as the end of their own drag tear their
++         * state down under DoDragDrop, and crash when it returns.
++         */
++        OLEDD_TrackStateChange(&trackerInfo);
++      }
+       else
+       {
+ 	/*
+-	 * Dispatch the messages only when it's not a keyboard message.
++	 * Dispatch the messages only when it's not a keyboard or mouse message.
+ 	 */
+ 	DispatchMessageW(&msg);
+       }

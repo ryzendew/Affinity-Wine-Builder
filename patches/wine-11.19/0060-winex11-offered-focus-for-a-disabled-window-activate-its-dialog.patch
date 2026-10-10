@@ -1,0 +1,78 @@
+winex11: Offered the focus for a window a modal dialog disabled, activate the dialog.
+
+On Windows, clicking a window that a modal dialog has disabled activates
+the dialog: the last active popup of the top of the window's owner chain.
+Under X the window manager raises the window it offers the focus to and
+sends WM_TAKE_FOCUS. Since 0022 Wine takes the focus for a disabled window
+(an owner disabled for an out-of-process dialog must not end up
+unreachable), and with an offer it considers stale it does nothing at all;
+either way the dialog stays below, or loses the focus. In Affinity the
+recovery prompt went behind the startup dialog when that was clicked or
+alt-tabbed to.
+
+When the offered window is disabled and the top of its owner chain has an
+enabled, visible last active popup other than itself, focus that popup and
+ask the window manager to activate it, which raises it. GA_ROOTOWNER is not
+used: it stops at a window without WS_POPUP, as these dialogs are. An owner
+disabled for the portal file chooser has no such popup and keeps 0022's
+behavior.
+
+The request must not be skipped as a duplicate. The dialog's own
+activation request, made when it was shown, can still look pending: KWin
+had already made it active, so _NET_ACTIVE_WINDOW never changed to confirm
+it. KWin may also send the property change for the window it is activating
+only after WM_TAKE_FOCUS, so nothing has cleared that state yet, and
+set_net_active_window returned without sending anything. KWin kept the
+disabled window active, and Wine then followed it.
+
+In a test with an owner, an enabled palette, a disabled owned dialog and a
+modal prompt, under a nested KWin, the prompt lost the activation to the
+disabled dialog when KWin activated that; with this it stays active and on
+top, repeatedly, and when KWin activates the owner.
+
+diff --git a/dlls/winex11.drv/event.c b/dlls/winex11.drv/event.c
+index 226adc7..2817c03 100644
+--- a/dlls/winex11.drv/event.c
++++ b/dlls/winex11.drv/event.c
+@@ -603,6 +603,41 @@ static void handle_wm_protocols( HWND hwnd, XClientMessageEvent *event )
+     {
+         HWND last_focus = x11drv_thread_data()->last_focus, foreground = NtUserGetForegroundWindow();
+ 
++        /* On Windows, clicking a window that a modal dialog has disabled
++         * activates the dialog instead: the last active popup of the top of
++         * the window's owner chain. The window manager raises whatever it
++         * offers the focus to, so taking the focus for the disabled window, or
++         * ignoring the offer as stale, left the dialog behind it; activate the
++         * dialog and ask the window manager to raise it. */
++        if (!window_has_pending_wm_state( hwnd, -1 ) && !NtUserIsWindowEnabled( hwnd ))
++        {
++            HWND owner = hwnd, next, popup = 0;
++
++            /* the top of the owner chain; GA_ROOTOWNER stops at a window that
++             * is not WS_POPUP, which these dialogs usually are not */
++            while ((next = NtUserGetWindowRelative( owner, GW_OWNER ))) owner = next;
++
++            /* GetLastActivePopup, as Windows uses: an enabled owned palette is
++             * not the dialog, and an owner disabled for an out-of-process
++             * dialog (the portal file chooser) has no popup of its own here,
++             * so it keeps the focus as before. */
++            if (owner) popup = NtUserGetLastActivePopup( owner );
++            if (popup && popup != owner && popup != hwnd && NtUserIsWindowEnabled( popup ) &&
++                NtUserIsWindowVisible( popup ) && can_activate_window( popup, FALSE ))
++            {
++                TRACE( "window %p is disabled, activating its enabled popup %p\n", hwnd, popup );
++                set_focus( event->display, popup, event_time );
++                /* The window manager has made hwnd active, and may send the
++                 * _NET_ACTIVE_WINDOW change only after this message. A request
++                 * for popup can still look pending -- the window manager had
++                 * granted it already, so the property never changed to confirm
++                 * it -- and set_net_active_window would then skip this one. */
++                x11drv_thread_data()->pending_state.net_active_window = None;
++                set_net_active_window( popup, hwnd );
++                return;
++            }
++        }
++
+         if (window_has_pending_wm_state( hwnd, -1 ) || (hwnd != foreground && !window_should_take_focus( foreground, event_time )))
+         {
+             WARN( "Ignoring window %p/%lx WM_TAKE_FOCUS serial %lu, event_time %ld, foreground %p during WM_STATE change\n",
