@@ -25,3 +25,18 @@ harder than leaving it stubbed.
 
 Verified against a pristine `wine-11.18.tar.xz` (2026-10-01): `0032`–`0049`
 apply in order with no fuzz.
+
+## Numbering notes
+
+- **`0024`/`0025` are deliberate gaps, not dropped patches.** The alt 11.11 set
+  carries `0024-d2d1-stub-Widen-with-empty-geometry-to-prevent-caller-freeze`,
+  which is the same fix as this set's `0013-d2d1-stub-Widen-with-empty-geometry`.
+  It was superseded before the set reached 11.18 and the number was never
+  reused. Nothing was removed from this set.
+- **`0059` was formerly a second `0052`.** `0052-d2d1-cache-geometry-upload-buffers`
+  and `0052-winspool-map-printer-connections-to-local` shared a number and only
+  applied in the right order because `d2d1` sorts before `winspool`. The
+  winspool one is renumbered to `0059`; it touches only `dlls/winspool.drv/info.c`,
+  which no patch in `0053`–`0058` touches, so the apply order and the patch
+  bytes are both unchanged.
+- `0054` ships disabled (`.patchOFF`).

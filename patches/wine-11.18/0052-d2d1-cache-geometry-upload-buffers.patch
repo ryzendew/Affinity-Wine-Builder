@@ -14,10 +14,21 @@ versions internally so reuse is safe while the GPU still reads the
 previous contents. Uncacheable sizes fall back to the old
 create/destroy path. Cached buffers drain with the device context.
 
+A cached entry may be larger than the request that reuses it, so the
+refill passes an explicit D3D11_BOX bounded to byte_width. With a NULL
+box wined3d sizes the copy from the destination subresource
+(wined3d_device_context_update_sub_resource) and would read past the
+end of the caller's data by up to D2D_BUFFER_CACHE_MAX_BYTES.
+
+Reused entries record the buffer's ByteWidth rather than the size of
+the data last written to it, so a large buffer refilled by a small
+draw keeps matching later large requests instead of decaying to the
+smallest recent size and bringing the CreateBuffer churn back.
+
 diff -uNarp a/dlls/d2d1/device.c b/dlls/d2d1/device.c
---- a/dlls/d2d1/device.c	2026-09-18 15:55:04.000000000 -0300
-+++ b/dlls/d2d1/device.c	2026-10-08 00:00:00.000000000 -0300
-@@ -287,6 +287,13 @@
+--- a/dlls/d2d1/device.c	2026-10-09 10:30:56.156934908 -0300
++++ b/dlls/d2d1/device.c	2026-10-09 10:30:56.157266430 -0300
+@@ -287,6 +287,13 @@ static ULONG STDMETHODCALLTYPE d2d_devic
              ID3D11VertexShader_Release(context->shape_resources[i].vs);
              ID3D11InputLayout_Release(context->shape_resources[i].il);
          }
@@ -31,7 +42,7 @@ diff -uNarp a/dlls/d2d1/device.c b/dlls/d2d1/device.c
          for (i = 0; i < D2D_SAMPLER_INTERPOLATION_MODE_COUNT; ++i)
          {
              for (j = 0; j < D2D_SAMPLER_EXTEND_MODE_COUNT; ++j)
-@@ -851,11 +858,103 @@
+@@ -851,11 +858,124 @@ static HRESULT d2d_device_context_update
      return S_OK;
  }
  
@@ -47,8 +58,9 @@ diff -uNarp a/dlls/d2d1/device.c b/dlls/d2d1/device.c
 +{
 +    struct d2d_buffer_cache_entry *cache;
 +    ID3D11DeviceContext *d3d_context;
-+    D3D11_BUFFER_DESC desc;
 +    D3D11_SUBRESOURCE_DATA subresource_data;
++    D3D11_BUFFER_DESC desc;
++    D3D11_BOX box;
 +    unsigned int i;
 +    HRESULT hr;
 +
@@ -68,8 +80,16 @@ diff -uNarp a/dlls/d2d1/device.c b/dlls/d2d1/device.c
 +                if (context->cs)
 +                    LeaveCriticalSection(context->cs);
 +                ID3D11Device1_GetImmediateContext(context->d3d_device, &d3d_context);
++                /* The cached buffer is allowed to be larger than byte_width.
++                 * A NULL box makes wined3d size the copy from the destination
++                 * subresource, which would read past the end of data, so bound
++                 * the update to the bytes we actually have. */
++                box.left = box.top = box.front = 0;
++                box.right = byte_width;
++                box.bottom = 1;
++                box.back = 1;
 +                ID3D11DeviceContext_UpdateSubresource(d3d_context,
-+                        (ID3D11Resource *)*buffer, 0, NULL, data, 0, 0);
++                        (ID3D11Resource *)*buffer, 0, &box, data, 0, 0);
 +                ID3D11DeviceContext_Release(d3d_context);
 +                return S_OK;
 +            }
@@ -97,12 +117,24 @@ diff -uNarp a/dlls/d2d1/device.c b/dlls/d2d1/device.c
 +        unsigned int bind_flags, ID3D11Buffer *buffer, size_t size)
 +{
 +    struct d2d_buffer_cache_entry *cache;
++    D3D11_BUFFER_DESC desc;
 +    unsigned int i;
 +
 +    if (!buffer)
 +        return;
 +
 +    if (!size || size > D2D_BUFFER_CACHE_MAX_BYTES)
++    {
++        ID3D11Buffer_Release(buffer);
++        return;
++    }
++
++    /* Record the buffer's real capacity, not the size of the data last
++     * written into it. Otherwise a large buffer reused for a small draw
++     * shrinks its recorded size and stops matching later large requests,
++     * which defeats the cache and brings the CreateBuffer churn back. */
++    ID3D11Buffer_GetDesc(buffer, &desc);
++    if (!desc.ByteWidth || desc.ByteWidth > D2D_BUFFER_CACHE_MAX_BYTES)
 +    {
 +        ID3D11Buffer_Release(buffer);
 +        return;
@@ -117,7 +149,7 @@ diff -uNarp a/dlls/d2d1/device.c b/dlls/d2d1/device.c
 +        if (!cache[i].buffer)
 +        {
 +            cache[i].buffer = buffer;
-+            cache[i].size = size;
++            cache[i].size = desc.ByteWidth;
 +            buffer = NULL;
 +            break;
 +        }
@@ -137,7 +169,7 @@ diff -uNarp a/dlls/d2d1/device.c b/dlls/d2d1/device.c
      ID3D11Buffer *ib, *vb;
      HRESULT hr;
  
-@@ -871,63 +970,52 @@
+@@ -871,63 +991,52 @@ static void d2d_device_context_draw_geom
          return;
      }
  
@@ -227,7 +259,7 @@ diff -uNarp a/dlls/d2d1/device.c b/dlls/d2d1/device.c
              return;
          }
  
-@@ -935,30 +1023,29 @@
+@@ -935,30 +1044,29 @@ static void d2d_device_context_draw_geom
                  3 * geometry->outline.bezier_face_count, vb,
                  sizeof(*geometry->outline.beziers), brush, NULL);
  
@@ -273,7 +305,7 @@ diff -uNarp a/dlls/d2d1/device.c b/dlls/d2d1/device.c
              return;
          }
  
-@@ -967,8 +1054,10 @@
+@@ -967,8 +1075,10 @@ static void d2d_device_context_draw_geom
                      3 * geometry->outline.arc_face_count, vb,
                      sizeof(*geometry->outline.arcs), brush, NULL);
  
@@ -286,7 +318,7 @@ diff -uNarp a/dlls/d2d1/device.c b/dlls/d2d1/device.c
      }
  }
  
-@@ -1014,18 +1103,9 @@
+@@ -1014,18 +1124,9 @@ static void STDMETHODCALLTYPE d2d_device
  static void d2d_device_context_fill_geometry(struct d2d_device_context *render_target,
          const struct d2d_geometry *geometry, struct d2d_brush *brush, struct d2d_brush *opacity_brush)
  {
@@ -305,7 +337,7 @@ diff -uNarp a/dlls/d2d1/device.c b/dlls/d2d1/device.c
      if (FAILED(hr = d2d_device_context_update_vs_cb(render_target, &geometry->transform, 0.0f)))
      {
          WARN("Failed to update vs constant buffer, hr %#lx.\n", hr);
-@@ -1040,61 +1120,57 @@
+@@ -1040,61 +1141,57 @@ static void d2d_device_context_fill_geom
  
      if (geometry->fill.face_count)
      {
@@ -392,7 +424,7 @@ diff -uNarp a/dlls/d2d1/device.c b/dlls/d2d1/device.c
              return;
          }
  
-@@ -1102,7 +1178,8 @@
+@@ -1102,7 +1199,8 @@ static void d2d_device_context_fill_geom
              d2d_device_context_draw(render_target, D2D_SHAPE_TYPE_CURVE, NULL, geometry->fill.arc_vertex_count, vb,
                      sizeof(*geometry->fill.arc_vertices), brush, opacity_brush);
  
@@ -402,11 +434,10 @@ diff -uNarp a/dlls/d2d1/device.c b/dlls/d2d1/device.c
      }
  }
  
-
 diff -uNarp a/dlls/d2d1/d2d1_private.h b/dlls/d2d1/d2d1_private.h
---- a/dlls/d2d1/d2d1_private.h	2026-09-18 15:55:04.000000000 -0300
-+++ b/dlls/d2d1/d2d1_private.h	2026-10-08 00:00:00.000000000 -0300
-@@ -170,6 +170,15 @@
+--- a/dlls/d2d1/d2d1_private.h	2026-10-09 10:30:56.156981058 -0300
++++ b/dlls/d2d1/d2d1_private.h	2026-10-09 10:30:56.157305450 -0300
+@@ -170,6 +170,16 @@ struct d2d_indexed_objects
      size_t count;
  };
  
@@ -416,13 +447,14 @@ diff -uNarp a/dlls/d2d1/d2d1_private.h b/dlls/d2d1/d2d1_private.h
 +struct d2d_buffer_cache_entry
 +{
 +    ID3D11Buffer *buffer;
++    /* The buffer's ByteWidth, i.e. how much data it can accept. */
 +    size_t size;
 +};
 +
  struct d2d_device_context
  {
      ID2D1DeviceContext6 ID2D1DeviceContext6_iface;
-@@ -204,6 +213,8 @@
+@@ -204,6 +214,8 @@ struct d2d_device_context
      ID3D11Buffer *ib;
      unsigned int vb_stride;
      ID3D11Buffer *vb;

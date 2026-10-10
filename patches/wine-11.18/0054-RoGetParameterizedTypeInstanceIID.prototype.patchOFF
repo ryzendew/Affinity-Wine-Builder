@@ -1,0 +1,334 @@
+--- a/dlls/combase/roapi.c
++++ b/dlls/combase/roapi.c
+@@ -17,6 +17,7 @@
+  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+  */
+ #define COBJMACROS
++#include <stdio.h>
+ #include "objbase.h"
+ #include "ctxtcall.h"
+ #include "comsvcs.h"
+@@ -26,6 +27,7 @@
+ #include "roerrorapi.h"
+ #include "winstring.h"
+ #include "errhandlingapi.h"
++#include "wincrypt.h"
+ 
+ #include "combase_private.h"
+ 
+@@ -210,14 +212,311 @@
+ /***********************************************************************
+  *      RoGetParameterizedTypeInstanceIID (combase.@)
+  */
++/***********************************************************************
++ *      RoGetParameterizedTypeInstanceIID (combase.@)
++ *
++ * Computes the IID of a parameterized (generic) WinRT type instantiation.
++ * The IID is a version-5 UUID over the type's interface signature, e.g.
++ * "pinterface({9fc2b0bb-e446-44e2-aa61-9cab8f636af2};rc(Windows.Storage.StorageFile;{...}))".
++ * Only types with statically known signatures are supported; anything else
++ * keeps the historical E_NOTIMPL behavior.
++ */
++static const WCHAR * const pinterface_piids[][2] =
++{
++    { L"Windows.Foundation.AsyncActionProgressHandler`1", L"{6d844858-0cff-4590-ae89-95a5a5c8b4b8}" },
++    { L"Windows.Foundation.AsyncActionWithProgressCompletedHandler`1", L"{9c029f91-cc84-44fd-ac26-0a6c4e555281}" },
++    { L"Windows.Foundation.AsyncOperationCompletedHandler`1", L"{fcdcf02c-e5d8-4478-915a-4d90b74b83a5}" },
++    { L"Windows.Foundation.AsyncOperationProgressHandler`2", L"{55690902-0aab-421a-8778-f8ce5026d758}" },
++    { L"Windows.Foundation.AsyncOperationWithProgressCompletedHandler`2", L"{e85df41d-6aa7-46e3-a8e2-f009d840c627}" },
++    { L"Windows.Foundation.EventHandler`1", L"{9de1c535-6ae1-11e0-84e1-18a905bcc53f}" },
++    { L"Windows.Foundation.IAsyncActionWithProgress`1", L"{1f6db258-e803-48a1-9546-eb7353398884}" },
++    { L"Windows.Foundation.IAsyncOperation`1", L"{9fc2b0bb-e446-44e2-aa61-9cab8f636af2}" },
++    { L"Windows.Foundation.IAsyncOperationWithProgress`2", L"{b5d036d7-e297-498f-ba60-0289e76e23dd}" },
++    { L"Windows.Foundation.IReference`1", L"{61c17706-2d65-11e0-9ae8-d48564015472}" },
++    { L"Windows.Foundation.TypedEventHandler`2", L"{9de1c534-6ae1-11e0-9ae8-d48564015472}" },
++    { L"Windows.Foundation.Collections.IIterable`1", L"{faa585ea-6214-4217-afda-7f46de5869b3}" },
++    { L"Windows.Foundation.Collections.IIterator`1", L"{6a79e863-4300-459a-9966-cbb660963ee1}" },
++    { L"Windows.Foundation.Collections.IKeyValuePair`2", L"{02b51929-c1c4-4a7e-8940-0312b5c18500}" },
++    { L"Windows.Foundation.Collections.IMap`2", L"{3c2925fe-8519-45c1-aa79-197b6718c1c1}" },
++    { L"Windows.Foundation.Collections.IMapView`2", L"{e480ce40-a338-4ada-adcf-272272e48cb9}" },
++    { L"Windows.Foundation.Collections.IVector`1", L"{913337e9-11a1-4345-a3a2-4e7f956e222d}" },
++    { L"Windows.Foundation.Collections.IVectorView`1", L"{bbe1fa4c-b0e3-4583-baef-1f1b2e483e56}" },
++    { NULL, NULL }
++};
++
++/* Runtime classes usable as generic arguments, with their default interface IID. */
++static const WCHAR * const pinstance_classes[][2] =
++{
++    { L"Windows.Storage.StorageFile", L"{fa3f6186-4214-428c-a64c-14c9ac7315ea}" },
++    { NULL, NULL }
++};
++
++/* Interfaces usable as generic arguments, by IID. */
++static const WCHAR * const pinstance_ifaces[][2] =
++{
++    { L"Windows.Storage.IStorageFile", L"{fa3f6186-4214-428c-a64c-14c9ac7315ea}" },
++    { NULL, NULL }
++};
++
++struct pii_sig
++{
++    WCHAR *buf;
++    size_t len;
++    size_t cap;
++    BOOL failed;
++};
++
++static void pii_append( struct pii_sig *sig, const WCHAR *str, size_t count )
++{
++    if (sig->failed) return;
++    if (sig->len + count + 1 > sig->cap)
++    {
++        sig->failed = TRUE;
++        return;
++    }
++    memcpy( sig->buf + sig->len, str, count * sizeof(WCHAR) );
++    sig->len += count;
++}
++
++static void pii_append_wstr( struct pii_sig *sig, const WCHAR *str )
++{
++    pii_append( sig, str, wcslen( str ) );
++}
++
++static const WCHAR *pii_find_piid( const WCHAR *name )
++{
++    UINT i;
++    for (i = 0; pinterface_piids[i][0]; i++)
++        if (!wcscmp( pinterface_piids[i][0], name )) return pinterface_piids[i][1];
++    return NULL;
++}
++
++/* Append the signature of one type argument; *index advances past any nested
++ * elements it consumes. Returns new index, or 0 on failure. */
++static UINT pii_append_arg( struct pii_sig *sig, const WCHAR **elements, UINT index, UINT count )
++{
++    static const WCHAR * const prim_names[] = { L"String", L"Boolean", L"Char16", L"Byte", L"Int16",
++        L"UInt16", L"Int32", L"UInt32", L"Int64", L"UInt64", L"Single", L"Double", L"Guid", NULL };
++    static const WCHAR * const prim_sigs[] = { L"string", L"b1", L"c2", L"u1", L"i2",
++        L"u2", L"i4", L"u4", L"i8", L"u8", L"r4", L"r8", L"g16", NULL };
++    const WCHAR *elem, *tick, *dot;
++    WCHAR *end;
++    ULONG arity;
++    UINT i, next;
++
++    if (index >= count) return 0;
++    elem = elements[index];
++    if (!elem) return 0;
++
++    tick = wcsrchr( elem, '`' );
++    if (tick)
++    {
++        /* Nested generic instantiation: recurse over its own arguments. */
++        const WCHAR *nested_piid;
++        arity = wcstoul( tick + 1, &end, 10 );
++        if (!arity || *end || arity > 8) return 0;
++        nested_piid = pii_find_piid( elem );
++        if (!nested_piid) return 0;
++        next = index + 1;
++        pii_append_wstr( sig, L"pinterface(" );
++        pii_append_wstr( sig, nested_piid );
++        for (i = 0; i < arity; i++)
++        {
++            pii_append_wstr( sig, L";" );
++            next = pii_append_arg( sig, elements, next, count );
++            if (!next) return 0;
++        }
++        pii_append_wstr( sig, L")" );
++        return next;
++    }
++
++    dot = wcsrchr( elem, '.' );
++    if (!dot)
++    {
++        if (!wcscmp( elem, L"IInspectable" ))
++        {
++            pii_append_wstr( sig, L"cinterface(IInspectable)" );
++            return index + 1;
++        }
++        for (i = 0; prim_names[i]; i++)
++        {
++            if (!wcscmp( prim_names[i], elem ))
++            {
++                pii_append_wstr( sig, prim_sigs[i] );
++                return index + 1;
++            }
++        }
++        return 0;
++    }
++
++    for (i = 0; pinstance_classes[i][0]; i++)
++    {
++        if (!wcscmp( pinstance_classes[i][0], elem ))
++        {
++            WCHAR rc[128];
++            swprintf( rc, ARRAY_SIZE(rc), L"rc(%ls;%ls)", elem, pinstance_classes[i][1] );
++            pii_append_wstr( sig, rc );
++            return index + 1;
++        }
++    }
++    for (i = 0; pinstance_ifaces[i][0]; i++)
++    {
++        if (!wcscmp( pinstance_ifaces[i][0], elem ))
++        {
++            pii_append_wstr( sig, pinstance_ifaces[i][1] );
++            return index + 1;
++        }
++    }
++    return 0;
++}
++
+ HRESULT WINAPI RoGetParameterizedTypeInstanceIID(UINT32 name_element_count, const WCHAR **name_elements,
+                                                  const IRoMetaDataLocator *meta_data_locator, GUID *iid,
+                                                  ROPARAMIIDHANDLE *hiid)
+ {
+-    FIXME("stub: %d %p %p %p %p\n", name_element_count, name_elements, meta_data_locator, iid, hiid);
+-    if (iid) *iid = GUID_NULL;
+-    if (hiid) *hiid = INVALID_HANDLE_VALUE;
+-    return E_NOTIMPL;
++    static const BYTE pinterface_namespace[16] = {0x11,0xf4,0x7a,0xd5,0x7b,0x73,0x42,0xc0,0xab,0xae,0x87,0x8b,0x1e,0x16,0xad,0xee};
++    struct pii_sig sig;
++    const WCHAR *piid, *elem0;
++    WCHAR *joined;
++    HCRYPTPROV prov = 0;
++    HCRYPTHASH hash = 0;
++    BYTE digest[20];
++    DWORD digest_len = sizeof(digest);
++    char *utf8 = NULL;
++    int utf8_len;
++    GUID result;
++    UINT i, next, arity;
++    WCHAR *end;
++    HRESULT hr = E_NOTIMPL;
++    FILE *dbglog;
++    UINT li;
++
++    FIXME("(%d %p %p %p %p): semi-stub\n", name_element_count, name_elements, meta_data_locator, iid, hiid);
++
++    dbglog = fopen( "/tmp/iid-calls.log", "a" );
++    if (dbglog)
++    {
++        fprintf( dbglog, "call count=%u", name_element_count );
++        for (li = 0; li < name_element_count && li < 16; li++)
++            fprintf( dbglog, " [%u]<%ls>", li, name_elements[li] ? name_elements[li] : L"(null)" );
++        fprintf( dbglog, "\n" );
++        fclose( dbglog );
++    }
++
++    FIXME("(%d %p %p %p %p): semi-stub\n", name_element_count, name_elements, meta_data_locator, iid, hiid);
++
++    if (!name_element_count || !name_elements || (!iid && !hiid)) return E_INVALIDARG;
++    for (i = 0; i < name_element_count; i++)
++        if (!name_elements[i]) return E_INVALIDARG;
++
++    /* The open generic is element 0 ("Namespace.Name`arity"); tolerate a split
++     * namespace ("Namespace", "Name`arity") as well. */
++    elem0 = name_elements[0];
++    if (!wcschr( elem0, '`' ))
++    {
++        size_t join_len;
++        if (name_element_count < 2 || !wcschr( name_elements[1], '`' )) goto done;
++        join_len = wcslen( elem0 ) + 1 + wcslen( name_elements[1] ) + 1;
++        joined = HeapAlloc( GetProcessHeap(), 0, join_len * sizeof(WCHAR) );
++        if (!joined)
++        {
++            hr = E_OUTOFMEMORY;
++            goto done;
++        }
++        swprintf( joined, join_len, L"%ls.%ls", elem0, name_elements[1] );
++        elem0 = joined;
++        next = 2;
++    }
++    else
++    {
++        joined = NULL;
++        next = 1;
++    }
++
++    piid = pii_find_piid( elem0 );
++    if (!piid) goto done_free;
++
++    arity = wcstoul( wcsrchr( elem0, '`' ) + 1, &end, 10 );
++    if (!arity || *end || arity > 8) goto done_free;
++
++    sig.cap = 4096;
++    sig.len = 0;
++    sig.failed = FALSE;
++    sig.buf = HeapAlloc( GetProcessHeap(), 0, sig.cap * sizeof(WCHAR) );
++    if (!sig.buf)
++    {
++        hr = E_OUTOFMEMORY;
++        goto done_free;
++    }
++    pii_append_wstr( &sig, L"pinterface(" );
++    pii_append_wstr( &sig, piid );
++    for (i = 0; i < arity; i++)
++    {
++        pii_append_wstr( &sig, L";" );
++        next = pii_append_arg( &sig, name_elements, next, name_element_count );
++        if (!next) break;
++    }
++    if (!next || next != name_element_count || sig.failed)
++    {
++        HeapFree( GetProcessHeap(), 0, sig.buf );
++        goto done_free;
++    }
++    pii_append_wstr( &sig, L")" );
++    sig.buf[sig.len] = 0;
++    TRACE("signature %s\n", debugstr_w(sig.buf));
++
++    utf8_len = WideCharToMultiByte( CP_UTF8, 0, sig.buf, sig.len, NULL, 0, NULL, NULL );
++    utf8 = HeapAlloc( GetProcessHeap(), 0, utf8_len );
++    if (!utf8)
++    {
++        HeapFree( GetProcessHeap(), 0, sig.buf );
++        hr = E_OUTOFMEMORY;
++        goto done_free;
++    }
++    WideCharToMultiByte( CP_UTF8, 0, sig.buf, sig.len, utf8, utf8_len, NULL, NULL );
++    HeapFree( GetProcessHeap(), 0, sig.buf );
++
++    if (!CryptAcquireContextW( &prov, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT ) ||
++        !CryptCreateHash( prov, CALG_SHA1, 0, 0, &hash ) ||
++        !CryptHashData( hash, pinterface_namespace, sizeof(pinterface_namespace), 0 ) ||
++        !CryptHashData( hash, (BYTE *)utf8, utf8_len, 0 ) ||
++        !CryptGetHashParam( hash, HP_HASHVAL, digest, &digest_len, 0 ) || digest_len < 16)
++    {
++        hr = HRESULT_FROM_WIN32( GetLastError() );
++        goto done_crypto;
++    }
++    result.Data1 = (digest[0] << 24) | (digest[1] << 16) | (digest[2] << 8) | digest[3];
++    result.Data2 = (digest[4] << 8) | digest[5];
++    result.Data3 = (((digest[6] << 8) | digest[7]) & 0x0fff) | 0x5000;
++    result.Data4[0] = (digest[8] & 0x3f) | 0x80;
++    memcpy( result.Data4 + 1, digest + 9, 7 );
++    if (iid) *iid = result;
++    if (hiid)
++    {
++        GUID *copy = CoTaskMemAlloc( sizeof(GUID) );
++        if (!copy)
++        {
++            hr = E_OUTOFMEMORY;
++            goto done_crypto;
++        }
++        *copy = result;
++        *hiid = (ROPARAMIIDHANDLE)copy;
++    }
++    hr = S_OK;
++
++done_crypto:
++    if (hash) CryptDestroyHash( hash );
++    if (prov) CryptReleaseContext( prov, 0 );
++    HeapFree( GetProcessHeap(), 0, utf8 );
++done_free:
++    HeapFree( GetProcessHeap(), 0, joined );
++done:
++    if (FAILED(hr))
++    {
++        if (iid) *iid = GUID_NULL;
++        if (hiid) *hiid = INVALID_HANDLE_VALUE;
++    }
++    return hr;
+ }
+ 
+ /***********************************************************************

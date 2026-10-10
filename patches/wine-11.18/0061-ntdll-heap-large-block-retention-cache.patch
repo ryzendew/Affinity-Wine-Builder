@@ -1,0 +1,474 @@
+ntdll: large heap block retention cache + churn probe
+
+Rebased from Nico-LaFoucate/neutron-wine patches/neutron-heap-large-cache.mypatch
+verbatim: it applied to wine-11.18 with zero rejects and zero offsets, so the diff is
+unchanged. Only this provenance header is added.
+
+Adopted for the CHURN PROBE, not the cache. perf, gdb attach and /proc/PID/syscall are
+all denied on this machine and strace is not installed, so this inert counter (WINEDEBUG=
++neutronheap) is the only available way to measure whether Affinity churns large heap
+blocks and at what size -- the number that decides whether a retention cache is worth
+having at all.
+
+The cache itself ships DISABLED and stays that way until the probe says it should not:
+neutron_large_cache_on() requires NEUTRON_HEAP_LARGE_CACHE=1, so an unconfigured prefix
+gets only the extra struct fields and two predictable-branch tests.
+
+Note for whoever ports neutron-srw-wake-fastpath: it touches dlls/ntdll/sync.c, which our
+0049 also modifies. This patch touches dlls/ntdll/heap.c only and does not collide.
+
+# neutron-heap-large-cache
+#
+# Retain freed LARGE heap blocks (>= HEAP_MIN_LARGE_BLOCK_SIZE, ~1 MB) instead of releasing them
+# to the kernel, so the next allocation of a compatible size writes into WARM pages.
+# Gate: NEUTRON_HEAP_LARGE_CACHE=1. Touches: dlls/ntdll/heap.c only.
+#
+# THE PROBLEM
+# Wine's heap_free_large() calls NtFreeVirtualMemory(MEM_RELEASE) unconditionally and retains
+# nothing, so an app that allocates a large scratch buffer per frame always writes into fresh,
+# unfaulted pages. On Linux the kernel faults and zeroes each 4 KB page on first touch.
+#
+# Measured in Premiere's timeline zoom (30 s, GPU-accelerated UI mode, runtime 11.10-15):
+# ~16,000 large allocations totalling 22 GB, average 1,435 KB, 98% the same size as a block freed
+# moments earlier -- about 5.6 million page faults. A CPU profile put 27.9% of the UI thread on a
+# single `rep movsb` inside ucrtbase!memmove with a further 15.1% in kernel frames beneath it.
+#
+# CROSS-CHECKED AGAINST NATIVE WINDOWS (two rounds on a Ryzen 9700X / Win 11 box):
+#   * Windows does NOT retain large freed blocks either -- HeapAlloc-per-iteration (11.99 GB/s)
+#     is identical to raw VirtualAlloc-per-iteration (12.03). So this is NOT a Wine bug.
+#   * But Windows' fresh-page path is ~3x cheaper (zero-page thread vs zeroing in the fault
+#     handler), so Wine is disadvantaged by how LINUX hands out pages. This patch compensates.
+#   * Premiere churns HARDER natively (285,686 page faults/sec while zooming vs 32 idle,
+#     Virtual Bytes sawtoothing 1.8 GB), so the allocation pattern is Adobe's design and there is
+#     no upstream bug to fix instead.
+#   * With this patch Linux reaches 12.9 GB/s vs Windows' 11.27 -- 1.14x, i.e. PARITY.
+#
+# SIZING. The process cap is 1% of physical RAM clamped to [64 MB, 512 MB] (512 MB on a 62 GB
+# box, 160 MB on 16 GB, 80 MB on 8 GB), overridable with NEUTRON_HEAP_LARGE_CACHE_MB. Derived,
+# not guessed: matching Windows needs a hit rate h where h*12.9 + (1-h)*4.5 = 11.27 -> 81%, and
+# for Lightroom's ~30 MB blocks that means holding ~16 of them. 32 slots because Premiere and
+# Photoshop are slot-limited rather than byte-limited, and 98% of Premiere's allocations matched
+# one of the last 32 freed sizes.
+#
+# ⚠️ MEASURE PAST L3. Every "warm" number here is from a >= 64 MB payload. At 14 MB the buffers
+# fit in L3 on both reference machines and the warm rows measure CACHE, which produced three
+# wrong conclusions before it was caught (a 6-8x penalty that is really 3.2x, a 3.4x "overshoot"
+# of Windows that is really parity, and "copy chunk size barely matters" when at DRAM scale
+# 256-byte chunks run at 0.28 GB/s).
+#
+# FOUR THINGS THIS GOT WRONG IN DEVELOPMENT -- do not reintroduce:
+#  1. NO EVICTION -> the cache died permanently once all slots filled with sizes the app stopped
+#     requesting. Round-robin evicts now, and releases the evicted region OUTSIDE the heap lock
+#     (NtFreeVirtualMemory is a syscall; holding the lock across it serialises other threads).
+#  2. GATED ON A DEBUG CHANNEL -> TRACE_ON() is FALSE when stderr is /dev/null, so the cache
+#     silently did not engage while appearing enabled. Never gate behaviour on debug output.
+#  3. HEAP_ZERO_MEMORY -> RtlAllocateHeap's large path never calls initialize_block(), so zeroing
+#     is satisfied only implicitly by fresh pages arriving zeroed. A recycled block is dirty. The
+#     reuse path memsets explicitly; harnesses/heapzero.c is the null control and was verified to
+#     FAIL (poison 0xaa at round 1) on a build with that memset removed.
+#  4. A PER-HEAP CAP IS NOT A PROCESS BOUND -- a process has several heaps. Both caps apply.
+#
+# Also included: an inert churn counter on the `neutronheap` debug channel (allocation/free rate,
+# average size, and the hit rate a cache WOULD achieve). It is TRACE-gated like any Wine debug
+# output and costs a predictable-branch test when off; it is what made the sizing measurable and
+# is kept so the next person can re-measure rather than guess.
+--- a/dlls/ntdll/heap.c
++++ b/dlls/ntdll/heap.c
+@@ -37,6 +37,169 @@
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(heap);
+ 
++/* NEUTRON diagnostic: large-block churn probe. Inert unless WINEDEBUG=+neutronheap.
++ *
++ * Wine sends every allocation >= HEAP_MIN_LARGE_BLOCK_SIZE (~1 MB on 64-bit) straight to
++ * NtAllocateVirtualMemory, and heap_free_large() hands it back with MEM_RELEASE. There is
++ * no retention, so a caller that allocates a big scratch buffer per frame receives FRESH,
++ * UNFAULTED pages every single time. Measured cost of that (harnesses/copybench.c): writing
++ * 14 MB into freshly committed pages runs at 3.4 GB/s versus 25.8 GB/s into a reused block --
++ * 7.5x, because every page takes a fault and a kernel zeroing.
++ *
++ * A CPU profile of Premiere's timeline zoom (2026-07-29) put 27.9% of the UI thread on a
++ * single `rep movsb` inside ucrtbase!memmove, with a further 15.1% in kernel frames directly
++ * beneath that copy -- exactly the signature of copying into cold pages. What the profile
++ * cannot show is the allocation SIZE, so this probe answers the two questions that decide
++ * whether a retention cache is worth building:
++ *   1. does the app actually churn large blocks, and at what rate/size;
++ *   2. would a cache have HIT -- i.e. how often is a large allocation the same size as one
++ *      recently freed (`would-reuse`).
++ * Counters are deliberately unsynchronised: they are read under the heap lock in the common
++ * path, an occasional lost increment does not change a rate, and a lock here would perturb
++ * the very thing being measured. */
++WINE_DECLARE_DEBUG_CHANNEL(neutronheap);
++
++#define NEUTRON_LARGE_RING 32
++
++static struct
++{
++    ULONGLONG alloc_n, alloc_bytes, free_n, free_bytes, would_reuse;
++    SIZE_T ring[NEUTRON_LARGE_RING];
++    unsigned int ring_pos;
++} neutron_large;
++
++static void neutron_large_alloc( SIZE_T size )
++{
++    unsigned int i;
++
++    if (!TRACE_ON(neutronheap)) return;
++
++    neutron_large.alloc_n++;
++    neutron_large.alloc_bytes += size;
++
++    /* Would a retention cache have served this from a recently freed block? */
++    for (i = 0; i < NEUTRON_LARGE_RING; i++)
++    {
++        if (neutron_large.ring[i] != size) continue;
++        neutron_large.would_reuse++;
++        neutron_large.ring[i] = 0;   /* consume it, so one free serves one alloc */
++        break;
++    }
++
++    if (!(neutron_large.alloc_n % 128))
++        TRACE_(neutronheap)( "neutron-heap-large: allocs=%I64u (%I64u MB, avg %I64u KB)  "
++                             "frees=%I64u (%I64u MB)  would-reuse=%I64u (%I64u%%)\n",
++                             neutron_large.alloc_n, neutron_large.alloc_bytes >> 20,
++                             neutron_large.alloc_bytes / neutron_large.alloc_n >> 10,
++                             neutron_large.free_n, neutron_large.free_bytes >> 20,
++                             neutron_large.would_reuse,
++                             neutron_large.would_reuse * 100 / neutron_large.alloc_n );
++}
++
++static void neutron_large_free( SIZE_T size )
++{
++    if (!TRACE_ON(neutronheap)) return;
++
++    neutron_large.free_n++;
++    neutron_large.free_bytes += size;
++    neutron_large.ring[neutron_large.ring_pos++ % NEUTRON_LARGE_RING] = size;
++}
++
++/* NEUTRON: LARGE-BLOCK RETENTION CACHE (the fix the probe above justifies)
++ *
++ * Measured in Premiere's timeline zoom, ~30 s, GPU-accelerated UI mode: ~13,000 large
++ * allocations totalling 18.6 GB, average 1,459 KB, and 98% of them the same size as a block
++ * freed moments earlier. Every one got fresh pages from the kernel, so the app's memcpy wrote
++ * into cold memory at 3.4 GB/s instead of 25.8 GB/s and the kernel paid ~5.6 million page
++ * faults -- 27.9% of the UI thread on one `rep movsb` plus 15.1% in faults beneath it.
++ *
++ * So: keep a few freed regions instead of releasing them, and hand them back on the next
++ * allocation of a compatible size.
++ *
++ * The 1.4 MB average sits just past HEAP_MIN_LARGE_BLOCK_SIZE (~1 MB), and that threshold
++ * cannot simply be raised: `struct block` encodes block_size in 16 bits times BLOCK_ALIGN, so
++ * ordinary heap blocks top out near 1 MB. A cache is the mechanism that fits.
++ *
++ * Bounded on purpose -- retained address space is the risk -- by BOTH a count and a byte cap,
++ * and a region much larger than the request is left alone rather than wasted on it.
++ *
++ * ⚠️ CORRECTNESS: RtlAllocateHeap's large path never calls initialize_block(), so
++ * HEAP_ZERO_MEMORY is today satisfied only IMPLICITLY, by fresh VirtualAlloc pages being zero.
++ * A recycled block is dirty, so the reuse path MUST zero it explicitly or callers that asked
++ * for zeroed memory silently receive stale data. See heap_allocate_large().
++ *
++ * Gated on WINEDEBUG=+nheapcache while this is an experiment -- a debug channel rather
++ * than an env var deliberately, because WINEDEBUG is parsed before the heap exists and reading
++ * the process environment this early is not safe. Make it unconditional only once proven. */
++WINE_DECLARE_DEBUG_CHANNEL(nheapcache);
++
++/* 32 slots: Premiere and Photoshop are SLOT-limited rather than byte-limited (their blocks
++ * average 1.4 MB and 6.9 MB), and 98% of Premiere's large allocations matched one of the last
++ * 32 freed sizes, so 32 is the number that measurement pointed at. Cost is 32 pointers + 32
++ * sizes per heap. */
++#define NEUTRON_LARGE_CACHE_COUNT 32
++#define NEUTRON_LARGE_CACHE_MAX   (96 * 1024 * 1024)   /* per heap */
++
++/* PROCESS-WIDE byte cap, SCALED TO THE MACHINE.
++ *
++ * Picking one constant was wrong: Lightroom's blocks average 30 MB, so a 192 MB cap retained
++ * only ~6 of them and capped its hit rate at 46%, while Premiere (1.4 MB blocks) never came
++ * close to the byte limit at all. And a number tuned on a 64 GB workstation would be reckless
++ * on an 8 GB laptop.
++ *
++ * Target: Windows parity. Windows retains nothing but its faults are ~3x cheaper, so matching
++ * it needs a hit rate of h where h*12.9 + (1-h)*4.5 = 11.27 GB/s -> h = 81%. For Lightroom that
++ * means holding ~16 blocks of ~30 MB, i.e. ~500 MB. Hence 1% of RAM clamped to [64 MB, 512 MB]:
++ * 512 MB on this 62 GB box, 160 MB on a 16 GB laptop, 80 MB on an 8 GB one.
++ * Override with NEUTRON_HEAP_LARGE_CACHE_MB for experiments. */
++static SIZE_T neutron_large_cache_total_max(void)
++{
++    static SIZE_T limit;
++
++    if (!limit)
++    {
++        SYSTEM_BASIC_INFORMATION sbi;
++        SIZE_T v = 192 * 1024 * 1024;   /* fallback if the query fails */
++        static const WCHAR mbW[] = {'N','E','U','T','R','O','N','_','H','E','A','P','_','L',
++                                    'A','R','G','E','_','C','A','C','H','E','_','M','B',0};
++        UNICODE_STRING name, value;
++        WCHAR buf[16];
++
++        if (!NtQuerySystemInformation( SystemBasicInformation, &sbi, sizeof(sbi), NULL ))
++        {
++            SIZE_T ram = (SIZE_T)sbi.MmNumberOfPhysicalPages * sbi.PageSize;
++            v = ram / 100;
++            if (v < 64 * 1024 * 1024)  v = 64 * 1024 * 1024;
++            if (v > 512 * 1024 * 1024) v = 512 * 1024 * 1024;
++        }
++
++        name.Buffer = (WCHAR *)mbW;
++        name.Length = sizeof(mbW) - sizeof(WCHAR);
++        name.MaximumLength = sizeof(mbW);
++        value.Buffer = buf; value.Length = 0; value.MaximumLength = sizeof(buf);
++        if (!RtlQueryEnvironmentVariable_U( NULL, &name, &value ) && value.Length)
++        {
++            SIZE_T mb = 0;
++            unsigned int i;
++            buf[value.Length / sizeof(WCHAR)] = 0;
++            for (i = 0; buf[i] >= '0' && buf[i] <= '9'; i++) mb = mb * 10 + (buf[i] - '0');
++            if (mb) v = mb * 1024 * 1024;
++        }
++        limit = v;
++        ERR( "neutron-heap-cache: process retention cap %u MB\n", (unsigned)(limit >> 20) );
++    }
++    return limit;
++}
++
++static ULONGLONG neutron_cache_hits, neutron_cache_keeps, neutron_cache_misses;
++
++/* PROCESS-WIDE retained-byte cap.
++ * The per-heap cap alone is NOT a bound on the process: a process has several heaps (process
++ * heap, CRT heaps, the app's own), so 16 slots x 96 MB EACH could retain far more address
++ * space than intended -- and Premiere runs five processes. Cap the total as well, so worst-case
++ * retention is a number we can state rather than a product of however many heaps exist. */
++static LONG64 neutron_cache_total;
++
+ /* HeapCompatibilityInformation values */
+ 
+ #define HEAP_STD 0
+@@ -300,6 +463,12 @@
+     RTL_CRITICAL_SECTION cs;
+     struct entry     free_lists[FREE_LIST_COUNT];
+     struct bin      *bins;
++    /* NEUTRON large-block retention cache. Must stay BEFORE subheap -- there is a C_ASSERT
++     * below requiring subheap to be the last member. */
++    ARENA_LARGE     *neutron_cache[NEUTRON_LARGE_CACHE_COUNT];
++    SIZE_T           neutron_cache_size[NEUTRON_LARGE_CACHE_COUNT];
++    SIZE_T           neutron_cache_bytes;
++    unsigned int     neutron_cache_next;   /* round-robin eviction cursor */
+     SUBHEAP          subheap;
+ };
+ 
+@@ -594,6 +763,156 @@
+     RtlLeaveCriticalSection( &heap->cs );
+ }
+ 
++/* Gate: NEUTRON_HEAP_LARGE_CACHE=1.
++ *
++ * ⚠️ This was FIRST gated on a debug channel (TRACE_ON) to avoid reading the process
++ * environment during early heap init. That gate turned out to be UNRELIABLE: measured with
++ * copybench, TRACE_ON evaluated false whenever stderr was /dev/null, so the cache silently
++ * did not engage while appearing enabled (2x2 matrix: cache-on/stderr-file 26.2 GB/s,
++ * cache-on/stderr-devnull 4.4, cache-off/either 4.2-4.5). A behaviour gate must never depend
++ * on where debug output happens to point.
++ *
++ * So read a real env var, lazily, and only once the PEB's ProcessParameters exist -- the
++ * heap is used long before the environment does, and a negative answer is NOT cached so an
++ * early call cannot latch the cache off for the life of the process. */
++static BOOL neutron_large_cache_on(void)
++{
++    static int enabled = -1;
++    static const WCHAR nameW[] = {'N','E','U','T','R','O','N','_','H','E','A','P','_',
++                                  'L','A','R','G','E','_','C','A','C','H','E',0};
++    UNICODE_STRING name, value;
++    WCHAR buf[8];
++    TEB *teb = NtCurrentTeb();
++
++    if (enabled >= 0) return enabled;
++    if (!teb || !teb->Peb || !teb->Peb->ProcessParameters) return FALSE;
++
++    name.Buffer = (WCHAR *)nameW;
++    name.Length = sizeof(nameW) - sizeof(WCHAR);
++    name.MaximumLength = sizeof(nameW);
++    value.Buffer = buf;
++    value.Length = 0;
++    value.MaximumLength = sizeof(buf);
++    enabled = (!RtlQueryEnvironmentVariable_U( NULL, &name, &value ) && value.Length && buf[0] == '1');
++    /* One-shot, at ERR level so it is visible whatever the channel settings: without this an
++     * absent cache and a DISABLED cache look identical in the log, and a whole capture run gets
++     * spent without knowing which happened. */
++    ERR( "neutron-heap-cache: gate NEUTRON_HEAP_LARGE_CACHE resolved to %d\n", enabled );
++    return enabled;
++}
++
++/* Take a cached region of at least *total_size; updates *total_size to the region's real size. */
++static ARENA_LARGE *neutron_large_cache_get( struct heap *heap, ULONG flags, SIZE_T *total_size )
++{
++    unsigned int i, best = ~0u;
++    ARENA_LARGE *arena = NULL;
++
++    if (!neutron_large_cache_on()) return NULL;
++
++    heap_lock( heap, flags );
++    for (i = 0; i < NEUTRON_LARGE_CACHE_COUNT; i++)
++    {
++        SIZE_T s = heap->neutron_cache_size[i];
++        if (!heap->neutron_cache[i] || s < *total_size) continue;
++        if (s > *total_size * 2) continue;   /* don't burn a much bigger region on a small request */
++        if (best == ~0u || s < heap->neutron_cache_size[best]) best = i;
++    }
++    if (best != ~0u)
++    {
++        arena = heap->neutron_cache[best];
++        *total_size = heap->neutron_cache_size[best];
++        heap->neutron_cache_bytes -= heap->neutron_cache_size[best];
++        InterlockedExchangeAdd64( &neutron_cache_total, -(LONG64)heap->neutron_cache_size[best] );
++        heap->neutron_cache[best] = NULL;
++        heap->neutron_cache_size[best] = 0;
++        neutron_cache_hits++;
++    }
++    else neutron_cache_misses++;
++    heap_unlock( heap, flags );
++
++    if (!((neutron_cache_hits + neutron_cache_misses) % 128))
++        TRACE_(nheapcache)( "neutron-heap-cache: hits=%I64u misses=%I64u keeps=%I64u -> %I64u%% served warm\n",
++                                  neutron_cache_hits, neutron_cache_misses, neutron_cache_keeps,
++                                  neutron_cache_hits * 100 / (neutron_cache_hits + neutron_cache_misses) );
++    return arena;
++}
++
++/* Retain a freed region instead of releasing it. TRUE => kept, caller must NOT free it. */
++static BOOL neutron_large_cache_put( struct heap *heap, ULONG flags, ARENA_LARGE *arena, SIZE_T region_size )
++{
++    unsigned int i, slot = ~0u;
++    ARENA_LARGE *evicted = NULL;
++    BOOL kept = FALSE;
++
++    if (!neutron_large_cache_on()) return FALSE;
++    if (region_size > NEUTRON_LARGE_CACHE_MAX) return FALSE;
++
++    heap_lock( heap, flags );
++
++    for (i = 0; i < NEUTRON_LARGE_CACHE_COUNT; i++)
++    {
++        if (heap->neutron_cache[i]) continue;
++        slot = i;
++        break;
++    }
++
++    /* No free slot: EVICT, round-robin. Without eviction the cache dies PERMANENTLY the first
++     * time every slot fills with a size the app stops asking for -- each later free finds no
++     * room, releases its region, and the hit rate collapses to zero in a way that depends on
++     * allocation order. Caught by copybench: row 5 went fast in one run and slow in the next,
++     * because rows 1-4 had filled all the slots with other sizes first. */
++    if (slot == ~0u)
++    {
++        slot = heap->neutron_cache_next % NEUTRON_LARGE_CACHE_COUNT;
++        heap->neutron_cache_next = slot + 1;
++        evicted = heap->neutron_cache[slot];
++        heap->neutron_cache_bytes -= heap->neutron_cache_size[slot];
++        InterlockedExchangeAdd64( &neutron_cache_total, -(LONG64)heap->neutron_cache_size[slot] );
++        heap->neutron_cache[slot] = NULL;
++        heap->neutron_cache_size[slot] = 0;
++    }
++
++    if (heap->neutron_cache_bytes + region_size <= NEUTRON_LARGE_CACHE_MAX
++        && (SIZE_T)(ReadNoFence64( &neutron_cache_total ) + (LONG64)region_size) <= neutron_large_cache_total_max())
++    {
++        InterlockedExchangeAdd64( &neutron_cache_total, (LONG64)region_size );
++        heap->neutron_cache[slot] = arena;
++        heap->neutron_cache_size[slot] = region_size;
++        heap->neutron_cache_bytes += region_size;
++        neutron_cache_keeps++;
++        kept = TRUE;
++    }
++    heap_unlock( heap, flags );
++
++    /* Release the evicted region OUTSIDE the lock: NtFreeVirtualMemory is a syscall, and
++     * holding the heap lock across it would serialise every other thread's allocations. */
++    if (evicted)
++    {
++        void *addr = evicted;
++        SIZE_T size = 0;
++        NtFreeVirtualMemory( NtCurrentProcess(), &addr, &size, MEM_RELEASE );
++    }
++    return kept;
++}
++
++/* Release everything retained; without this a destroyed heap leaks its cached regions. */
++static void neutron_large_cache_flush( struct heap *heap )
++{
++    unsigned int i;
++
++    for (i = 0; i < NEUTRON_LARGE_CACHE_COUNT; i++)
++    {
++        void *addr = heap->neutron_cache[i];
++        SIZE_T size = 0;
++        if (!addr) continue;
++        InterlockedExchangeAdd64( &neutron_cache_total, -(LONG64)heap->neutron_cache_size[i] );
++        heap->neutron_cache[i] = NULL;
++        heap->neutron_cache_size[i] = 0;
++        NtFreeVirtualMemory( NtCurrentProcess(), &addr, &size, MEM_RELEASE );
++    }
++    heap->neutron_cache_bytes = 0;
++}
++
+ static void heap_set_status( const struct heap *heap, ULONG flags, NTSTATUS status )
+ {
+     if (status == STATUS_NO_MEMORY && (flags & HEAP_GENERATE_EXCEPTIONS)) RtlRaiseStatus( status );
+@@ -1007,9 +1326,19 @@
+     ARENA_LARGE *arena;
+     SIZE_T total_size = ROUND_SIZE( sizeof(*arena) + size, REGION_ALIGN - 1 );
+     struct block *block;
++    BOOL reused = FALSE;
+ 
+     if (total_size < size) return STATUS_NO_MEMORY;  /* overflow */
+-    if (!(arena = allocate_region( heap, flags, &total_size, &total_size ))) return STATUS_NO_MEMORY;
++    if ((arena = neutron_large_cache_get( heap, flags, &total_size )))
++    {
++        /* Recycled region: its pages are already faulted in (that is the whole point) but they
++         * are DIRTY. RtlAllocateHeap's large path never calls initialize_block(), so a fresh
++         * region satisfies HEAP_ZERO_MEMORY only because the kernel hands back zeroed pages.
++         * A reused one does not, so zero the user area here or callers asking for zeroed
++         * memory get stale data. memset over warm pages still beats fault-plus-kernel-zero. */
++        reused = TRUE;
++    }
++    else if (!(arena = allocate_region( heap, flags, &total_size, &total_size ))) return STATUS_NO_MEMORY;
+ 
+     block = &arena->block;
+     arena->data_size = size;
+@@ -1027,6 +1356,10 @@
+     valgrind_make_noaccess( (char *)block + sizeof(*block) + arena->data_size,
+                             arena->block_size - sizeof(*block) - arena->data_size );
+ 
++    neutron_large_alloc( total_size );
++
++    if (reused && (flags & HEAP_ZERO_MEMORY)) memset( block + 1, 0, size );
++
+     *ret = block + 1;
+     return STATUS_SUCCESS;
+ }
+@@ -1042,6 +1375,16 @@
+     list_remove( &arena->entry );
+     heap_unlock( heap, flags );
+ 
++    {
++        SIZE_T region_size = arena->block_size + (SIZE_T)((char *)block - (char *)arena);
++
++        neutron_large_free( region_size );
++
++        /* Retain it instead of giving the pages back, so the next same-sized allocation
++         * writes into warm memory. Measured 98% size-match rate in Premiere's zoom path. */
++        if (neutron_large_cache_put( heap, flags, arena, region_size )) return STATUS_SUCCESS;
++    }
++
+     return NtFreeVirtualMemory( NtCurrentProcess(), &address, &size, MEM_RELEASE );
+ }
+ 
+@@ -1633,6 +1976,8 @@
+     }
+     if (!heap) return handle;
+ 
++    neutron_large_cache_flush( heap );   /* retained regions would otherwise leak */
++
+     if ((pending = heap->pending_free))
+     {
+         heap->pending_free = NULL;

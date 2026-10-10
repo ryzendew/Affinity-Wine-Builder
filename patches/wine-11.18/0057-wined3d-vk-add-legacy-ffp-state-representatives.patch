@@ -1,0 +1,28 @@
+--- a/dlls/wined3d/shader_spirv.c
++++ b/dlls/wined3d/shader_spirv.c
+@@ -1344,6 +1344,25 @@
+ static const struct wined3d_state_entry_template spirv_fragment_pipe_vk_fp_states[] =
+ {
+     {STATE_RENDER(WINED3D_RS_FOGVERTEXMODE),     {STATE_RENDER(WINED3D_RS_FOGVERTEXMODE),     state_nop}},
++    /* Vulkan has no fixed-function lighting, fog or material pipeline, so the
++       remaining legacy FFP render states are accepted and ignored, matching the
++       GL driver where they are all handled together by the fog state. Without
++       an entry here validate_state_table() reports "should have a
++       representative" for each of them, and device_invalidate_state() has no
++       representative to dirty, so it falls back to setting a spurious bit. */
++    {STATE_RENDER(WINED3D_RS_FOGENABLE),         {STATE_RENDER(WINED3D_RS_FOGENABLE),         state_nop}},
++    {STATE_RENDER(WINED3D_RS_RANGEFOGENABLE),    {STATE_RENDER(WINED3D_RS_RANGEFOGENABLE),    state_nop}},
++    {STATE_RENDER(WINED3D_RS_LIGHTING),          {STATE_RENDER(WINED3D_RS_LIGHTING),          state_nop}},
++    {STATE_RENDER(WINED3D_RS_SPECULARENABLE),    {STATE_RENDER(WINED3D_RS_SPECULARENABLE),    state_nop}},
++    {STATE_RENDER(WINED3D_RS_LOCALVIEWER),       {STATE_RENDER(WINED3D_RS_LOCALVIEWER),       state_nop}},
++    {STATE_RENDER(WINED3D_RS_NORMALIZENORMALS),  {STATE_RENDER(WINED3D_RS_NORMALIZENORMALS),  state_nop}},
++    {STATE_RENDER(WINED3D_RS_COLORVERTEX),       {STATE_RENDER(WINED3D_RS_COLORVERTEX),       state_nop}},
++    {STATE_RENDER(WINED3D_RS_AMBIENTMATERIALSOURCE),  {STATE_RENDER(WINED3D_RS_AMBIENTMATERIALSOURCE),  state_nop}},
++    {STATE_RENDER(WINED3D_RS_DIFFUSEMATERIALSOURCE),  {STATE_RENDER(WINED3D_RS_DIFFUSEMATERIALSOURCE),  state_nop}},
++    {STATE_RENDER(WINED3D_RS_SPECULARMATERIALSOURCE), {STATE_RENDER(WINED3D_RS_SPECULARMATERIALSOURCE), state_nop}},
++    {STATE_RENDER(WINED3D_RS_EMISSIVEMATERIALSOURCE), {STATE_RENDER(WINED3D_RS_EMISSIVEMATERIALSOURCE), state_nop}},
++    {STATE_RENDER(WINED3D_RS_VERTEXBLEND),       {STATE_RENDER(WINED3D_RS_VERTEXBLEND),       state_nop}},
++    {STATE_RENDER(WINED3D_RS_COLORKEYENABLE),    {STATE_RENDER(WINED3D_RS_COLORKEYENABLE),    state_nop}},
+     {0}, /* Terminate */
+ };
+ 

@@ -1,0 +1,314 @@
+diff -urN a/dlls/opencl/opencl_private.h b/dlls/opencl/opencl_private.h
+--- a/dlls/opencl/opencl_private.h
++++ b/dlls/opencl/opencl_private.h
+@@ -32,6 +32,27 @@
+ 
+ BOOL extension_is_supported( const char *name, size_t len );
+ 
++/* Cache of immutable OpenCL info values (device/platform/memory-object
++ * parameters that cannot change over the lifetime of the object). Used to
++ * avoid repeating PE->unix round trips for values the application hammers. */
++
++enum opencl_info_cache_kind
++{
++    OPENCL_CACHE_DEVICE   = 0,
++    OPENCL_CACHE_PLATFORM = 1,
++    OPENCL_CACHE_MEMOBJ   = 2,
++};
++
++#define OPENCL_CACHE_MISS        0
++#define OPENCL_CACHE_HIT         1
++#define OPENCL_CACHE_TOO_SMALL  -1
++
++int info_cache_find( void *object, unsigned int name, int kind,
++                     void *out, size_t out_size, size_t *out_stored );
++void info_cache_store( void *object, unsigned int name, int kind,
++                       const void *data, size_t size );
++void info_cache_invalidate( void *object );
++
+ #define OPENCL_CALL( func, params ) WINE_UNIX_CALL( unix_ ## func, params )
+ 
+ #endif
+diff -urN a/dlls/opencl/pe_thunks.c b/dlls/opencl/pe_thunks.c
+--- a/dlls/opencl/pe_thunks.c
++++ b/dlls/opencl/pe_thunks.c
+@@ -96,6 +96,9 @@
+     struct clCreateBuffer_params params = { &__retval, context, flags, size, host_ptr, errcode_ret };
+     TRACE( "(%p, %s, %Iu, %p, %p)\n", context, wine_dbgstr_longlong(flags), size, host_ptr, errcode_ret );
+     OPENCL_CALL( clCreateBuffer, &params );
++    /* The driver may recycle a released handle's address, so drop any values
++       cached for it by a previous object. */
++    info_cache_invalidate( __retval );
+     return __retval;
+ }
+ 
+@@ -132,6 +135,9 @@
+     struct clCreateImage_params params = { &__retval, context, flags, image_format, image_desc, host_ptr, errcode_ret };
+     TRACE( "(%p, %s, %p, %p, %p, %p)\n", context, wine_dbgstr_longlong(flags), image_format, image_desc, host_ptr, errcode_ret );
+     OPENCL_CALL( clCreateImage, &params );
++    /* The driver may recycle a released handle's address, so drop any
++       values cached for it by a previous object. */
++    info_cache_invalidate( __retval );
+     return __retval;
+ }
+ 
+@@ -141,6 +147,9 @@
+     struct clCreateImage2D_params params = { &__retval, context, flags, image_format, image_width, image_height, image_row_pitch, host_ptr, errcode_ret };
+     TRACE( "(%p, %s, %p, %Iu, %Iu, %Iu, %p, %p)\n", context, wine_dbgstr_longlong(flags), image_format, image_width, image_height, image_row_pitch, host_ptr, errcode_ret );
+     OPENCL_CALL( clCreateImage2D, &params );
++    /* The driver may recycle a released handle's address, so drop any
++       values cached for it by a previous object. */
++    info_cache_invalidate( __retval );
+     return __retval;
+ }
+ 
+@@ -150,6 +159,9 @@
+     struct clCreateImage3D_params params = { &__retval, context, flags, image_format, image_width, image_height, image_depth, image_row_pitch, image_slice_pitch, host_ptr, errcode_ret };
+     TRACE( "(%p, %s, %p, %Iu, %Iu, %Iu, %Iu, %Iu, %p, %p)\n", context, wine_dbgstr_longlong(flags), image_format, image_width, image_height, image_depth, image_row_pitch, image_slice_pitch, host_ptr, errcode_ret );
+     OPENCL_CALL( clCreateImage3D, &params );
++    /* The driver may recycle a released handle's address, so drop any
++       values cached for it by a previous object. */
++    info_cache_invalidate( __retval );
+     return __retval;
+ }
+ 
+@@ -211,6 +223,9 @@
+     struct clCreateSubBuffer_params params = { &__retval, buffer, flags, buffer_create_type, buffer_create_info, errcode_ret };
+     TRACE( "(%p, %s, %u, %p, %p)\n", buffer, wine_dbgstr_longlong(flags), buffer_create_type, buffer_create_info, errcode_ret );
+     OPENCL_CALL( clCreateSubBuffer, &params );
++    /* The driver may recycle a released handle's address, so drop any
++       values cached for it by a previous object. */
++    info_cache_invalidate( __retval );
+     return __retval;
+ }
+ 
+@@ -521,8 +536,43 @@
+ cl_int WINAPI clGetMemObjectInfo( cl_mem memobj, cl_mem_info param_name, size_t param_value_size, void* param_value, size_t* param_value_size_ret )
+ {
+     struct clGetMemObjectInfo_params params = { memobj, param_name, param_value_size, param_value, param_value_size_ret };
++    size_t cached_size;
++    int hit;
++
+     TRACE( "(%p, %u, %Iu, %p, %p)\n", memobj, param_name, param_value_size, param_value, param_value_size_ret );
+-    return OPENCL_CALL( clGetMemObjectInfo, &params );
++
++    /* CL_MEM_SIZE and CL_MEM_FLAGS are fixed for the lifetime of the object, but
++       Affinity polls them in tight loops: 13.6k calls, 36% of all OpenCL traffic
++       in one traced session, with up to 1.5k calls on a single handle in a
++       single second. Serve them from the cache. */
++    if (param_name == CL_MEM_SIZE || param_name == CL_MEM_FLAGS)
++    {
++        if ((hit = info_cache_find( memobj, param_name, OPENCL_CACHE_MEMOBJ,
++                param_value, param_value_size, &cached_size )) == OPENCL_CACHE_HIT)
++        {
++            TRACE( "returning cached mem info %#x\n", param_name );
++            if (param_value_size_ret) *param_value_size_ret = cached_size;
++            return CL_SUCCESS;
++        }
++        if (hit == OPENCL_CACHE_TOO_SMALL)
++            return CL_INVALID_VALUE;
++    }
++
++    {
++        size_t unix_size = 0;
++        cl_int ret;
++
++        /* Affinity passes NULL for the size out-parameter on the large majority
++           of calls, so capture it ourselves in order to cache the value. */
++        params.param_value_size_ret = param_value_size_ret ? param_value_size_ret : &unix_size;
++        ret = OPENCL_CALL( clGetMemObjectInfo, &params );
++
++        if (ret == CL_SUCCESS && param_value
++                && (param_name == CL_MEM_SIZE || param_name == CL_MEM_FLAGS))
++            info_cache_store( memobj, param_name, OPENCL_CACHE_MEMOBJ,
++                    param_value, param_value_size_ret ? *param_value_size_ret : unix_size );
++        return ret;
++    }
+ }
+ 
+ cl_int WINAPI clGetPlatformIDs( cl_uint num_entries, cl_platform_id* platforms, cl_uint* num_platforms )
+@@ -613,6 +663,7 @@
+ {
+     struct clReleaseMemObject_params params = { memobj };
+     TRACE( "(%p)\n", memobj );
++    info_cache_invalidate( memobj );
+     return OPENCL_CALL( clReleaseMemObject, &params );
+ }
+ 
+diff -urN a/dlls/opencl/pe_wrappers.c b/dlls/opencl/pe_wrappers.c
+--- a/dlls/opencl/pe_wrappers.c
++++ b/dlls/opencl/pe_wrappers.c
+@@ -42,10 +42,6 @@
+     size_t filtered_len;
+ } ext_cache;
+ 
+-static int info_cache_find( void *object, cl_uint name, int is_platform,
+-                            void *out, size_t out_size, size_t *out_stored );
+-static void info_cache_store( void *object, cl_uint name, int is_platform, const void *data, size_t size );
+-
+ static cl_int filter_extensions( const char *unix_exts, SIZE_T size, char *win_exts, size_t *ret_size )
+ {
+     char *p = win_exts;
+@@ -169,7 +165,7 @@
+         size_t filtered_size = 0;
+         struct clGetPlatformInfo_params params = { platform, name, 0, NULL, &unix_size };
+ 
+-        if (info_cache_find( platform, name, TRUE, value, size, &cached_size ) == INFO_CACHE_HIT)
++        if (info_cache_find( platform, name, OPENCL_CACHE_PLATFORM, value, size, &cached_size ) == OPENCL_CACHE_HIT)
+         {
+             TRACE( "returning cached platform extensions\n" );
+             if (ret_size) *ret_size = cached_size;
+@@ -198,7 +194,7 @@
+ 
+         if (ret == CL_SUCCESS && value)
+         {
+-            info_cache_store( platform, name, TRUE, value, ret_size ? *ret_size : filtered_size );
++            info_cache_store( platform, name, OPENCL_CACHE_PLATFORM, value, ret_size ? *ret_size : filtered_size );
+         }
+ 
+         return ret;
+@@ -228,7 +224,7 @@
+         size_t filtered_size = 0;
+         struct clGetDeviceInfo_params params = { device, name, 0, NULL, &unix_size };
+ 
+-        if (info_cache_find( device, name, FALSE, value, size, &cached_size ) == INFO_CACHE_HIT)
++        if (info_cache_find( device, name, OPENCL_CACHE_DEVICE, value, size, &cached_size ) == OPENCL_CACHE_HIT)
+         {
+             TRACE( "returning cached device extensions\n" );
+             if (ret_size) *ret_size = cached_size;
+@@ -257,7 +253,7 @@
+ 
+         if (ret == CL_SUCCESS && value)
+         {
+-            info_cache_store( device, name, FALSE, value, ret_size ? *ret_size : filtered_size );
++            info_cache_store( device, name, OPENCL_CACHE_DEVICE, value, ret_size ? *ret_size : filtered_size );
+         }
+ 
+         return ret;
+@@ -265,15 +261,15 @@
+ 
+     {
+         size_t cached_size;
+-        int hit = info_cache_find( device, name, FALSE, value, size, &cached_size );
++        int hit = info_cache_find( device, name, OPENCL_CACHE_DEVICE, value, size, &cached_size );
+ 
+-        if (hit == INFO_CACHE_HIT)
++        if (hit == OPENCL_CACHE_HIT)
+         {
+             TRACE( "returning cached device info %#x\n", name );
+             if (ret_size) *ret_size = cached_size;
+             return CL_SUCCESS;
+         }
+-        if (hit == INFO_CACHE_TOO_SMALL)
++        if (hit == OPENCL_CACHE_TOO_SMALL)
+             return CL_INVALID_VALUE;
+     }
+ 
+@@ -294,7 +290,7 @@
+            unix side reported instead of requiring the caller to supply one;
+            previously this store was skipped entirely for such callers. */
+         if (ret == CL_SUCCESS && value)
+-            info_cache_store( device, name, FALSE, value, ret_size ? *ret_size : unix_size );
++            info_cache_store( device, name, OPENCL_CACHE_DEVICE, value, ret_size ? *ret_size : unix_size );
+     }
+ 
+     return ret;
+@@ -442,35 +438,28 @@
+    the cache thrash on hot keys. */
+ #define INFO_CACHE_MAX_ENTRIES 2048
+ 
+-/* Return codes for info_cache_find(), distinguishing "not cached" from
+-   "cached, but the caller's buffer is too small", which must surface as
+-   CL_INVALID_VALUE rather than silently falling through to the unix call. */
+-#define INFO_CACHE_MISS        0
+-#define INFO_CACHE_HIT         1
+-#define INFO_CACHE_TOO_SMALL  -1
+-
+-static int info_cache_find( void *object, cl_uint name, int is_platform,
+-                            void *out, size_t out_size, size_t *out_stored )
++int info_cache_find( void *object, unsigned int name, int kind,
++                     void *out, size_t out_size, size_t *out_stored )
+ {
+     struct info_cache_entry *entry;
+-    int ret = INFO_CACHE_MISS;
++    int ret = OPENCL_CACHE_MISS;
+ 
+     /* Copy under the lock: returning a pointer into the entry would let a
+        concurrent info_cache_store() eviction free it before the caller reads. */
+     AcquireSRWLockShared( &opencl_cache_lock );
+     for (entry = info_cache_head; entry; entry = entry->next)
+     {
+-        if (entry->object != object || entry->name != name || entry->is_platform != is_platform)
++        if (entry->object != object || entry->name != name || entry->is_platform != kind)
+             continue;
+         *out_stored = entry->size;
+         if (!out)
+-            ret = INFO_CACHE_HIT;
++            ret = OPENCL_CACHE_HIT;
+         else if (out_size < entry->size)
+-            ret = INFO_CACHE_TOO_SMALL;
++            ret = OPENCL_CACHE_TOO_SMALL;
+         else
+         {
+             memcpy( out, entry->data, entry->size );
+-            ret = INFO_CACHE_HIT;
++            ret = OPENCL_CACHE_HIT;
+         }
+         break;
+     }
+@@ -479,7 +468,8 @@
+     return ret;
+ }
+ 
+-static void info_cache_store( void *object, cl_uint name, int is_platform, const void *data, size_t size )
++void info_cache_store( void *object, unsigned int name, int kind,
++                       const void *data, size_t size )
+ {
+     struct info_cache_entry **pp, *entry;
+ 
+@@ -490,7 +480,7 @@
+        in use, which caps the hit rate once the cache is actually populated. */
+     for (pp = &info_cache_head; *pp; pp = &(*pp)->next)
+     {
+-        if ((*pp)->object != object || (*pp)->name != name || (*pp)->is_platform != is_platform)
++        if ((*pp)->object != object || (*pp)->name != name || (*pp)->is_platform != kind)
+             continue;
+         entry = *pp;
+         if (entry->size == size)
+@@ -522,7 +512,7 @@
+     }
+     entry->object = object;
+     entry->name = name;
+-    entry->is_platform = is_platform;
++    entry->is_platform = kind;
+     entry->size = size;
+     memcpy( entry->data, data, size );
+     entry->next = info_cache_head;
+@@ -532,3 +522,27 @@
+     ReleaseSRWLockExclusive( &opencl_cache_lock );
+ }
+ 
++/* Drop every cached value for an object. Must be called before a handle can be
++   recycled by the driver, otherwise a new object allocated at the same address
++   would inherit the previous object's CL_MEM_SIZE / CL_MEM_FLAGS. */
++void info_cache_invalidate( void *object )
++{
++    struct info_cache_entry **pp = &info_cache_head, *entry;
++
++    if (!object) return;
++
++    AcquireSRWLockExclusive( &opencl_cache_lock );
++    while ((entry = *pp))
++    {
++        if (entry->object != object)
++        {
++            pp = &entry->next;
++            continue;
++        }
++        *pp = entry->next;
++        HeapFree( GetProcessHeap(), 0, entry );
++        info_cache_count--;
++    }
++    ReleaseSRWLockExclusive( &opencl_cache_lock );
++}
++
