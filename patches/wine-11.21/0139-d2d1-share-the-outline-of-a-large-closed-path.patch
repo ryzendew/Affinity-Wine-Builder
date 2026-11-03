@@ -1,0 +1,258 @@
+From 61e5a1269b445243fb27d46fca464094897e746c Mon Sep 17 00:00:00 2001
+From: jfacemyer <1776340+jfacemyer@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 01:46:48 -0500
+Subject: [PATCH 7/8] d2d1: Share the outline of a large closed path between
+ geometries of the same figures.
+
+Affinity draws the selection outline of a large path with a new path
+geometry of the same figures for every redraw, 6-10 times per select or
+nudge, and each built the same outline again: 19 ms for a path of 138,000
+curves (1.8 million outline vertices). Closed paths of 16,384 vertices or
+more now look their figures up in a cache of outlines (256 MiB, least
+recently used out first) and share the outline found there, 2 ms with the
+lookup. Entries are reference counted: a path keeps its outline when the
+cache drops it.
+---
+ dlls/d2d1/d2d1_private.h |   6 +-
+ dlls/d2d1/geometry.c     | 180 ++++++++++++++++++++++++++++++++++++++-
+ 2 files changed, 184 insertions(+), 2 deletions(-)
+
+diff --git a/dlls/d2d1/d2d1_private.h b/dlls/d2d1/d2d1_private.h
+index f5fa415..40ca535 100644
+--- a/dlls/d2d1/d2d1_private.h
++++ b/dlls/d2d1/d2d1_private.h
+@@ -610,7 +610,7 @@ struct d2d_geometry
+         size_t arc_vertex_count;
+     } fill;
+ 
+-    struct
++    struct d2d_geometry_outline
+     {
+         struct d2d_outline_vertex *vertices;
+         size_t vertices_size;
+@@ -638,6 +638,8 @@ struct d2d_geometry
+     } outline;
+     LONG outline_pending;
+     LONG fill_pending;
++    /* The shared outline this path's outline arrays belong to, if any. */
++    struct d2d_outline_cache_entry *outline_entry;
+ 
+     union
+     {
+@@ -697,6 +699,8 @@ HRESULT d2d_rectangle_geometry_init(struct d2d_geometry *geometry,
+         ID2D1Factory *factory, const D2D1_RECT_F *rect);
+ HRESULT d2d_rounded_rectangle_geometry_init(struct d2d_geometry *geometry,
+         ID2D1Factory *factory, const D2D1_ROUNDED_RECT *rounded_rect);
++void d2d_outline_cache_entry_addref(struct d2d_outline_cache_entry *entry);
++void d2d_outline_cache_entry_release(struct d2d_outline_cache_entry *entry);
+ void d2d_geometry_ensure_fill(const struct d2d_geometry *geometry);
+ const struct d2d_geometry *d2d_geometry_get_outline(const struct d2d_geometry *geometry);
+ void d2d_line_outline(struct d2d_outline_vertex *v, struct d2d_face *f,
+diff --git a/dlls/d2d1/geometry.c b/dlls/d2d1/geometry.c
+index 6045190..2b1b733 100644
+--- a/dlls/d2d1/geometry.c
++++ b/dlls/d2d1/geometry.c
+@@ -5530,6 +5530,179 @@ static void d2d_figure_count_outline(const struct d2d_figure *figure, BOOL close
+     }
+ }
+ 
++/* The outlines of large closed paths, shared between path geometries of the
++ * same figures. Affinity draws the selection outline of a large path with a
++ * new path geometry of the same figures for every redraw, 6-10 per select
++ * or nudge. */
++struct d2d_outline_cache_entry
++{
++    struct list entry;
++    LONG refcount;
++    UINT64 hash;
++    unsigned char *key;
++    size_t key_size;
++    size_t size;
++    struct d2d_geometry_outline outline;
++};
++
++static unsigned char *d2d_close_cache_put(unsigned char *p, const void *data, size_t size);
++
++#define D2D_OUTLINE_CACHE_MIN_VERTICES 16384
++#define D2D_OUTLINE_CACHE_MAX_SIZE (256u << 20)
++
++static struct list d2d_outline_cache = LIST_INIT(d2d_outline_cache);
++static size_t d2d_outline_cache_size;
++static SRWLOCK d2d_outline_cache_lock = SRWLOCK_INIT;
++
++void d2d_outline_cache_entry_addref(struct d2d_outline_cache_entry *entry)
++{
++    InterlockedIncrement(&entry->refcount);
++}
++
++void d2d_outline_cache_entry_release(struct d2d_outline_cache_entry *entry)
++{
++    if (InterlockedDecrement(&entry->refcount))
++        return;
++    free(entry->outline.arc_faces);
++    free(entry->outline.arcs);
++    free(entry->outline.bezier_faces);
++    free(entry->outline.beziers);
++    free(entry->outline.faces);
++    free(entry->outline.vertices);
++    free(entry->key);
++    free(entry);
++}
++
++/* What the outline is built from: per figure, its flags, vertices, vertex
++ * types and bezier controls. */
++static unsigned char *d2d_outline_cache_make_key(const struct d2d_figure *figures, size_t count, size_t *size)
++{
++    size_t i, total = sizeof(count);
++    unsigned char *key, *p;
++
++    for (i = 0; i < count; ++i)
++        total += 2 * sizeof(size_t) + sizeof(figures[i].flags)
++                + figures[i].vertex_count * (sizeof(*figures[i].vertices) + sizeof(*figures[i].vertex_types))
++                + figures[i].bezier_control_count * sizeof(*figures[i].bezier_controls);
++    if (!(p = key = malloc(total)))
++        return NULL;
++    p = d2d_close_cache_put(p, &count, sizeof(count));
++    for (i = 0; i < count; ++i)
++    {
++        const struct d2d_figure *figure = &figures[i];
++
++        p = d2d_close_cache_put(p, &figure->vertex_count, sizeof(figure->vertex_count));
++        p = d2d_close_cache_put(p, &figure->bezier_control_count, sizeof(figure->bezier_control_count));
++        p = d2d_close_cache_put(p, &figure->flags, sizeof(figure->flags));
++        p = d2d_close_cache_put(p, figure->vertices, figure->vertex_count * sizeof(*figure->vertices));
++        p = d2d_close_cache_put(p, figure->vertex_types, figure->vertex_count * sizeof(*figure->vertex_types));
++        p = d2d_close_cache_put(p, figure->bezier_controls,
++                figure->bezier_control_count * sizeof(*figure->bezier_controls));
++    }
++    *size = total;
++    return key;
++}
++
++static UINT64 d2d_outline_cache_hash(const unsigned char *key, size_t size)
++{
++    UINT64 h = 0xcbf29ce484222325ull, v;
++    size_t i;
++
++    /* Eight bytes at a time: the keys run to megabytes. */
++    for (i = 0; i + sizeof(v) <= size; i += sizeof(v))
++    {
++        memcpy(&v, key + i, sizeof(v));
++        h = (h ^ v) * 0x100000001b3ull;
++        h ^= h >> 29;
++    }
++    for (; i < size; ++i)
++        h = (h ^ key[i]) * 0x100000001b3ull;
++    return h;
++}
++
++static void d2d_path_geometry_build_outline(struct d2d_geometry *geometry);
++
++/* Builds a closed path's outline, or shares that of a path of the same
++ * figures. */
++static void d2d_path_geometry_build_outline_shared(struct d2d_geometry *geometry)
++{
++    const struct d2d_figure *figures = geometry->u.path.figures;
++    size_t i, count = geometry->u.path.figure_count, vertex_count = 0, key_size;
++    struct d2d_outline_cache_entry *entry;
++    unsigned char *key;
++    UINT64 hash;
++
++    if (geometry->u.path.outline_figures)
++    {
++        figures = geometry->u.path.outline_figures;
++        count = geometry->u.path.outline_figure_count;
++    }
++    for (i = 0; i < count; ++i)
++        vertex_count += figures[i].vertex_count;
++    if (geometry->u.path.state != D2D_GEOMETRY_STATE_CLOSED || geometry->u.path.outline_built
++            || geometry->outline_entry || vertex_count < D2D_OUTLINE_CACHE_MIN_VERTICES
++            || !(key = d2d_outline_cache_make_key(figures, count, &key_size)))
++    {
++        d2d_path_geometry_build_outline(geometry);
++        return;
++    }
++    hash = d2d_outline_cache_hash(key, key_size);
++
++    AcquireSRWLockExclusive(&d2d_outline_cache_lock);
++    LIST_FOR_EACH_ENTRY(entry, &d2d_outline_cache, struct d2d_outline_cache_entry, entry)
++    {
++        if (entry->hash != hash || entry->key_size != key_size || memcmp(entry->key, key, key_size))
++            continue;
++        list_remove(&entry->entry);
++        list_add_head(&d2d_outline_cache, &entry->entry);
++        d2d_outline_cache_entry_addref(entry);
++        ReleaseSRWLockExclusive(&d2d_outline_cache_lock);
++        free(key);
++        geometry->outline = entry->outline;
++        geometry->outline_entry = entry;
++        geometry->u.path.outline_built = geometry->u.path.figure_count;
++        d2d_path_geometry_free_outline_figures(geometry);
++        return;
++    }
++    ReleaseSRWLockExclusive(&d2d_outline_cache_lock);
++
++    d2d_path_geometry_build_outline(geometry);
++    if (!(entry = calloc(1, sizeof(*entry))))
++    {
++        free(key);
++        return;
++    }
++    /* One reference for the cache, one for this path. */
++    entry->refcount = 2;
++    entry->hash = hash;
++    entry->key = key;
++    entry->key_size = key_size;
++    entry->outline = geometry->outline;
++    entry->size = key_size + entry->outline.vertex_count * sizeof(*entry->outline.vertices)
++            + (entry->outline.face_count + entry->outline.bezier_face_count + entry->outline.arc_face_count)
++            * sizeof(struct d2d_face) + (entry->outline.bezier_count + entry->outline.arc_count)
++            * sizeof(*entry->outline.beziers);
++    geometry->outline_entry = entry;
++    if (entry->size > D2D_OUTLINE_CACHE_MAX_SIZE / 2)
++    {
++        d2d_outline_cache_entry_release(entry);
++        return;
++    }
++    AcquireSRWLockExclusive(&d2d_outline_cache_lock);
++    list_add_head(&d2d_outline_cache, &entry->entry);
++    d2d_outline_cache_size += entry->size;
++    while (d2d_outline_cache_size > D2D_OUTLINE_CACHE_MAX_SIZE)
++    {
++        struct d2d_outline_cache_entry *last = LIST_ENTRY(list_tail(&d2d_outline_cache),
++                struct d2d_outline_cache_entry, entry);
++
++        list_remove(&last->entry);
++        d2d_outline_cache_size -= last->size;
++        d2d_outline_cache_entry_release(last);
++    }
++    ReleaseSRWLockExclusive(&d2d_outline_cache_lock);
++}
++
+ static void d2d_path_geometry_build_outline(struct d2d_geometry *geometry)
+ {
+     struct d2d_figure *figures = geometry->u.path.figures;
+@@ -5594,7 +5767,7 @@ static void d2d_geometry_ensure_outline(struct d2d_geometry *geometry)
+     AcquireSRWLockExclusive(&d2d_outline_lock);
+     if (geometry->outline_pending)
+     {
+-        d2d_path_geometry_build_outline(geometry);
++        d2d_path_geometry_build_outline_shared(geometry);
+         WriteRelease(&geometry->outline_pending, FALSE);
+     }
+     ReleaseSRWLockExclusive(&d2d_outline_lock);
+@@ -6165,6 +6338,11 @@ static ULONG STDMETHODCALLTYPE d2d_path_geometry_Release(ID2D1PathGeometry1 *ifa
+     if (!refcount)
+     {
+         d2d_path_geometry_free_figures(geometry);
++        if (geometry->outline_entry)
++        {
++            memset(&geometry->outline, 0, sizeof(geometry->outline));
++            d2d_outline_cache_entry_release(geometry->outline_entry);
++        }
+         d2d_geometry_cleanup(geometry);
+         free(geometry);
+     }
+-- 
+2.55.0
+

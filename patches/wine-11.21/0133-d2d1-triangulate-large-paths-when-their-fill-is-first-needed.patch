@@ -1,0 +1,243 @@
+From 4a6e80ed873e792f54073ee0c03aeb747706545d Mon Sep 17 00:00:00 2001
+From: jfacemyer <1776340+jfacemyer@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 23:39:36 -0500
+Subject: [PATCH 1/8] d2d1: Triangulate large paths when their fill is first
+ needed.
+
+Close() did the whole fill preparation of a path: its self-intersections,
+its overlapping beziers and its triangulation. A path that is only
+stroked never uses any of it. Affinity closes the selected object's path
+for every redraw of its selection outline and never fills it, so for a
+dense engraving (138,000 curves) every select or nudge spent 1.1 s in
+Close() for nothing.
+
+Paths of 16,384 vertices or more now leave that work to the first call
+that reads the fill or the figures Close() changes: a fill, a hit test,
+the bounds, a tessellation or area, streaming, simplifying, or creating
+a transformed geometry or geometry group from it. The work and its
+results are the same, only later; smaller paths are prepared in Close()
+as before.
+---
+ dlls/d2d1/d2d1_private.h |  2 +
+ dlls/d2d1/device.c       |  2 +
+ dlls/d2d1/geometry.c     | 84 ++++++++++++++++++++++++++++++++++++++--
+ 3 files changed, 84 insertions(+), 4 deletions(-)
+
+diff --git a/dlls/d2d1/d2d1_private.h b/dlls/d2d1/d2d1_private.h
+index 22ecfe8..f5fa415 100644
+--- a/dlls/d2d1/d2d1_private.h
++++ b/dlls/d2d1/d2d1_private.h
+@@ -637,6 +637,7 @@ struct d2d_geometry
+         size_t arc_face_count;
+     } outline;
+     LONG outline_pending;
++    LONG fill_pending;
+ 
+     union
+     {
+@@ -696,6 +697,7 @@ HRESULT d2d_rectangle_geometry_init(struct d2d_geometry *geometry,
+         ID2D1Factory *factory, const D2D1_RECT_F *rect);
+ HRESULT d2d_rounded_rectangle_geometry_init(struct d2d_geometry *geometry,
+         ID2D1Factory *factory, const D2D1_ROUNDED_RECT *rounded_rect);
++void d2d_geometry_ensure_fill(const struct d2d_geometry *geometry);
+ const struct d2d_geometry *d2d_geometry_get_outline(const struct d2d_geometry *geometry);
+ void d2d_line_outline(struct d2d_outline_vertex *v, struct d2d_face *f,
+         const D2D1_POINT_2F *p0, const D2D1_POINT_2F *p1);
+diff --git a/dlls/d2d1/device.c b/dlls/d2d1/device.c
+index 2cc7655..a1081a3 100644
+--- a/dlls/d2d1/device.c
++++ b/dlls/d2d1/device.c
+@@ -1465,6 +1465,8 @@ static void d2d_device_context_fill_geometry(struct d2d_device_context *render_t
+ {
+     HRESULT hr;
+ 
++    d2d_geometry_ensure_fill(geometry);
++
+     if (FAILED(hr = d2d_device_context_update_vs_cb(render_target, &geometry->transform, 0.0f)))
+     {
+         WARN("Failed to update vs constant buffer, hr %#lx.\n", hr);
+diff --git a/dlls/d2d1/geometry.c b/dlls/d2d1/geometry.c
+index aeb2beb..fd3603a 100644
+--- a/dlls/d2d1/geometry.c
++++ b/dlls/d2d1/geometry.c
+@@ -5383,13 +5383,51 @@ static void d2d_geometry_close_cache_store(const struct d2d_geometry *geometry,
+     ReleaseSRWLockExclusive(&d2d_close_cache.lock);
+ }
+ 
++static HRESULT d2d_path_geometry_compute_fill(struct d2d_geometry *geometry);
++static const struct ID2D1PathGeometry1Vtbl d2d_path_geometry_vtbl;
++
++/* Paths at least this large are triangulated when something first needs
++ * their fill, rather than in Close(): a path that is only ever stroked never
++ * needs it. Affinity closes the selected object's path for every redraw of
++ * its selection outline, and never fills it. */
++#define D2D_DEFER_FILL_MIN_VERTICES 16384
++
++static BOOL d2d_path_geometry_defer_fill(const struct d2d_geometry *geometry)
++{
++    size_t i, count = 0;
++
++    for (i = 0; i < geometry->u.path.figure_count; ++i)
++        count += geometry->u.path.figures[i].vertex_count;
++    return count >= D2D_DEFER_FILL_MIN_VERTICES;
++}
++
++static SRWLOCK d2d_fill_lock = SRWLOCK_INIT;
++
++/* Does Close()'s deferred fill work, if any, before anything reads the fill
++ * or the figures as Close() leaves them. */
++void d2d_geometry_ensure_fill(const struct d2d_geometry *geometry)
++{
++    struct d2d_geometry *path = (struct d2d_geometry *)geometry;
++
++    if (path->ID2D1Geometry_iface.lpVtbl != (const ID2D1GeometryVtbl *)&d2d_path_geometry_vtbl
++            || !ReadAcquire(&path->fill_pending))
++        return;
++    AcquireSRWLockExclusive(&d2d_fill_lock);
++    if (path->fill_pending)
++    {
++        /* A lazy outline reads the figures under this lock. The fill work
++         * changes them, after keeping a copy for the outline. */
++        AcquireSRWLockExclusive(&d2d_outline_lock);
++        d2d_path_geometry_compute_fill(path);
++        ReleaseSRWLockExclusive(&d2d_outline_lock);
++        WriteRelease(&path->fill_pending, FALSE);
++    }
++    ReleaseSRWLockExclusive(&d2d_fill_lock);
++}
++
+ static HRESULT STDMETHODCALLTYPE d2d_geometry_sink_Close(ID2D1GeometrySink *iface)
+ {
+     struct d2d_geometry *geometry = impl_from_ID2D1GeometrySink(iface);
+-    unsigned char *key = NULL;
+-    size_t key_size = 0;
+-    HRESULT hr = E_FAIL;
+-    UINT64 hash = 0;
+ 
+     TRACE("iface %p.\n", iface);
+ 
+@@ -5404,6 +5442,23 @@ static HRESULT STDMETHODCALLTYPE d2d_geometry_sink_Close(ID2D1GeometrySink *ifac
+ 
+     geometry->u.path.state = D2D_GEOMETRY_STATE_CLOSED;
+ 
++    if (d2d_path_geometry_defer_fill(geometry))
++    {
++        geometry->fill_pending = TRUE;
++        return S_OK;
++    }
++    return d2d_path_geometry_compute_fill(geometry);
++}
++
++/* Close()'s fill work: self-intersections, overlapping beziers and the
++ * triangulation, or their results from the close cache. */
++static HRESULT d2d_path_geometry_compute_fill(struct d2d_geometry *geometry)
++{
++    unsigned char *key = NULL;
++    size_t key_size = 0;
++    HRESULT hr = E_FAIL;
++    UINT64 hash = 0;
++
+     if (!d2d_path_geometry_alloc_outline_figures(geometry))
+         d2d_path_geometry_build_outline_now(geometry);
+ 
+@@ -5601,6 +5656,8 @@ static HRESULT STDMETHODCALLTYPE d2d_path_geometry_GetBounds(ID2D1PathGeometry1
+ 
+     TRACE("iface %p, transform %p, bounds %p.\n", iface, transform, bounds);
+ 
++    d2d_geometry_ensure_fill(impl_from_ID2D1PathGeometry1(iface));
++
+     if (geometry->u.path.state != D2D_GEOMETRY_STATE_CLOSED)
+         return D2DERR_WRONG_STATE;
+ 
+@@ -5736,6 +5793,8 @@ static HRESULT STDMETHODCALLTYPE d2d_path_geometry_StrokeContainsPoint(ID2D1Path
+     TRACE("iface %p, point %s, stroke_width %.8e, stroke_style %p, transform %p, tolerance %.8e, contains %p.\n",
+             iface, debug_d2d_point_2f(&point), stroke_width, stroke_style, transform, tolerance, contains);
+ 
++    d2d_geometry_ensure_fill(impl_from_ID2D1PathGeometry1(iface));
++
+     if (stroke_style)
+         FIXME("Ignoring stroke style %p.\n", stroke_style);
+ 
+@@ -5817,6 +5876,8 @@ static HRESULT STDMETHODCALLTYPE d2d_path_geometry_FillContainsPoint(ID2D1PathGe
+     TRACE("iface %p, point %s, transform %p, tolerance %.8e, contains %p.\n",
+             iface, debug_d2d_point_2f(&point), transform, tolerance, contains);
+ 
++    d2d_geometry_ensure_fill(impl_from_ID2D1PathGeometry1(iface));
++
+     if (transform)
+     {
+         if (!d2d_matrix_invert(&g_i, transform))
+@@ -5971,6 +6032,8 @@ static HRESULT STDMETHODCALLTYPE d2d_path_geometry_Simplify(ID2D1PathGeometry1 *
+     TRACE("iface %p, option %#x, transform %p, tolerance %.8e, sink %p.\n",
+             iface, option, transform, tolerance, sink);
+ 
++    d2d_geometry_ensure_fill(impl_from_ID2D1PathGeometry1(iface));
++
+     ID2D1SimplifiedGeometrySink_SetFillMode(sink, geometry->u.path.fill_mode);
+     for (i = 0; i < geometry->u.path.figure_count; ++i)
+     {
+@@ -6031,6 +6094,8 @@ static HRESULT d2d_geometry_tessellate(ID2D1Geometry *geometry, const D2D1_MATRI
+         struct d2d_geometry *path_impl = unsafe_impl_from_ID2D1Geometry((ID2D1Geometry *)path_geometry);
+         D2D1_TRIANGLE t;
+ 
++        d2d_geometry_ensure_fill(path_impl);
++
+         for (size_t i = 0; i < path_impl->fill.face_count; ++i)
+         {
+             const struct d2d_face *face = &path_impl->fill.faces[i];
+@@ -6072,6 +6137,8 @@ static HRESULT d2d_geometry_compute_area(ID2D1Geometry *geometry, const D2D1_MAT
+         struct d2d_geometry *path_impl = unsafe_impl_from_ID2D1Geometry((ID2D1Geometry *)path_geometry);
+         D2D1_TRIANGLE t;
+ 
++        d2d_geometry_ensure_fill(path_impl);
++
+         for (size_t i = 0; i < path_impl->fill.face_count; ++i)
+         {
+             const struct d2d_face *face = &path_impl->fill.faces[i];
+@@ -6097,6 +6164,8 @@ static HRESULT STDMETHODCALLTYPE d2d_path_geometry_Tessellate(ID2D1PathGeometry1
+ 
+     TRACE("iface %p, transform %p, tolerance %.8e, sink %p.\n", iface, transform, tolerance, sink);
+ 
++    d2d_geometry_ensure_fill(impl_from_ID2D1PathGeometry1(iface));
++
+     return d2d_geometry_tessellate(&geometry->ID2D1Geometry_iface, transform, tolerance, sink);
+ }
+ 
+@@ -6125,6 +6194,8 @@ static HRESULT STDMETHODCALLTYPE d2d_path_geometry_ComputeArea(ID2D1PathGeometry
+ 
+     TRACE("iface %p, transform %p, tolerance %.8e, area %p.\n", iface, transform, tolerance, area);
+ 
++    d2d_geometry_ensure_fill(impl_from_ID2D1PathGeometry1(iface));
++
+     return d2d_geometry_compute_area(&geometry->ID2D1Geometry_iface, transform, tolerance, area);
+ }
+ 
+@@ -6342,6 +6413,8 @@ static HRESULT STDMETHODCALLTYPE d2d_path_geometry_Stream(ID2D1PathGeometry1 *if
+ 
+     TRACE("iface %p, sink %p.\n", iface, sink);
+ 
++    d2d_geometry_ensure_fill(impl_from_ID2D1PathGeometry1(iface));
++
+     if (geometry->u.path.state != D2D_GEOMETRY_STATE_CLOSED)
+         return D2DERR_WRONG_STATE;
+ 
+@@ -8009,6 +8082,7 @@ void d2d_transformed_geometry_init(struct d2d_geometry *geometry, ID2D1Factory *
+     D2D_MATRIX_3X2_F g;
+ 
+     src_impl = unsafe_impl_from_ID2D1Geometry(src_geometry);
++    d2d_geometry_ensure_fill(src_impl);
+ 
+     g = src_impl->transform;
+     d2d_matrix_multiply(&g, transform);
+@@ -8349,6 +8423,8 @@ HRESULT d2d_geometry_group_init(struct d2d_geometry *geometry, ID2D1Factory *fac
+     {
+         struct d2d_geometry *path_impl = unsafe_impl_from_ID2D1Geometry((ID2D1Geometry *)geometry->u.group.path);
+ 
++        d2d_geometry_ensure_fill(path_impl);
++
+         geometry->fill = path_impl->fill;
+         geometry->outline = path_impl->outline;
+     }
+-- 
+2.55.0
+
