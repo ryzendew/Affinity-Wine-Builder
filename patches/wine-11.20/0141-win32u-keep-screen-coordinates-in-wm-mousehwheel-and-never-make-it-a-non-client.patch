@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jfacemyer <1776340+jfacemyer@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 07:29:40 -0500
+Subject: [PATCH] win32u: Keep screen coordinates in WM_MOUSEHWHEEL and
+ never make it a non-client message.
+
+Both wheel messages carry the pointer position in screen coordinates and
+Windows has no non-client wheel message, but process_mouse_message()
+exempted only WM_MOUSEWHEEL from the conversion. WM_MOUSEHWHEEL arrived
+with client coordinates over the client area and, over the frame, as
+message 0xae with the hit-test code in wParam, which applications ignore.
+
+From neutron-wine (Nico-LaFoucate).
+---
+ dlls/win32u/message.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/dlls/win32u/message.c b/dlls/win32u/message.c
+index 0a2f5d1..869330a 100644
+--- a/dlls/win32u/message.c
++++ b/dlls/win32u/message.c
+@@ -2725,7 +2725,7 @@ static BOOL process_mouse_message( MSG *msg, UINT hw_id, ULONG_PTR extra_info, H
+     message = msg->message;
+     wparam = msg->wParam;
+     /* Note: windows has no concept of a non-client wheel message */
+-    if (message != WM_MOUSEWHEEL)
++    if (message != WM_MOUSEWHEEL && message != WM_MOUSEHWHEEL)
+     {
+         if (hittest != HTCLIENT)
+         {
+-- 
+2.55.0
+

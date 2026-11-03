@@ -1,0 +1,49 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jfacemyer <1776340+jfacemyer@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 07:30:16 -0500
+Subject: [PATCH] win32u: Don't send WM_MOUSELEAVE to the window
+ holding the mouse capture.
+
+For TrackMouseEvent the window the mouse is in is the window that gets
+the mouse messages, which while the mouse is captured is the capture
+window, client area, wherever the pointer is. Windows (and ReactOS, which
+mirrors it) therefore sends the leave only after the capture is released.
+get_mouse_window() looked up the window under the cursor instead, so a
+captured drag that crossed the window's edge got WM_MOUSELEAVE mid-drag
+and, for example, a scroll bar thumb stopped following the pointer.
+
+The capture check comes before the check for the pointer being over
+another application's window, which applies once the capture is gone.
+
+From neutron-wine (Nico-LaFoucate).
+---
+ dlls/win32u/input.c | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/dlls/win32u/input.c b/dlls/win32u/input.c
+index d4bd41b..203673f 100644
+--- a/dlls/win32u/input.c
++++ b/dlls/win32u/input.c
+@@ -1836,9 +1836,18 @@ static void check_mouse_leave( HWND hwnd, int hittest, struct mouse_tracking_inf
+ static HWND get_mouse_window( HWND hwnd, INT *hittest, POINT *ret_pos, struct mouse_tracking_info *tracking )
+ {
+     POINT pos;
+-    HWND ret;
++    HWND ret, capture;
+ 
+     NtUserGetCursorPos( &pos );
++    /* while the mouse is captured, the capture window gets the mouse messages wherever
++     * the pointer is, so it is the window the mouse is in and gets no WM_MOUSELEAVE */
++    if ((capture = get_capture()))
++    {
++        *hittest = HTCLIENT;
++        *ret_pos = pos;
++        TRACE( "point %s captured by %p\n", wine_dbgstr_point(&pos), capture );
++        return capture;
++    }
+     if (tracking->pointer_outside)
+     {
+         *hittest = HTNOWHERE;
+-- 
+2.55.0
+

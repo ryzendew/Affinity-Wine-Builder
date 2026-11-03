@@ -1,0 +1,69 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jfacemyer <1776340+jfacemyer@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 07:41:58 -0500
+Subject: [PATCH] d2d1: Bound the subdivision in the bezier stroke hit
+ test.
+
+d2d_point_on_bezier_segment() halves the curve until the point is clearly
+on or off its stroke. At extreme zoom the float approximation stops
+narrowing and it recursed without end, freezing the caller. Stop at a
+depth where the halves are far below float precision.
+
+Reported against WineFix's copy of d2d1 (AffinityPluginLoader #58,
+AffinityOnLinux #134); Wine's has the same recursion.
+---
+ dlls/d2d1/geometry.c | 24 +++++++++++++++++++-----
+ 1 file changed, 19 insertions(+), 5 deletions(-)
+
+diff --git a/dlls/d2d1/geometry.c b/dlls/d2d1/geometry.c
+index 879d557..a5fe40a 100644
+--- a/dlls/d2d1/geometry.c
++++ b/dlls/d2d1/geometry.c
+@@ -763,9 +763,14 @@ static BOOL d2d_point_on_line_segment(const D2D1_POINT_2F *q, const D2D1_POINT_2
+  * lies outside the approximation, we're done. If the width of the
+  * approximation is less than the tolerance and the point lies inside, we're
+  * also done. If neither of those is the case, we subdivide the Bézier segment
+- * and try again. */
+-static BOOL d2d_point_on_bezier_segment(const D2D1_POINT_2F *q, const D2D1_POINT_2F *p0,
+-        const D2D1_BEZIER_SEGMENT *b, const D2D1_MATRIX_3X2_F *transform, float stroke_width, float tolerance)
++ * and try again, up to a depth where the halves are far below float
++ * precision: at extreme zoom the approximation stops narrowing, and the
++ * recursion never ended. */
++#define D2D_POINT_ON_BEZIER_MAX_DEPTH 24
++
++static BOOL d2d_point_on_bezier_segment_depth(const D2D1_POINT_2F *q, const D2D1_POINT_2F *p0,
++        const D2D1_BEZIER_SEGMENT *b, const D2D1_MATRIX_3X2_F *transform, float stroke_width, float tolerance,
++        unsigned int depth)
+ {
+     float d1, d2, d3, d4, d, l, m, w, w2;
+     D2D1_POINT_2F t[7], start, end, v_p;
+@@ -906,6 +911,9 @@ static BOOL d2d_point_on_bezier_segment(const D2D1_POINT_2F *q, const D2D1_POINT
+      * curve can't possibly be within the tolerance. */
+     if (!d2d_point_on_line_segment(q, &start, &end, transform, w + w2, tolerance))
+         return FALSE;
++    /* Within the wide approximation, which no longer narrows. */
++    if (depth >= D2D_POINT_ON_BEZIER_MAX_DEPTH)
++        return TRUE;
+ 
+     /* Subdivide the curve. Note that simply splitting the segment in half
+      * here works and is easy, but may not be optimal. We could potentially
+@@ -921,8 +929,14 @@ static BOOL d2d_point_on_bezier_segment(const D2D1_POINT_2F *q, const D2D1_POINT
+     d2d_point_lerp(&b0.point2, &t[0], &b0.point1, 0.5f);
+     d2d_point_lerp(&b0.point3, &b0.point2, &b1.point1, 0.5f);
+ 
+-    return d2d_point_on_bezier_segment(q, p0, &b0, transform, stroke_width, tolerance)
+-            || d2d_point_on_bezier_segment(q, &b0.point3, &b1, transform, stroke_width, tolerance);
++    return d2d_point_on_bezier_segment_depth(q, p0, &b0, transform, stroke_width, tolerance, depth + 1)
++            || d2d_point_on_bezier_segment_depth(q, &b0.point3, &b1, transform, stroke_width, tolerance, depth + 1);
++}
++
++static BOOL d2d_point_on_bezier_segment(const D2D1_POINT_2F *q, const D2D1_POINT_2F *p0,
++        const D2D1_BEZIER_SEGMENT *b, const D2D1_MATRIX_3X2_F *transform, float stroke_width, float tolerance)
++{
++    return d2d_point_on_bezier_segment_depth(q, p0, b, transform, stroke_width, tolerance, 0);
+ }
+ 
+ static void d2d_rect_union(D2D1_RECT_F *l, const D2D1_RECT_F *r)
+-- 
+2.55.0
+
