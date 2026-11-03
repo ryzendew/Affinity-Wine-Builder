@@ -1,0 +1,112 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jfacemyer <1776340+jfacemyer@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 09:58:22 -0500
+Subject: [PATCH] d2d1: Keep a path drawable when its fill cannot be computed.
+
+When the triangulation of a path failed, Close() freed its figures but
+left the figure count, and the lazy outline then read the freed figures
+and faulted at the next stroke. Reset the count with the figures, and
+when the fill work was deferred, after Close() had already succeeded,
+keep the figures and outline and leave the path without a fill. A vertex
+the sorted array does not hold now fails the triangulation instead of
+indexing outside it.
+---
+ dlls/d2d1/geometry.c | 36 ++++++++++++++++++++++++++++--------
+ 1 file changed, 28 insertions(+), 8 deletions(-)
+
+diff --git a/dlls/d2d1/geometry.c b/dlls/d2d1/geometry.c
+index 4d5674e..92507e6 100644
+--- a/dlls/d2d1/geometry.c
++++ b/dlls/d2d1/geometry.c
+@@ -3196,8 +3196,14 @@ static BOOL d2d_cdt_insert_segments(struct d2d_cdt *cdt, struct d2d_geometry *ge
+         if (figure->vertex_count < 2)
+             continue;
+ 
+-        p = bsearch(&figure->vertices[figure->vertex_count - 1], cdt->vertices,
+-                geometry->fill.vertex_count, sizeof(*p), d2d_cdt_compare_vertices);
++        /* A vertex the sorted array does not hold, e.g. a NaN coordinate,
++         * would index far outside it. */
++        if (!(p = bsearch(&figure->vertices[figure->vertex_count - 1], cdt->vertices,
++                geometry->fill.vertex_count, sizeof(*p), d2d_cdt_compare_vertices)))
++        {
++            ERR("Vertex not found.\n");
++            return FALSE;
++        }
+         start_vertex = p - cdt->vertices;
+ 
+         /* The lowest numbered live edge with an end at start_vertex, as the
+@@ -3253,8 +3259,12 @@ static BOOL d2d_cdt_insert_segments(struct d2d_cdt *cdt, struct d2d_geometry *ge
+ 
+         for (j = 0; j < figure->vertex_count; start_vertex = end_vertex, ++j)
+         {
+-            p = bsearch(&figure->vertices[j], cdt->vertices,
+-                    geometry->fill.vertex_count, sizeof(*p), d2d_cdt_compare_vertices);
++            if (!(p = bsearch(&figure->vertices[j], cdt->vertices,
++                    geometry->fill.vertex_count, sizeof(*p), d2d_cdt_compare_vertices)))
++            {
++                ERR("Vertex not found.\n");
++                return FALSE;
++            }
+             end_vertex = p - cdt->vertices;
+ 
+             if (start_vertex == end_vertex)
+@@ -4568,6 +4578,7 @@ static void d2d_path_geometry_free_figures(struct d2d_geometry *geometry)
+     free(geometry->u.path.figures);
+     geometry->u.path.figures = NULL;
+     geometry->u.path.figures_size = 0;
++    geometry->u.path.figure_count = 0;
+ }
+ 
+ static BOOL d2d_geometry_get_bezier_segment_idx(struct d2d_geometry *geometry, struct d2d_segment_idx *idx, BOOL next)
+@@ -6118,7 +6129,7 @@ static void d2d_geometry_close_cache_store(const struct d2d_geometry *geometry,
+     ReleaseSRWLockExclusive(&d2d_close_cache.lock);
+ }
+ 
+-static HRESULT d2d_path_geometry_compute_fill(struct d2d_geometry *geometry);
++static HRESULT d2d_path_geometry_compute_fill(struct d2d_geometry *geometry, BOOL deferred);
+ static const struct ID2D1PathGeometry1Vtbl d2d_path_geometry_vtbl;
+ 
+ /* Paths at least this large are triangulated when something first needs
+@@ -6152,7 +6163,7 @@ void d2d_geometry_ensure_fill(const struct d2d_geometry *geometry)
+     {
+         if (path->fill_pending)
+         {
+-            d2d_path_geometry_compute_fill(path);
++            d2d_path_geometry_compute_fill(path, TRUE);
+             WriteRelease(&path->fill_pending, FALSE);
+         }
+     }
+@@ -6181,12 +6192,12 @@ static HRESULT STDMETHODCALLTYPE d2d_geometry_sink_Close(ID2D1GeometrySink *ifac
+         geometry->fill_pending = TRUE;
+         return S_OK;
+     }
+-    return d2d_path_geometry_compute_fill(geometry);
++    return d2d_path_geometry_compute_fill(geometry, FALSE);
+ }
+ 
+ /* Close()'s fill work: self-intersections, overlapping beziers and the
+  * triangulation, or their results from the close cache. */
+-static HRESULT d2d_path_geometry_compute_fill(struct d2d_geometry *geometry)
++static HRESULT d2d_path_geometry_compute_fill(struct d2d_geometry *geometry, BOOL deferred)
+ {
+     unsigned char *key = NULL;
+     size_t key_size = 0;
+@@ -6230,6 +6241,15 @@ done:
+         free(geometry->fill.bezier_vertices);
+         geometry->fill.bezier_vertices = NULL;
+         geometry->fill.bezier_vertex_count = 0;
++        /* Deferred, Close() has already succeeded, and the path is still
++         * drawn and queried: it keeps its figures and outline, with no
++         * fill. Freeing them here made the next stroke read freed figures. */
++        if (deferred)
++        {
++            WARN("Failed to compute the fill of geometry %p, hr %#lx.\n", geometry, hr);
++            geometry->fill.face_count = 0;
++            return hr;
++        }
+         d2d_path_geometry_free_figures(geometry);
+         d2d_geometry_set_error(geometry, hr);
+     }
+-- 
+2.55.0
+
