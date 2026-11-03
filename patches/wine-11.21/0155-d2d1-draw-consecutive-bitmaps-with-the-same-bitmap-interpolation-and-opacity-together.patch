@@ -1,0 +1,385 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jfacemyer <1776340+jfacemyer@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 13:30:48 -0500
+Subject: [PATCH 155/155] d2d1: Draw consecutive bitmaps with the same bitmap,
+ interpolation and opacity together.
+
+Affinity draws one bitmap per node of the path being edited, each with its
+own transform: on a dense path, tens of thousands a frame, 91% with the
+same bitmap as the one before. Each was a bitmap brush, a constant buffer
+update, a vertex upload and a draw, and took 58% of the UI thread while
+nodes were dragged.
+
+Add such bitmaps to the draw batch instead: the vertices are transformed
+on the CPU and carry their texture coordinates, so the constants are the
+same for all of them, and one draw covers up to 16,384 bitmaps. Changing
+the bitmap's content through CopyFromBitmap(), CopyFromMemory() or Map()
+draws the batch first. WINE_D2D_NO_DRAW_BATCHING=1 turns it off with the
+other batching.
+
+DrawBitmap() in Affinity's node drag: 58% -> 10% of the UI thread, wined3d
+37% -> 6%. d2d1 tests unchanged (17,521, 0 failures).
+---
+ dlls/d2d1/bitmap.c       |   3 +
+ dlls/d2d1/brush.c        |  15 +++-
+ dlls/d2d1/d2d1_private.h |   5 ++
+ dlls/d2d1/device.c       | 187 +++++++++++++++++++++++++++++++++++++--
+ 4 files changed, 203 insertions(+), 7 deletions(-)
+
+diff --git a/dlls/d2d1/bitmap.c b/dlls/d2d1/bitmap.c
+index 2a20000..b83cbf9 100644
+--- a/dlls/d2d1/bitmap.c
++++ b/dlls/d2d1/bitmap.c
+@@ -171,6 +171,7 @@ static HRESULT STDMETHODCALLTYPE d2d_bitmap_CopyFromBitmap(ID2D1Bitmap1 *iface,
+         box.back = 1;
+     }
+ 
++    d2d_bitmap_flush_draws(dst_bitmap);
+     ID3D11Resource_GetDevice(dst_bitmap->resource, &device);
+     ID3D11Device_GetImmediateContext(device, &context);
+     ID3D11DeviceContext_CopySubresourceRegion(context, dst_bitmap->resource, 0,
+@@ -241,6 +242,7 @@ static HRESULT STDMETHODCALLTYPE d2d_bitmap_CopyFromMemory(ID2D1Bitmap1 *iface,
+         box.back = 1;
+     }
+ 
++    d2d_bitmap_flush_draws(bitmap);
+     ID3D11Resource_GetDevice(bitmap->resource, &device);
+     ID3D11Device_GetImmediateContext(device, &context);
+     ID3D11DeviceContext_UpdateSubresource(context, bitmap->resource, 0, dst_rect ? &box : NULL, src_data, pitch, 0);
+@@ -309,6 +311,7 @@ static HRESULT STDMETHODCALLTYPE d2d_bitmap_Map(ID2D1Bitmap1 *iface, D2D1_MAP_OP
+         return E_INVALIDARG;
+     }
+ 
++    d2d_bitmap_flush_draws(bitmap);
+     ID3D11Resource_GetDevice(bitmap->resource, &device);
+     ID3D11Device_GetImmediateContext(device, &context);
+     if (SUCCEEDED(hr = ID3D11DeviceContext_Map(context, bitmap->resource, 0, map_type,
+diff --git a/dlls/d2d1/brush.c b/dlls/d2d1/brush.c
+index ea09e6e..0095bf5 100644
+--- a/dlls/d2d1/brush.c
++++ b/dlls/d2d1/brush.c
+@@ -1468,6 +1468,19 @@ BOOL d2d_brush_fill_cb(const struct d2d_brush *brush, struct d2d_brush_cb *cb)
+                 cb->type = D2D_BRUSH_TYPE_BITMAP;
+             }
+ 
++            cb->u.bitmap.ignore_alpha = bitmap->format.alphaMode == D2D1_ALPHA_MODE_IGNORE;
++
++            if (brush->type == D2D_BRUSH_TYPE_BITMAP && brush->u.bitmap.texcoords)
++            {
++                cb->u.bitmap._11 = 1.0f;
++                cb->u.bitmap._21 = 0.0f;
++                cb->u.bitmap._31 = 0.0f;
++                cb->u.bitmap._12 = 0.0f;
++                cb->u.bitmap._22 = 1.0f;
++                cb->u.bitmap._32 = 0.0f;
++                return TRUE;
++            }
++
+             /* Scale for bitmap size and dpi. */
+             b = brush->transform;
+             dpi_scale = bitmap->pixel_size.width * (96.0f / bitmap->dpi_x);
+@@ -1491,8 +1504,6 @@ BOOL d2d_brush_fill_cb(const struct d2d_brush *brush, struct d2d_brush_cb *cb)
+                 cb->u.bitmap._32 = -(b._11 * b._32 - b._31 * b._12) / d;
+             }
+ 
+-            cb->u.bitmap.ignore_alpha = bitmap->format.alphaMode == D2D1_ALPHA_MODE_IGNORE;
+-
+             if (image_bitmap)
+                 ID2D1Bitmap_Release(image_bitmap);
+ 
+diff --git a/dlls/d2d1/d2d1_private.h b/dlls/d2d1/d2d1_private.h
+index 1a6ef62..86b49eb 100644
+--- a/dlls/d2d1/d2d1_private.h
++++ b/dlls/d2d1/d2d1_private.h
+@@ -53,6 +53,7 @@ enum d2d_shape_type
+     D2D_SHAPE_TYPE_ARC_OUTLINE,
+     D2D_SHAPE_TYPE_TRIANGLE,
+     D2D_SHAPE_TYPE_CURVE,
++    D2D_SHAPE_TYPE_SPRITE,
+     D2D_SHAPE_TYPE_COUNT,
+ };
+ 
+@@ -407,6 +408,7 @@ struct d2d_brush
+             D2D1_EXTEND_MODE extend_mode_x;
+             D2D1_EXTEND_MODE extend_mode_y;
+             D2D1_INTERPOLATION_MODE interpolation_mode;
++            BOOL texcoords; /* sampled at the vertices' texture coordinates */
+         } bitmap;
+         struct
+         {
+@@ -503,6 +505,8 @@ struct d2d_bitmap
+     float dpi_x;
+     float dpi_y;
+     D2D1_BITMAP_OPTIONS options;
++    /* A context whose batched draws read this bitmap. */
++    struct d2d_device_context *batch_context;
+ };
+ 
+ HRESULT d2d_bitmap_create(struct d2d_device_context *context, D2D1_SIZE_U size, const void *src_data,
+@@ -1041,6 +1045,7 @@ void d2d_command_list_push_layer(struct d2d_command_list *command_list, const st
+ void d2d_command_list_pop_layer(struct d2d_command_list *command_list);
+ 
+ void d2d_device_context_flush_draws(struct d2d_device_context *context);
++void d2d_bitmap_flush_draws(struct d2d_bitmap *bitmap);
+ 
+ static inline BOOL d2d_array_reserve(void **elements, size_t *capacity, size_t count, size_t size)
+ {
+diff --git a/dlls/d2d1/device.c b/dlls/d2d1/device.c
+index 276ca93..a7aa42f 100644
+--- a/dlls/d2d1/device.c
++++ b/dlls/d2d1/device.c
+@@ -523,6 +523,9 @@ void d2d_device_context_flush_draws(struct d2d_device_context *render_target)
+     render_target->ps_cb_offset = ps_cb_offset;
+     render_target->vs_cb_pending = vs_cb_pending;
+ 
++    if (batch->shape_type == D2D_SHAPE_TYPE_SPRITE
++            && batch->brush->u.bitmap.bitmap->batch_context == render_target)
++        batch->brush->u.bitmap.bitmap->batch_context = NULL;
+     ID2D1Brush_Release(&batch->brush->ID2D1Brush_iface);
+     batch->brush = NULL;
+     batch->active = FALSE;
+@@ -1367,11 +1370,11 @@ static HRESULT d2d_device_context_update_ps_cb(struct d2d_device_context *contex
+     return hr;
+ }
+ 
+-static HRESULT d2d_device_context_update_vs_cb(struct d2d_device_context *context,
+-        const D2D_MATRIX_3X2_F *geometry_transform, float stroke_width, float miter_limit, float turn_extension)
++static HRESULT d2d_device_context_set_vs_cb(struct d2d_device_context *context,
++        const D2D_MATRIX_3X2_F *geometry_transform, const D2D1_MATRIX_3X2_F *w, float stroke_width,
++        float miter_limit, float turn_extension)
+ {
+     struct d2d_vs_cb new_data, *cb_data = &new_data;
+-    const D2D1_MATRIX_3X2_F *w;
+     float tmp_x, tmp_y;
+ 
+     cb_data->transform_geometry._11 = geometry_transform->_11;
+@@ -1383,8 +1386,6 @@ static HRESULT d2d_device_context_update_vs_cb(struct d2d_device_context *contex
+     cb_data->transform_geometry._32 = geometry_transform->_32;
+     cb_data->transform_geometry.stroke_width = stroke_width;
+ 
+-    w = &context->drawing_state.transform;
+-
+     tmp_x = context->desc.dpiX / 96.0f;
+     cb_data->transform_rtx.x = w->_11 * tmp_x;
+     cb_data->transform_rtx.y = w->_21 * tmp_x;
+@@ -1412,6 +1413,13 @@ static HRESULT d2d_device_context_update_vs_cb(struct d2d_device_context *contex
+     return S_OK;
+ }
+ 
++static HRESULT d2d_device_context_update_vs_cb(struct d2d_device_context *context,
++        const D2D_MATRIX_3X2_F *geometry_transform, float stroke_width, float miter_limit, float turn_extension)
++{
++    return d2d_device_context_set_vs_cb(context, geometry_transform, &context->drawing_state.transform,
++            stroke_width, miter_limit, turn_extension);
++}
++
+ static ID3D11Buffer *d2d_outline_create_buffer(ID3D11Device1 *device, const void *data, size_t size, UINT bind)
+ {
+     D3D11_SUBRESOURCE_DATA init = {.pSysMem = data};
+@@ -1693,6 +1701,139 @@ static void STDMETHODCALLTYPE d2d_device_context_FillOpacityMask(ID2D1DeviceCont
+         d2d_command_list_fill_opacity_mask(context->target.command_list, context, mask, brush, dst_rect, src_rect);
+ }
+ 
++struct d2d_sprite_vertex
++{
++    D2D1_POINT_2F position;
++    D2D1_POINT_2F texcoord;
++};
++
++/* Draw what is batched from this bitmap before it changes. */
++void d2d_bitmap_flush_draws(struct d2d_bitmap *bitmap)
++{
++    struct d2d_device_context *context;
++
++    if (!(context = bitmap->batch_context))
++        return;
++    if (context->cs)
++        EnterCriticalSection(context->cs);
++    d2d_device_context_flush_draws(context);
++    if (context->cs)
++        LeaveCriticalSection(context->cs);
++}
++
++/* Add a bitmap to the draw batch. Affinity draws one bitmap per node of the
++ * path being edited, each with its own transform: tens of thousands a frame
++ * on a dense path, and drawn one by one each cost a constant buffer update, a
++ * vertex upload and a draw. Consecutive bitmaps with the same bitmap,
++ * interpolation mode and opacity are drawn together instead: the vertices are
++ * transformed here and carry their texture coordinates, so the constants are
++ * the same for all of them. */
++static BOOL d2d_device_context_batch_bitmap(struct d2d_device_context *context, ID2D1Bitmap *bitmap,
++        const D2D1_RECT_F *s, const D2D1_RECT_F *d, float opacity, D2D1_INTERPOLATION_MODE interpolation_mode)
++{
++    static const D2D1_MATRIX_3X2_F identity = {{{1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f}}};
++    static const WORD faces[] = {1, 2, 0, 0, 2, 3};
++    struct d2d_bitmap *bitmap_impl = unsafe_impl_from_ID2D1Bitmap(bitmap);
++    const D2D1_MATRIX_3X2_F *w = &context->drawing_state.transform;
++    struct d2d_draw_batch *batch = &context->draw_batch;
++    D2D1_BITMAP_BRUSH_PROPERTIES1 bitmap_brush_desc;
++    D2D1_BRUSH_PROPERTIES brush_desc;
++    struct d2d_sprite_vertex *v;
++    float l, t, r, b, u0, v0, u1, v1;
++    struct d2d_brush *brush;
++    D2D1_SIZE_F size;
++    unsigned int i;
++    WORD *idx;
++    BOOL ret = FALSE;
++
++    if (!d2d_draw_batching() || context->target.type == D2D_TARGET_COMMAND_LIST)
++        return FALSE;
++
++    if (context->cs)
++        EnterCriticalSection(context->cs);
++
++    if (batch->active && (batch->shape_type != D2D_SHAPE_TYPE_SPRITE
++            || batch->brush->u.bitmap.bitmap != bitmap_impl
++            || batch->brush->u.bitmap.interpolation_mode != interpolation_mode
++            || batch->brush->opacity != opacity || batch->vertex_count + 4 > 0x10000))
++        d2d_device_context_flush_draws(context);
++
++    if (!batch->active)
++    {
++        if (bitmap_impl->batch_context && bitmap_impl->batch_context != context)
++            d2d_bitmap_flush_draws(bitmap_impl);
++
++        bitmap_brush_desc.extendModeX = D2D1_EXTEND_MODE_CLAMP;
++        bitmap_brush_desc.extendModeY = D2D1_EXTEND_MODE_CLAMP;
++        bitmap_brush_desc.interpolationMode = interpolation_mode;
++        brush_desc.opacity = opacity;
++        brush_desc.transform = identity;
++        if (FAILED(d2d_bitmap_brush_create(context->factory, bitmap, &bitmap_brush_desc, &brush_desc, &brush)))
++            goto done;
++        brush->u.bitmap.texcoords = TRUE;
++
++        if (FAILED(d2d_device_context_set_vs_cb(context, &identity, &identity, 0.0f, D2D_DEFAULT_MITER_LIMIT, 0.0f))
++                || FAILED(d2d_device_context_update_ps_cb(context, brush, NULL, FALSE, FALSE)))
++        {
++            ID2D1Brush_Release(&brush->ID2D1Brush_iface);
++            goto done;
++        }
++
++        batch->active = TRUE;
++        batch->shape_type = D2D_SHAPE_TYPE_SPRITE;
++        batch->brush = brush;
++        batch->vb_stride = sizeof(*v);
++        batch->vs_cb_offset = context->vs_cb_offset;
++        batch->ps_cb_offset = context->ps_cb_offset;
++        batch->index_count = 0;
++        batch->vertex_count = 0;
++        bitmap_impl->batch_context = context;
++    }
++
++    if (!d2d_array_reserve((void **)&batch->indices, &batch->indices_size,
++            batch->index_count + 6, sizeof(*batch->indices))
++            || !d2d_array_reserve((void **)&batch->vertices, &batch->vertices_size,
++            (batch->vertex_count + 4) * sizeof(*v), 1))
++    {
++        d2d_device_context_flush_draws(context);
++        goto done;
++    }
++
++    /* As the bitmap brush draw_bitmap() uses: the rectangle's top left corner
++     * shows the source rectangle's, whichever way round either is given. */
++    size = ID2D1Bitmap_GetSize(bitmap);
++    l = min(d->left, d->right);
++    r = max(d->left, d->right);
++    t = min(d->top, d->bottom);
++    b = max(d->top, d->bottom);
++    u0 = s->left / size.width;
++    u1 = s->right / size.width;
++    v0 = s->top / size.height;
++    v1 = s->bottom / size.height;
++
++    v = (struct d2d_sprite_vertex *)(batch->vertices + batch->vertex_count * sizeof(*v));
++    d2d_point_transform(&v[0].position, w, l, t);
++    d2d_point_set(&v[0].texcoord, u0, v0);
++    d2d_point_transform(&v[1].position, w, l, b);
++    d2d_point_set(&v[1].texcoord, u0, v1);
++    d2d_point_transform(&v[2].position, w, r, b);
++    d2d_point_set(&v[2].texcoord, u1, v1);
++    d2d_point_transform(&v[3].position, w, r, t);
++    d2d_point_set(&v[3].texcoord, u1, v0);
++
++    idx = batch->indices + batch->index_count;
++    for (i = 0; i < ARRAY_SIZE(faces); ++i)
++        idx[i] = batch->vertex_count + faces[i];
++    batch->index_count += 6;
++    batch->vertex_count += 4;
++    ret = TRUE;
++
++done:
++    if (context->cs)
++        LeaveCriticalSection(context->cs);
++    return ret;
++}
++
+ static void d2d_device_context_draw_bitmap(struct d2d_device_context *context, ID2D1Bitmap *bitmap,
+         const D2D1_RECT_F *dst_rect, float opacity, D2D1_INTERPOLATION_MODE interpolation_mode,
+         const D2D1_RECT_F *src_rect, const D2D1_POINT_2F *offset,
+@@ -1739,6 +1880,10 @@ static void d2d_device_context_draw_bitmap(struct d2d_device_context *context, I
+         d.bottom += offset->y;
+     }
+ 
++    if (!perspective_transform && d2d_device_context_batch_bitmap(context, bitmap, &s, &d,
++            opacity, interpolation_mode))
++        return;
++
+     bitmap_brush_desc.extendModeX = D2D1_EXTEND_MODE_CLAMP;
+     bitmap_brush_desc.extendModeY = D2D1_EXTEND_MODE_CLAMP;
+     bitmap_brush_desc.interpolationMode = interpolation_mode;
+@@ -4287,6 +4432,11 @@ static const D3D11_INPUT_ELEMENT_DESC shape_il_desc_curve[] =
+     {"POSITION", 0, DXGI_FORMAT_R32G32_FLOAT,    0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
+     {"TEXCOORD", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 8, D3D11_INPUT_PER_VERTEX_DATA, 0},
+ };
++static const D3D11_INPUT_ELEMENT_DESC shape_il_desc_sprite[] =
++{
++    {"POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
++    {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 8, D3D11_INPUT_PER_VERTEX_DATA, 0},
++};
+ static const char shape_vs_code_outline[] =
+     "float3x2 transform_geometry;\n"
+     "float stroke_width;\n"
+@@ -4540,6 +4690,31 @@ static const char shape_vs_code_curve[] =
+     "            * float2(transform_rtx.w, transform_rty.w);\n"
+     "    o.position = float4(position + float2(-1.0f, 1.0f), 0.0f, 1.0f);\n"
+     "}\n";
++/* Bitmaps batched by d2d_device_context_batch_bitmap(): the position is
++ * already transformed, and the bitmap brush samples at the world position,
++ * which is set to the texture coordinates. */
++static const char shape_vs_code_sprite[] =
++    "float3x2 transform_geometry;\n"
++    "float4 transform_rtx;\n"
++    "float4 transform_rty;\n"
++    "\n"
++    "struct output\n"
++    "{\n"
++    "    float2 p : WORLD_POSITION;\n"
++    "    float4 b : BEZIER;\n"
++    "    nointerpolation float2x2 stroke_transform : STROKE_TRANSFORM;\n"
++    "    float4 position : SV_POSITION;\n"
++    "};\n"
++    "\n"
++    "void main(float2 position : POSITION, float2 texcoord : TEXCOORD0, out struct output o)\n"
++    "{\n"
++    "    o.p = texcoord;\n"
++    "    o.b = float4(1.0, 0.0, 1.0, 1.0);\n"
++    "    o.stroke_transform = float2x2(1.0, 0.0, 0.0, 1.0);\n"
++    "    position = mul(float2x3(transform_rtx.xyz, transform_rty.xyz), float3(position, 1.0f))\n"
++    "            * float2(transform_rtx.w, transform_rty.w);\n"
++    "    o.position = float4(position + float2(-1.0f, 1.0f), 0.0f, 1.0f);\n"
++    "}\n";
+ static const char shape_ps_code[] =
+     "#define BRUSH_TYPE_SOLID    0\n"
+     "#define BRUSH_TYPE_LINEAR   1\n"
+@@ -4764,6 +4939,8 @@ shape_info[] =
+      "triangle",                    shape_vs_code_triangle,       sizeof(shape_vs_code_triangle) - 1},
+     {D2D_SHAPE_TYPE_CURVE,          shape_il_desc_curve,          ARRAY_SIZE(shape_il_desc_curve),
+      "curve",                       shape_vs_code_curve,          sizeof(shape_vs_code_curve) - 1},
++    {D2D_SHAPE_TYPE_SPRITE,         shape_il_desc_sprite,         ARRAY_SIZE(shape_il_desc_sprite),
++     "sprite",                      shape_vs_code_sprite,         sizeof(shape_vs_code_sprite) - 1},
+ };
+ 
+ static HRESULT d2d_device_context_init(struct d2d_device_context *render_target,
+-- 
+2.55.0
+
