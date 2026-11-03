@@ -1,0 +1,51 @@
+From 3998d3fd9027308519bff44e543c4fd0b4ecf9ff Mon Sep 17 00:00:00 2001
+From: jfacemyer <1776340+jfacemyer@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 22:04:16 -0500
+Subject: [PATCH] win32u: Let the present worker go with the process.
+
+The worker that copies presents to offscreen surfaces never returns
+from the unix call that runs it. At process exit Wine stops each thread
+with SIGQUIT and pthread_exit(), and the forced unwind of this thread's
+stack faults past that call: "nested exception on signal stack", and
+the process dies with SIGSEGV (a core dump, and exit code 1 or 139)
+instead of its own exit code. Affinity's setup window and the d3d11
+tests did this on every exit once a swapchain had been used.
+
+The worker holds nothing at exit, so it blocks SIGQUIT and ends with
+the process.
+---
+ dlls/win32u/vulkan.c | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
+index 56c2f65..0495ed2 100644
+--- a/dlls/win32u/vulkan.c
++++ b/dlls/win32u/vulkan.c
+@@ -26,6 +26,7 @@
+ 
+ #include <dlfcn.h>
+ #include <pthread.h>
++#include <signal.h>
+ #include <unistd.h>
+ 
+ #include "ntstatus.h"
+@@ -2073,6 +2074,16 @@ static BOOL present_worker_running;
+ 
+ static void win32u_present_worker(void)
+ {
++    sigset_t quit;
++
++    /* This thread never returns from the unix call that runs it. At process exit Wine stops each
++     * thread with SIGQUIT and pthread_exit(), whose unwind of this stack faults past that call: the
++     * process then dies with SIGSEGV instead of its exit code. Nothing here needs cleaning up, so
++     * leave the thread to go with the process. */
++    sigemptyset( &quit );
++    sigaddset( &quit, SIGQUIT );
++    pthread_sigmask( SIG_BLOCK, &quit, NULL );
++
+     pthread_mutex_lock( &present_worker_lock );
+     present_worker_running = TRUE;
+     for (;;)
+-- 
+2.55.0
+
