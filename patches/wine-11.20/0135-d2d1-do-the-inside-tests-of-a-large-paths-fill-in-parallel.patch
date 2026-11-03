@@ -1,0 +1,370 @@
+From c88b6eb8c4e8240c44478abe9e35fc0c2d72f2b2 Mon Sep 17 00:00:00 2001
+From: jfacemyer <1776340+jfacemyer@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 00:28:13 -0500
+Subject: [PATCH 3/8] d2d1: Do the inside tests of a large path's fill in
+ parallel.
+
+Close() tests a probe point of every face of the triangulation, and every
+bezier control point, against the path. For a path of 138,000 curves
+those 900,000 tests took 0.3 s, all on one thread; they only read the
+path and its probe edges, and the answers do not depend on each other,
+so they now run on up to 16 threads. Faces are still added, and vertices
+inserted, one by one in the original order, so the fill is the same.
+
+Sorting the probe edges, bucket by bucket, is done in parallel too.
+
+Paths under 8,192 faces or control points do everything on the calling
+thread, as before. On a 32-thread machine, Close() of that path went from
+1.2 s to 0.85 s.
+---
+ dlls/d2d1/geometry.c | 266 ++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 261 insertions(+), 5 deletions(-)
+
+diff --git a/dlls/d2d1/geometry.c b/dlls/d2d1/geometry.c
+index 8cfe75e..1524669 100644
+--- a/dlls/d2d1/geometry.c
++++ b/dlls/d2d1/geometry.c
+@@ -981,6 +981,8 @@ struct d2d_box_grid
+ /* Below this many boxes a query simply returns every box before the limit:
+  * setting up the grid costs more than the pair tests it saves. */
+ #define D2D_BOX_GRID_MIN_COUNT 256
++/* Below this many faces or control points, threads cost more than they save. */
++#define D2D_PARALLEL_MIN_COUNT 8192
+ 
+ static BOOL d2d_box_is_finite(const D2D_RECT_F *b)
+ {
+@@ -2629,6 +2631,74 @@ static void d2d_probe_edge_set(struct d2d_probe_edge *e, const D2D1_POINT_2F *p0
+     e->bounds = bounds;
+ }
+ 
++/* Runs fn over [0, count) in slices on up to 16 threads, the calling thread
++ * among them; on the calling thread alone when count is under twice
++ * min_slice. fn may only read shared data, and write to its own slice. */
++struct d2d_parallel_slice
++{
++    void (*fn)(void *ctx, size_t begin, size_t end);
++    void *ctx;
++    size_t begin, end;
++#ifdef __i386__
++    unsigned int control_word;
++#endif
++};
++
++static DWORD WINAPI d2d_parallel_proc(void *arg)
++{
++    struct d2d_parallel_slice *slice = arg;
++
++#ifdef __i386__
++    _controlfp(slice->control_word, _MCW_PC | _MCW_RC);
++#endif
++    slice->fn(slice->ctx, slice->begin, slice->end);
++    return 0;
++}
++
++static void d2d_parallel_for(size_t count, size_t min_slice,
++        void (*fn)(void *ctx, size_t begin, size_t end), void *ctx)
++{
++    static LONG cpu_count;
++    struct d2d_parallel_slice slices[16];
++    HANDLE threads[ARRAY_SIZE(slices)];
++    unsigned int n, i, started = 0;
++    LONG cpus;
++
++    if (!(cpus = ReadNoFence(&cpu_count)))
++    {
++        SYSTEM_INFO info;
++
++        GetSystemInfo(&info);
++        WriteNoFence(&cpu_count, cpus = max(1, info.dwNumberOfProcessors));
++    }
++    if ((n = min(min(cpus, ARRAY_SIZE(slices)), count / max(min_slice, 1))) < 2)
++    {
++        fn(ctx, 0, count);
++        return;
++    }
++    for (i = 0; i < n; ++i)
++    {
++        slices[i].fn = fn;
++        slices[i].ctx = ctx;
++        slices[i].begin = count * i / n;
++        slices[i].end = count * (i + 1) / n;
++#ifdef __i386__
++        slices[i].control_word = _controlfp(0, 0);
++#endif
++    }
++    for (i = 1; i < n; ++i)
++    {
++        if ((threads[started] = CreateThread(NULL, 0, d2d_parallel_proc, &slices[i], 0, NULL)))
++            ++started;
++        else
++            fn(ctx, slices[i].begin, slices[i].end);
++    }
++    fn(ctx, slices[0].begin, slices[0].end);
++    WaitForMultipleObjects(started, threads, TRUE, INFINITE);
++    for (i = 0; i < started; ++i)
++        CloseHandle(threads[i]);
++}
++
+ static float d2d_probe_edge_right(const struct d2d_probe_edge *e)
+ {
+     return max(e->p0.x, e->p1.x);
+@@ -2649,6 +2719,15 @@ static int __cdecl d2d_probe_edge_compare(const void *a, const void *b)
+  * figures array is not reallocated and no vertex the walk uses changes:
+  * inserting D2D_VERTEX_TYPE_NONE vertices is fine when "triangles_only" is
+  * not set. */
++static void d2d_probe_edges_sort_slice(void *ctx, size_t begin, size_t end)
++{
++    struct d2d_probe_edges *pe = ctx;
++    size_t b;
++
++    for (b = begin; b < end; ++b)
++        qsort(&pe->edges[pe->starts[b]], pe->starts[b + 1] - pe->starts[b], sizeof(*pe->edges), d2d_probe_edge_compare);
++}
++
+ static BOOL d2d_probe_edges_init(struct d2d_probe_edges *pe, const struct d2d_geometry *geometry,
+         BOOL triangles_only)
+ {
+@@ -2705,10 +2784,7 @@ static BOOL d2d_probe_edges_init(struct d2d_probe_edges *pe, const struct d2d_ge
+     /* Rightmost edges first, so a probe can stop at the first edge that lies
+      * wholly to its left. Not worth it for a few edges. */
+     if ((pe->sorted = edge_count >= D2D_BOX_GRID_MIN_COUNT))
+-    {
+-        for (b = 0; b < pe->bucket_count; ++b)
+-            qsort(&pe->edges[pe->starts[b]], pe->starts[b + 1] - pe->starts[b], sizeof(*pe->edges), d2d_probe_edge_compare);
+-    }
++        d2d_parallel_for(pe->bucket_count, 256, d2d_probe_edges_sort_slice, pe);
+ 
+     return TRUE;
+ }
+@@ -2813,11 +2889,127 @@ static BOOL d2d_path_geometry_add_fill_face(struct d2d_geometry *geometry, const
+     return TRUE;
+ }
+ 
++struct d2d_face_candidate
++{
++    struct d2d_face face;
++    D2D1_POINT_2F probe;
++};
++
++struct d2d_face_inside_ctx
++{
++    const struct d2d_cdt *cdt;
++    const struct d2d_geometry *geometry;
++    const struct d2d_face_candidate *candidates;
++    BOOL *inside;
++};
++
++static void d2d_face_inside_slice(void *arg, size_t begin, size_t end)
++{
++    struct d2d_face_inside_ctx *ctx = arg;
++    size_t i;
++
++    for (i = begin; i < end; ++i)
++        ctx->inside[i] = ctx->cdt->probe_edges
++                ? d2d_probe_edges_point_inside(ctx->cdt->probe_edges, ctx->geometry, &ctx->candidates[i].probe)
++                : d2d_path_geometry_point_inside(ctx->geometry, &ctx->candidates[i].probe, TRUE);
++}
++
++/* d2d_path_geometry_add_fill_face() for every face, with the inside tests,
++ * most of the work, run in parallel. The faces are the same, in the same
++ * order. */
++static BOOL d2d_cdt_generate_faces_parallel(const struct d2d_cdt *cdt, struct d2d_geometry *geometry)
++{
++    size_t i, k, candidate_count = 0, inside_count = 0, max_candidates = 2 * cdt->edge_count / 3 + 2;
++    struct d2d_face_candidate *candidates, *c;
++    struct d2d_cdt_edge_ref base_edge, tmp;
++    struct d2d_face_inside_ctx ctx;
++    BOOL *inside;
++
++    /* Each face is found from one of the two sides of three edges. */
++    if (!(candidates = malloc(max_candidates * sizeof(*candidates))))
++        return FALSE;
++    for (i = 0; i < cdt->edge_count; ++i)
++    {
++        if (cdt->edges[i].flags & D2D_CDT_EDGE_FLAG_FREED)
++            continue;
++        for (k = 0; k < 2; ++k)
++        {
++            base_edge.idx = i;
++            base_edge.r = k ? D2D_EDGE_NEXT_SYM : D2D_EDGE_NEXT_ORIGIN;
++            if (cdt->edges[i].flags & D2D_CDT_EDGE_FLAG_VISITED(base_edge.r))
++                continue;
++            if (candidate_count == max_candidates)
++            {
++                free(candidates);
++                return FALSE;
++            }
++            c = &candidates[candidate_count];
++
++            tmp = base_edge;
++            cdt->edges[tmp.idx].flags |= D2D_CDT_EDGE_FLAG_VISITED(tmp.r);
++            c->face.v[0] = d2d_cdt_edge_origin(cdt, &tmp);
++            c->probe.x = cdt->vertices[c->face.v[0]].x * 0.25f;
++            c->probe.y = cdt->vertices[c->face.v[0]].y * 0.25f;
++
++            d2d_cdt_edge_next_left(cdt, &tmp, &tmp);
++            cdt->edges[tmp.idx].flags |= D2D_CDT_EDGE_FLAG_VISITED(tmp.r);
++            c->face.v[1] = d2d_cdt_edge_origin(cdt, &tmp);
++            c->probe.x += cdt->vertices[c->face.v[1]].x * 0.25f;
++            c->probe.y += cdt->vertices[c->face.v[1]].y * 0.25f;
++
++            d2d_cdt_edge_next_left(cdt, &tmp, &tmp);
++            cdt->edges[tmp.idx].flags |= D2D_CDT_EDGE_FLAG_VISITED(tmp.r);
++            c->face.v[2] = d2d_cdt_edge_origin(cdt, &tmp);
++            c->probe.x += cdt->vertices[c->face.v[2]].x * 0.50f;
++            c->probe.y += cdt->vertices[c->face.v[2]].y * 0.50f;
++
++            if (d2d_cdt_leftof(cdt, c->face.v[2], &base_edge))
++                ++candidate_count;
++        }
++    }
++
++    if (!(inside = malloc(max(candidate_count, 1) * sizeof(*inside))))
++    {
++        free(candidates);
++        return FALSE;
++    }
++    ctx.cdt = cdt;
++    ctx.geometry = geometry;
++    ctx.candidates = candidates;
++    ctx.inside = inside;
++    d2d_parallel_for(candidate_count, 4096, d2d_face_inside_slice, &ctx);
++
++    for (i = 0; i < candidate_count; ++i)
++        inside_count += !!inside[i];
++    if (!d2d_array_reserve((void **)&geometry->fill.faces, &geometry->fill.faces_size,
++            geometry->fill.face_count + inside_count, sizeof(*geometry->fill.faces)))
++    {
++        free(inside);
++        free(candidates);
++        return FALSE;
++    }
++    for (i = 0; i < candidate_count; ++i)
++    {
++        if (inside[i])
++            geometry->fill.faces[geometry->fill.face_count++] = candidates[i].face;
++    }
++    free(inside);
++    free(candidates);
++    return TRUE;
++}
++
+ static BOOL d2d_cdt_generate_faces(const struct d2d_cdt *cdt, struct d2d_geometry *geometry)
+ {
+     struct d2d_cdt_edge_ref base_edge;
+     size_t i;
+ 
++    if (cdt->edge_count >= 3 * D2D_PARALLEL_MIN_COUNT)
++    {
++        if (d2d_cdt_generate_faces_parallel(cdt, geometry))
++            return TRUE;
++        goto fail;
++    }
++
+     for (i = 0; i < cdt->edge_count; ++i)
+     {
+         if (cdt->edges[i].flags & D2D_CDT_EDGE_FLAG_FREED)
+@@ -4673,6 +4865,64 @@ static size_t d2d_resolve_candidates(struct d2d_box_grid *grid, const struct d2d
+     return n;
+ }
+ 
++struct d2d_controls_inside_ctx
++{
++    const struct d2d_geometry *geometry;
++    const struct d2d_probe_edges *probe_edges;
++    const D2D1_POINT_2F *points;
++    BOOL *inside;
++};
++
++static void d2d_controls_inside_slice(void *arg, size_t begin, size_t end)
++{
++    struct d2d_controls_inside_ctx *ctx = arg;
++    size_t i;
++
++    for (i = begin; i < end; ++i)
++        ctx->inside[i] = d2d_probe_edges_point_inside(ctx->probe_edges, ctx->geometry, &ctx->points[i]);
++}
++
++/* Whether each of the count bezier control points, in segment order, is
++ * inside the path, found in parallel. NULL when there are not count of them,
++ * or memory runs out. */
++static BOOL *d2d_geometry_controls_inside(struct d2d_geometry *geometry,
++        const struct d2d_probe_edges *probe_edges, size_t count)
++{
++    struct d2d_controls_inside_ctx ctx;
++    struct d2d_segment_idx idx;
++    D2D1_POINT_2F *points;
++    BOOL *inside;
++    size_t n = 0;
++
++    if (!(points = malloc(count * sizeof(*points))))
++        return NULL;
++    if (!(inside = malloc(count * sizeof(*inside))))
++    {
++        free(points);
++        return NULL;
++    }
++    d2d_geometry_get_first_bezier_segment_idx(geometry, &idx);
++    do
++    {
++        if (n == count)
++            break;
++        points[n++] = geometry->u.path.figures[idx.figure_idx].bezier_controls[idx.control_idx];
++    } while (d2d_geometry_get_next_bezier_segment_idx(geometry, &idx));
++    if (n != count)
++    {
++        free(points);
++        free(inside);
++        return NULL;
++    }
++    ctx.geometry = geometry;
++    ctx.probe_edges = probe_edges;
++    ctx.points = points;
++    ctx.inside = inside;
++    d2d_parallel_for(count, 4096, d2d_controls_inside_slice, &ctx);
++    free(points);
++    return inside;
++}
++
+ static HRESULT d2d_geometry_resolve_beziers(struct d2d_geometry *geometry)
+ {
+     float margin = d2d_geometry_get_box_margin(geometry);
+@@ -4685,6 +4935,7 @@ static HRESULT d2d_geometry_resolve_beziers(struct d2d_geometry *geometry)
+     const D2D1_POINT_2F *p[3];
+     struct d2d_figure *figure;
+     size_t bezier_idx, i;
++    BOOL *inside = NULL;
+ 
+     if (!d2d_geometry_get_first_bezier_segment_idx(geometry, &idx_p))
+         return S_OK;
+@@ -4844,6 +5095,10 @@ oom:
+     /* Inserting control points below adds only D2D_VERTEX_TYPE_NONE vertices,
+      * which the probe edges do not use. */
+     have_probe_edges = d2d_probe_edges_init(&probe_edges, geometry, FALSE);
++    /* The vertices inserted below do not change the answers: they are all
++     * of type D2D_VERTEX_TYPE_NONE. */
++    if (have_probe_edges && geometry->fill.bezier_vertex_count / 3 >= D2D_PARALLEL_MIN_COUNT)
++        inside = d2d_geometry_controls_inside(geometry, &probe_edges, geometry->fill.bezier_vertex_count / 3);
+     bezier_idx = 0;
+     d2d_geometry_get_first_bezier_segment_idx(geometry, &idx_p);
+     for (;;)
+@@ -4855,7 +5110,7 @@ oom:
+         p[1] = &figure->bezier_controls[idx_p.control_idx];
+ 
+         i = idx_p.vertex_idx + 1;
+-        if (have_probe_edges ? d2d_probe_edges_point_inside(&probe_edges, geometry, p[1])
++        if (inside ? inside[bezier_idx] : have_probe_edges ? d2d_probe_edges_point_inside(&probe_edges, geometry, p[1])
+                 : d2d_path_geometry_point_inside(geometry, p[1], FALSE))
+         {
+             sign = 1.0f;
+@@ -4881,6 +5136,7 @@ oom:
+ 
+     if (have_probe_edges)
+         d2d_probe_edges_cleanup(&probe_edges);
++    free(inside);
+     return S_OK;
+ }
+ 
+-- 
+2.55.0
+

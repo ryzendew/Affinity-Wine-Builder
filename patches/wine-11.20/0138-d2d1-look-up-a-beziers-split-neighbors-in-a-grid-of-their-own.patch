@@ -1,0 +1,216 @@
+From 34896449d7a4e053843ee51c5074c769e72816f5 Mon Sep 17 00:00:00 2001
+From: jfacemyer <1776340+jfacemyer@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 00:29:11 -0500
+Subject: [PATCH 6/8] d2d1: Look up a bezier's split neighbors in a grid of
+ their own.
+
+Beziers that Close() splits off are not in the candidate grid, so every
+candidate query took all of them. For a path of 138,000 curves with 259
+splits, that made 27.9 million pairs to check, of which 175,000 were
+close enough to matter. The split-off beziers now have a small grid of
+their own, rebuilt after each split, and a query takes only those near
+it: 1.1 million pairs, and the bezier split pass went from 0.2 to 0.1 s.
+The pairs left out are ones the pass skipped as apart, so the splits are
+the same.
+---
+ dlls/d2d1/geometry.c | 153 +++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 147 insertions(+), 6 deletions(-)
+
+diff --git a/dlls/d2d1/geometry.c b/dlls/d2d1/geometry.c
+index c7d2149..6045190 100644
+--- a/dlls/d2d1/geometry.c
++++ b/dlls/d2d1/geometry.c
+@@ -4802,13 +4802,150 @@ static size_t d2d_bezier_list_find(const struct d2d_bezier_ref *list, size_t cou
+ /* Where the splits put new beziers in the list, so a grid built before them
+  * can still be used: each split inserts one bezier right after the one it
+  * split, and every bezier after that moves up by one. */
++#define D2D_SPLIT_GRID 32
++
+ struct d2d_split_positions
+ {
+     size_t pos[512];
+     size_t threshold[512];
+     size_t count;
++
++    /* A small grid of the inserted beziers' boxes, so that a candidate query
++     * takes only the inserted beziers near it, not all of them; rebuilt
++     * after each split, while there are at most 512. */
++    BOOL stale;
++    float x0, y0, sx, sy;
++    unsigned short cell_start[D2D_SPLIT_GRID * D2D_SPLIT_GRID + 1];
++    unsigned short items[512 * 16];
++    unsigned short anywhere[512];
++    size_t anywhere_count;
++    unsigned int stamp[512], query_id;
+ };
+ 
++static void d2d_split_grid_cells(const struct d2d_split_positions *s, const D2D_RECT_F *box, float margin,
++        unsigned int *x0, unsigned int *y0, unsigned int *x1, unsigned int *y1)
++{
++    float l = (box->left - margin - s->x0) * s->sx, r = (box->right + margin - s->x0) * s->sx;
++    float t = (box->top - margin - s->y0) * s->sy, b = (box->bottom + margin - s->y0) * s->sy;
++
++    *x0 = l <= 0.0f ? 0 : l >= D2D_SPLIT_GRID - 1 ? D2D_SPLIT_GRID - 1 : (unsigned int)l;
++    *x1 = r <= 0.0f ? 0 : r >= D2D_SPLIT_GRID - 1 ? D2D_SPLIT_GRID - 1 : (unsigned int)r;
++    *y0 = t <= 0.0f ? 0 : t >= D2D_SPLIT_GRID - 1 ? D2D_SPLIT_GRID - 1 : (unsigned int)t;
++    *y1 = b <= 0.0f ? 0 : b >= D2D_SPLIT_GRID - 1 ? D2D_SPLIT_GRID - 1 : (unsigned int)b;
++}
++
++static void d2d_split_grid_build(struct d2d_split_positions *s, const struct d2d_bezier_ref *list)
++{
++    float min_x = FLT_MAX, min_y = FLT_MAX, max_x = -FLT_MAX, max_y = -FLT_MAX;
++    unsigned int x0, y0, x1, y1, x, y;
++    unsigned short cursor[D2D_SPLIT_GRID * D2D_SPLIT_GRID];
++    BOOL far[512];
++    size_t j, total = 0;
++
++    s->stale = FALSE;
++    s->anywhere_count = 0;
++    for (j = 0; j < s->count; ++j)
++    {
++        const D2D_RECT_F *box = &list[s->pos[j]].box;
++
++        if (!d2d_box_is_finite(box))
++            continue;
++        min_x = min(min_x, box->left);
++        min_y = min(min_y, box->top);
++        max_x = max(max_x, box->right);
++        max_y = max(max_y, box->bottom);
++    }
++    s->x0 = min_x;
++    s->y0 = min_y;
++    s->sx = max_x > min_x ? D2D_SPLIT_GRID / (max_x - min_x) : 0.0f;
++    s->sy = max_y > min_y ? D2D_SPLIT_GRID / (max_y - min_y) : 0.0f;
++    if (!isfinite(s->sx))
++        s->sx = 0.0f;
++    if (!isfinite(s->sy))
++        s->sy = 0.0f;
++
++    memset(s->cell_start, 0, sizeof(s->cell_start));
++    for (j = 0; j < s->count; ++j)
++    {
++        const D2D_RECT_F *box = &list[s->pos[j]].box;
++
++        far[j] = !d2d_box_is_finite(box);
++        if (!far[j])
++        {
++            d2d_split_grid_cells(s, box, 0.0f, &x0, &y0, &x1, &y1);
++            far[j] = (x1 - x0 + 1) * (y1 - y0 + 1) > 16 || total + (x1 - x0 + 1) * (y1 - y0 + 1) > ARRAY_SIZE(s->items);
++        }
++        if (far[j])
++        {
++            s->anywhere[s->anywhere_count++] = j;
++            continue;
++        }
++        for (y = y0; y <= y1; ++y)
++            for (x = x0; x <= x1; ++x)
++                ++s->cell_start[y * D2D_SPLIT_GRID + x + 1];
++        total += (x1 - x0 + 1) * (y1 - y0 + 1);
++    }
++    for (j = 0; j < D2D_SPLIT_GRID * D2D_SPLIT_GRID; ++j)
++        s->cell_start[j + 1] += s->cell_start[j];
++    memcpy(cursor, s->cell_start, sizeof(cursor));
++    for (j = 0; j < s->count; ++j)
++    {
++        if (far[j])
++            continue;
++        d2d_split_grid_cells(s, &list[s->pos[j]].box, 0.0f, &x0, &y0, &x1, &y1);
++        for (y = y0; y <= y1; ++y)
++            for (x = x0; x <= x1; ++x)
++                s->items[cursor[y * D2D_SPLIT_GRID + x]++] = j;
++    }
++}
++
++/* The positions, in ascending order and before pi, of the inserted beziers
++ * whose boxes d2d_rect_apart() does not rule out against pi's. */
++static size_t d2d_split_grid_query(struct d2d_split_positions *s, const struct d2d_bezier_ref *list,
++        size_t pi, float margin, size_t *out)
++{
++    unsigned int x0, y0, x1, y1, x, y, id;
++    size_t i, j, k, n = 0, pos;
++
++    if (!s->count)
++        return 0;
++    if (s->stale)
++        d2d_split_grid_build(s, list);
++    if (!(id = ++s->query_id))
++    {
++        memset(s->stamp, 0, sizeof(s->stamp));
++        id = s->query_id = 1;
++    }
++
++#define D2D_SPLIT_TAKE(j_) do { j = (j_); if (s->stamp[j] != id) { s->stamp[j] = id; pos = s->pos[j]; \
++        if (pos < pi && !d2d_rect_apart(&list[pi].box, &list[pos].box, margin)) out[n++] = pos; } } while (0)
++    if (!d2d_box_is_finite(&list[pi].box))
++    {
++        for (j = 0; j < s->count; ++j)
++            if (s->pos[j] < pi)
++                out[n++] = s->pos[j];
++        return n;
++    }
++    d2d_split_grid_cells(s, &list[pi].box, 2.0f * margin, &x0, &y0, &x1, &y1);
++    for (y = y0; y <= y1; ++y)
++        for (x = x0; x <= x1; ++x)
++            for (k = s->cell_start[y * D2D_SPLIT_GRID + x]; k < s->cell_start[y * D2D_SPLIT_GRID + x + 1]; ++k)
++                D2D_SPLIT_TAKE(s->items[k]);
++    for (k = 0; k < s->anywhere_count; ++k)
++        D2D_SPLIT_TAKE(s->anywhere[k]);
++#undef D2D_SPLIT_TAKE
++
++    for (i = 1; i < n; ++i)
++    {
++        size_t v = out[i];
++
++        for (k = i; k && out[k - 1] > v; --k)
++            out[k] = out[k - 1];
++        out[k] = v;
++    }
++    return n;
++}
++
+ static void d2d_split_positions_add(struct d2d_split_positions *s, size_t x)
+ {
+     size_t j, k;
+@@ -4823,6 +4960,7 @@ static void d2d_split_positions_add(struct d2d_split_positions *s, size_t x)
+      * bezier k exactly when o >= pos[k] - k. */
+     for (k = 0; k < s->count; ++k)
+         s->threshold[k] = s->pos[k] - k;
++    s->stale = TRUE;
+ }
+ 
+ static size_t d2d_split_positions_map(const struct d2d_split_positions *s, size_t o)
+@@ -4841,10 +4979,11 @@ static size_t d2d_split_positions_map(const struct d2d_split_positions *s, size_
+ }
+ 
+ /* The beziers before "pi" that might overlap it, in list order. */
+-static size_t d2d_resolve_candidates(struct d2d_box_grid *grid, const struct d2d_split_positions *splits,
++static size_t d2d_resolve_candidates(struct d2d_box_grid *grid, struct d2d_split_positions *splits,
+         const struct d2d_bezier_ref *list, size_t pi, float margin, size_t *out, size_t *scratch)
+ {
+-    size_t n, i, j, k, m = 0;
++    size_t n, i, j, k, m = 0, near_count;
++    size_t near[512];
+ 
+     if (grid->linear)
+     {
+@@ -4860,11 +4999,13 @@ static size_t d2d_resolve_candidates(struct d2d_box_grid *grid, const struct d2d
+             break;
+         scratch[m++] = k;
+     }
+-    /* Merge in the inserted beziers; both lists are in ascending order. */
+-    for (i = 0, j = 0, n = 0; i < m || (j < splits->count && splits->pos[j] < pi);)
++    /* Merge in the inserted beziers near this one; both lists are in
++     * ascending order. */
++    near_count = d2d_split_grid_query(splits, list, pi, margin, near);
++    for (i = 0, j = 0, n = 0; i < m || j < near_count;)
+     {
+-        if (j < splits->count && splits->pos[j] < pi && (i == m || splits->pos[j] < scratch[i]))
+-            out[n++] = splits->pos[j++];
++        if (j < near_count && (i == m || near[j] < scratch[i]))
++            out[n++] = near[j++];
+         else
+             out[n++] = scratch[i++];
+     }
+-- 
+2.55.0
+

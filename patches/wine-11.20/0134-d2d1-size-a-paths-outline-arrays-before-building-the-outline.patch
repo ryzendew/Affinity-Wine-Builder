@@ -1,0 +1,105 @@
+From 1a783cab0505ccbdb5214adc080eb8bba53a131d Mon Sep 17 00:00:00 2001
+From: jfacemyer <1776340+jfacemyer@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 23:57:12 -0500
+Subject: [PATCH 2/8] d2d1: Size a path's outline arrays before building the
+ outline.
+
+The outline arrays grew as each segment and join was added, and every
+doubling copied them into new memory and faulted its pages in. For a
+path of 138,000 curves (1.8 million outline vertices) that was 70 of the
+86 ms an outline took to build; with the arrays sized once from the
+figures it takes 19 ms. Affinity builds it 6-10 times per select or
+nudge of such a path, once for each new path geometry it draws the
+selection outline with.
+
+The counts follow d2d_geometry_add_figure_outline(): four vertices and
+two faces for each line segment and join, seven bezier vertices and five
+bezier faces for each bezier segment. The outline itself is unchanged.
+---
+ dlls/d2d1/geometry.c | 63 ++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 63 insertions(+)
+
+diff --git a/dlls/d2d1/geometry.c b/dlls/d2d1/geometry.c
+index fd3603a..8cfe75e 100644
+--- a/dlls/d2d1/geometry.c
++++ b/dlls/d2d1/geometry.c
+@@ -5017,6 +5017,49 @@ static BOOL d2d_path_geometry_copy_outline_figures(struct d2d_geometry *geometry
+     return TRUE;
+ }
+ 
++/* The outline vertices and faces d2d_geometry_add_figure_outline() adds for a
++ * figure: each line segment and each join adds four vertices and two faces,
++ * each bezier segment seven bezier vertices and five bezier faces. */
++static void d2d_figure_count_outline(const struct d2d_figure *figure, BOOL closed,
++        size_t *vertices, size_t *faces, size_t *beziers, size_t *bezier_faces)
++{
++    size_t i, vertex_count;
++    enum d2d_vertex_type type;
++
++    if (!(vertex_count = figure->vertex_count))
++        return;
++    if (closed)
++    {
++        if (figure->vertex_types[vertex_count - 1] == D2D_VERTEX_TYPE_END && !--vertex_count)
++            return;
++    }
++    else if (!--vertex_count)
++    {
++        return;
++    }
++
++    for (i = 0; i < vertex_count; ++i)
++    {
++        if ((type = figure->vertex_types[i]) == D2D_VERTEX_TYPE_NONE)
++            continue;
++        if (d2d_vertex_type_is_bezier(type))
++        {
++            *beziers += 7;
++            *bezier_faces += 5;
++        }
++        else
++        {
++            *vertices += 4;
++            *faces += 2;
++        }
++        if (i || closed)
++        {
++            *vertices += 4;
++            *faces += 2;
++        }
++    }
++}
++
+ static void d2d_path_geometry_build_outline(struct d2d_geometry *geometry)
+ {
+     struct d2d_figure *figures = geometry->u.path.figures;
+@@ -5032,6 +5075,26 @@ static void d2d_path_geometry_build_outline(struct d2d_geometry *geometry)
+         --end;
+     }
+ 
++    if (figures && end > geometry->u.path.outline_built)
++    {
++        size_t vertices = geometry->outline.vertex_count, faces = geometry->outline.face_count;
++        size_t beziers = geometry->outline.bezier_count, bezier_faces = geometry->outline.bezier_face_count;
++
++        /* Sized once: growing them as they fill copied and re-faulted the
++         * arrays at every doubling, most of the time spent on a large path. */
++        for (i = geometry->u.path.outline_built; i < end; ++i)
++            d2d_figure_count_outline(&figures[i], !!(figures[i].flags & D2D_FIGURE_FLAG_CLOSED),
++                    &vertices, &faces, &beziers, &bezier_faces);
++        d2d_array_reserve((void **)&geometry->outline.vertices, &geometry->outline.vertices_size,
++                vertices, sizeof(*geometry->outline.vertices));
++        d2d_array_reserve((void **)&geometry->outline.faces, &geometry->outline.faces_size,
++                faces, sizeof(*geometry->outline.faces));
++        d2d_array_reserve((void **)&geometry->outline.beziers, &geometry->outline.beziers_size,
++                beziers, sizeof(*geometry->outline.beziers));
++        d2d_array_reserve((void **)&geometry->outline.bezier_faces, &geometry->outline.bezier_faces_size,
++                bezier_faces, sizeof(*geometry->outline.bezier_faces));
++    }
++
+     for (i = geometry->u.path.outline_built; figures && i < end; ++i)
+     {
+         if (!d2d_geometry_add_figure_outline(geometry, &figures[i], (figures[i].flags & D2D_FIGURE_FLAG_CLOSED)
+-- 
+2.55.0
+
