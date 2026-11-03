@@ -1,0 +1,78 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jfacemyer <1776340+jfacemyer@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 07:31:25 -0500
+Subject: [PATCH] wintab32: Drop the oldest packet, not the newest,
+ when a context queue overflows.
+
+On overflow AddPacketToContextQueue() discarded the incoming packet and
+flagged the last queued one, yet the caller still posted WT_PACKET with
+the discarded packet's serial number, which WTPacket() then could not
+find. An application that drains the queue slowly kept reading stale
+positions (the proximity entry point at pen-down time) while the fresh
+contact packets were thrown away, which draws a stray line.
+
+Now the oldest packet is dropped and the new one is queued with
+TPS_QUEUE_ERR set. The overflow test also catches a queue left longer
+than its size by WTQueueSizeSet(), and a zero-sized queue no longer
+writes before the start of the buffer.
+
+From neutron-wine (Nico-LaFoucate), the wintab32 part of its
+neutron-wintab patch.
+---
+ dlls/wintab32/context.c | 37 +++++++++++++++++++++----------------
+ 1 file changed, 21 insertions(+), 16 deletions(-)
+
+diff --git a/dlls/wintab32/context.c b/dlls/wintab32/context.c
+index e730477..7ee762f 100644
+--- a/dlls/wintab32/context.c
++++ b/dlls/wintab32/context.c
+@@ -232,25 +232,30 @@ LPOPENCONTEXT AddPacketToContextQueue(LPWTPACKET packet, HWND hwnd)
+ 
+             DUMPPACKET(*packet);
+ 
+-            if (tgt == ptr->QueueSize)
++            if (tgt >= ptr->QueueSize)
+             {
+-                TRACE("Queue Overflow %p\n",ptr->handle);
+-                ptr->PacketQueue[tgt-1].pkStatus |= TPS_QUEUE_ERR;
++                /* Drop the oldest packet, not this one: the caller posts WT_PACKET
++                 * with this packet's serial number, and the application must find
++                 * the newest position in the queue, not a stale one. */
++                TRACE("Queue Overflow %p, dropping the oldest packet\n",ptr->handle);
++                if (ptr->QueueSize <= 0) break;
++                tgt = ptr->QueueSize - 1;
++                memmove(ptr->PacketQueue, &ptr->PacketQueue[1], tgt * sizeof(WTPACKET));
++                ptr->PacketsQueued = tgt;
++                packet->pkStatus |= TPS_QUEUE_ERR;
+             }
+-            else
++
++            TRACE("Placed in queue %p index %i\n",ptr->handle,tgt);
++            ptr->PacketQueue[tgt] = *packet;
++            ptr->PacketsQueued++;
++
++            if (ptr->ActiveCursor != packet->pkCursor)
+             {
+-                TRACE("Placed in queue %p index %i\n",ptr->handle,tgt);
+-                ptr->PacketQueue[tgt] = *packet;
+-                ptr->PacketsQueued++;
+-
+-                if (ptr->ActiveCursor != packet->pkCursor)
+-                {
+-                    ptr->ActiveCursor = packet->pkCursor;
+-                    if (ptr->context.lcOptions & CXO_CSRMESSAGES)
+-                        TABLET_PostTabletMessage(ptr, _WT_CSRCHANGE(ptr->context.lcMsgBase),
+-                          (WPARAM)packet->pkSerialNumber, (LPARAM)ptr->handle,
+-                            FALSE);
+-                }
++                ptr->ActiveCursor = packet->pkCursor;
++                if (ptr->context.lcOptions & CXO_CSRMESSAGES)
++                    TABLET_PostTabletMessage(ptr, _WT_CSRCHANGE(ptr->context.lcMsgBase),
++                      (WPARAM)packet->pkSerialNumber, (LPARAM)ptr->handle,
++                        FALSE);
+             }
+             break;
+          }
+-- 
+2.55.0
+
