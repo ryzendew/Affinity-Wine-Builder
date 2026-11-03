@@ -1,0 +1,64 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jfacemyer <1776340+jfacemyer@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 12:53:07 -0500
+Subject: [PATCH 154/155] musl: Use the hardware square root instruction on
+ x86_64 and aarch64.
+
+The portable implementation computes the square root in integer
+arithmetic. sqrtsd/sqrtss and fsqrt round correctly, as it does, and are
+many times faster. hypot() and the inverse trigonometric functions call
+sqrt(); Affinity spends a fifth of a node drag in hypot().
+
+Results are identical for 2 million random inputs and the special values
+(zeros, subnormals, infinities, NaNs); _hypot() takes 7.1 ns instead of
+18.9 ns.
+---
+ libs/musl/src/math/sqrt.c  | 11 +++++++++++
+ libs/musl/src/math/sqrtf.c |  9 +++++++++
+ 2 files changed, 20 insertions(+)
+
+diff --git a/libs/musl/src/math/sqrt.c b/libs/musl/src/math/sqrt.c
+index beee70a..0209c49 100644
+--- a/libs/musl/src/math/sqrt.c
++++ b/libs/musl/src/math/sqrt.c
+@@ -42,6 +42,17 @@ double __cdecl sqrt(double x)
+ 		top -= 52;
+ 	}
+ 
++#if defined(__x86_64__)
++	/* The instruction rounds correctly, as the code below does, and is
++	 * many times faster: hypot() and the inverse trigonometric functions
++	 * come through here. */
++	__asm__( "sqrtsd %1, %0" : "=x" (x) : "x" (x) );
++	return x;
++#elif defined(__aarch64__)
++	__asm__( "fsqrt %d0, %d1" : "=w" (x) : "w" (x) );
++	return x;
++#endif
++
+ 	/* argument reduction:
+ 	   x = 4^e m; with integer e, and m in [1, 4)
+ 	   m: fixed point representation [2.62]
+diff --git a/libs/musl/src/math/sqrtf.c b/libs/musl/src/math/sqrtf.c
+index 45559f0..d5fa753 100644
+--- a/libs/musl/src/math/sqrtf.c
++++ b/libs/musl/src/math/sqrtf.c
+@@ -30,6 +30,15 @@ float __cdecl sqrtf(float x)
+ 		ix -= 23 << 23;
+ 	}
+ 
++#if defined(__x86_64__)
++	/* See sqrt.c. */
++	__asm__( "sqrtss %1, %0" : "=x" (x) : "x" (x) );
++	return x;
++#elif defined(__aarch64__)
++	__asm__( "fsqrt %s0, %s1" : "=w" (x) : "w" (x) );
++	return x;
++#endif
++
+ 	/* x = 4^e m; with int e and m in [1, 4).  */
+ 	even = ix & 0x00800000;
+ 	m1 = (ix << 8) | 0x80000000;
+-- 
+2.55.0
+
