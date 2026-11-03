@@ -1,0 +1,206 @@
+server: Keep a window's painting off the windows of other processes inside it.
+
+A window of another process draws straight to the X window of its
+toplevel, not into the owner's surface, so whatever the owner paints
+there only covers it. Affinity's Help panel showed it: the WebView2 page
+went blank whenever Affinity redrew its panels (hovering a tab, scrolling
+the canvas), and came back only when the page drew itself again.
+
+Leave those windows out of the region a surface flush may cover, and out
+of the visible region of the owner's DCs with WS_CLIPCHILDREN. Look for
+them inside transparent windows too: a WS_EX_TRANSPARENT window is still
+not clipped, but Affinity hosts the WebView2 in one, which hid the page
+from both clips.
+---
+ server/window.c | 113 +++++++++++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 103 insertions(+), 10 deletions(-)
+
+diff --git a/server/window.c b/server/window.c
+index 3cd82b0..13ce77f 100644
+--- a/server/window.c
++++ b/server/window.c
+@@ -1199,9 +1199,45 @@ static inline void map_win_region_to_screen( struct window *win, struct region *
+ }
+ 
+ 
++/* clip the descendants of a window that belong to another process than the owner out of the region:
++ * they draw straight to the X window, so whatever the owner draws there only covers them */
++static struct region *clip_foreign_children( struct window *parent, struct region *parent_clip,
++                                             struct region *region, int offset_x, int offset_y,
++                                             struct process *owner )
++{
++    struct window *ptr;
++    struct region *clip = create_empty_region();
++
++    if (!clip) return NULL;
++    LIST_FOR_EACH_ENTRY( ptr, &parent->children, struct window, entry )
++    {
++        if (!(ptr->style & WS_VISIBLE)) continue;
++        if (!(ptr->ex_style & WS_EX_TRANSPARENT) && ptr->thread && ptr->thread->process != owner)
++        {
++            set_region_rect( clip, &ptr->visible_rect );
++            if (ptr->win_region && !intersect_window_region( clip, ptr )) break;
++            offset_region( clip, offset_x, offset_y );
++            if (!intersect_region( clip, clip, parent_clip )) break;
++            if (!subtract_region( region, region, clip )) break;
++            continue;
++        }
++        if (list_empty( &ptr->children )) continue;
++        set_region_rect( clip, &ptr->client_rect );
++        if (ptr->win_region && !intersect_window_region( clip, ptr )) break;
++        offset_region( clip, offset_x, offset_y );
++        if (!intersect_region( clip, clip, parent_clip )) break;
++        if (!clip_foreign_children( ptr, clip, region, offset_x + ptr->client_rect.left,
++                                    offset_y + ptr->client_rect.top, owner ))
++            break;
++    }
++    free_region( clip );
++    return region;
++}
++
+ /* clip all children of a given window out of the visible region */
+ static struct region *clip_children( struct window *parent, struct window *last,
+-                                     struct region *region, int offset_x, int offset_y )
++                                     struct region *region, int offset_x, int offset_y,
++                                     struct process *owner )
+ {
+     struct window *ptr;
+     struct region *tmp = create_empty_region();
+@@ -1211,7 +1247,23 @@ static struct region *clip_children( struct window *parent, struct window *last,
+     {
+         if (ptr == last) break;
+         if (!(ptr->style & WS_VISIBLE)) continue;
+-        if (ptr->ex_style & WS_EX_TRANSPARENT) continue;
++        if (ptr->ex_style & WS_EX_TRANSPARENT)
++        {
++            /* a transparent window is not clipped, but windows of another process inside
++             * it are (an embedded WebView2, whose host window is transparent) */
++            if (!owner || list_empty( &ptr->children )) continue;
++            set_region_rect( tmp, &ptr->client_rect );
++            if (ptr->win_region && !intersect_window_region( tmp, ptr ))
++            {
++                free_region( tmp );
++                return NULL;
++            }
++            offset_region( tmp, offset_x, offset_y );
++            if (!(region = clip_foreign_children( ptr, tmp, region, offset_x + ptr->client_rect.left,
++                                                  offset_y + ptr->client_rect.top, owner ))) break;
++            if (is_region_empty( region )) break;
++            continue;
++        }
+         set_region_rect( tmp, &ptr->visible_rect );
+         if (ptr->win_region && !intersect_window_region( tmp, ptr ))
+         {
+@@ -1297,7 +1349,8 @@ static struct region *get_visible_region( struct window *win, unsigned int flags
+ 
+     if (flags & DCX_CLIPCHILDREN)
+     {
+-        if (!clip_children( win, NULL, region, win->client_rect.left, win->client_rect.top )) goto error;
++        if (!clip_children( win, NULL, region, win->client_rect.left, win->client_rect.top,
++                            win->thread ? win->thread->process : NULL )) goto error;
+     }
+ 
+     /* clip siblings of ancestors */
+@@ -1312,7 +1365,7 @@ static struct region *get_visible_region( struct window *win, unsigned int flags
+             /* we don't clip out top-level siblings as that's up to the native windowing system */
+             if (win->style & WS_CLIPSIBLINGS)
+             {
+-                if (!clip_children( win->parent, win, region, 0, 0 )) goto error;
++                if (!clip_children( win->parent, win, region, 0, 0, NULL )) goto error;
+                 if (is_region_empty( region )) break;
+             }
+             /* clip to parent client area */
+@@ -1339,7 +1392,8 @@ error:
+ 
+ /* clip all children with a custom pixel format out of the visible region */
+ static struct region *clip_pixel_format_children( struct window *parent, struct region *parent_clip,
+-                                                  struct region *region, int offset_x, int offset_y )
++                                                  struct region *region, int offset_x, int offset_y,
++                                                  struct process *owner )
+ {
+     struct window *ptr;
+     struct region *clip = create_empty_region();
+@@ -1349,7 +1403,19 @@ static struct region *clip_pixel_format_children( struct window *parent, struct
+     LIST_FOR_EACH_ENTRY_REV( ptr, &parent->children, struct window, entry )
+     {
+         if (!(ptr->style & WS_VISIBLE)) continue;
+-        if (ptr->ex_style & WS_EX_TRANSPARENT) continue;
++        if (ptr->ex_style & WS_EX_TRANSPARENT)
++        {
++            /* windows of another process inside it still paint straight to the window */
++            if (!owner || list_empty( &ptr->children )) continue;
++            set_region_rect( clip, &ptr->client_rect );
++            if (ptr->win_region && !intersect_window_region( clip, ptr )) break;
++            offset_region( clip, offset_x, offset_y );
++            if (!intersect_region( clip, clip, parent_clip )) break;
++            if (!clip_foreign_children( ptr, clip, region, offset_x + ptr->client_rect.left,
++                                        offset_y + ptr->client_rect.top, owner ))
++                break;
++            continue;
++        }
+ 
+         /* add the visible rect */
+         set_region_rect( clip, &ptr->visible_rect );
+@@ -1357,7 +1423,32 @@ static struct region *clip_pixel_format_children( struct window *parent, struct
+         offset_region( clip, offset_x, offset_y );
+         if (!intersect_region( clip, clip, parent_clip )) break;
+         if (!union_region( region, region, clip )) break;
+-        if (!(ptr->paint_flags & (PAINT_HAS_PIXEL_FORMAT | PAINT_PIXEL_FORMAT_CHILD))) continue;
++
++        /* A child of another process paints straight to the window, not into
++         * this surface, so a flush of the surface must not cover it: what the
++         * surface holds there is only what the owner painted underneath (an
++         * embedded browser blanked by its host's every repaint). */
++        if (owner && ptr->thread && ptr->thread->process != owner)
++        {
++            if (!subtract_region( region, region, clip )) break;
++            continue;
++        }
++
++        if (!(ptr->paint_flags & (PAINT_HAS_PIXEL_FORMAT | PAINT_PIXEL_FORMAT_CHILD)))
++        {
++            /* look for children of other processes further down */
++            if (!list_empty( &ptr->children ))
++            {
++                set_region_rect( clip, &ptr->client_rect );
++                if (ptr->win_region && !intersect_window_region( clip, ptr )) break;
++                offset_region( clip, offset_x, offset_y );
++                if (!intersect_region( clip, clip, parent_clip )) break;
++                if (!clip_pixel_format_children( ptr, clip, region, offset_x + ptr->client_rect.left,
++                                                 offset_y + ptr->client_rect.top, owner ))
++                    break;
++            }
++            continue;
++        }
+ 
+         /* subtract the client rect if it uses a custom pixel format */
+         set_region_rect( clip, &ptr->client_rect );
+@@ -1368,7 +1459,7 @@ static struct region *clip_pixel_format_children( struct window *parent, struct
+             break;
+ 
+         if (!clip_pixel_format_children( ptr, clip, region, offset_x + ptr->client_rect.left,
+-                                         offset_y + ptr->client_rect.top ))
++                                         offset_y + ptr->client_rect.top, owner ))
+             break;
+     }
+     free_region( clip );
+@@ -1403,7 +1494,8 @@ static struct region *get_surface_region( struct window *win )
+     }
+     else offset_x = offset_y = 0;
+ 
+-    if (!clip_pixel_format_children( win, clip, region, offset_x, offset_y )) goto error;
++    if (!clip_pixel_format_children( win, clip, region, offset_x, offset_y,
++                                     win->thread ? win->thread->process : NULL )) goto error;
+ 
+     free_region( clip );
+     return region;
+@@ -3047,7 +3139,8 @@ DECL_HANDLER(get_update_region)
+         }
+         if ((flags & UPDATE_CLIPCHILDREN) && (win->style & WS_CLIPCHILDREN))
+             clip_children( win, NULL, region, win->client_rect.left - win->window_rect.left,
+-                           win->client_rect.top - win->window_rect.top );
++                           win->client_rect.top - win->window_rect.top,
++                           win->thread ? win->thread->process : NULL );
+         map_win_region_to_screen( win, region );
+         if (!(data = get_region_data_and_free( region, get_reply_max_size(),
+                                                &reply->total_size ))) return;

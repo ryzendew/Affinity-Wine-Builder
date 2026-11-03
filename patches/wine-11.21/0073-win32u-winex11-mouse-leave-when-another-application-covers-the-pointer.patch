@@ -1,0 +1,196 @@
+win32u, winex11: Send WM_MOUSELEAVE when another application's window comes up under the pointer.
+
+Wine's mouse tracking finds the window under the pointer with
+window_from_point(), which knows only this process's windows. When another
+application's window covers ours while the pointer stays still, as after
+Alt-Tab, the tracked window keeps believing the pointer is over it and
+never gets WM_MOUSELEAVE. WPF closes mouse tooltips on WM_MOUSELEAVE, so in
+Affinity a tool's tooltip stayed up, above the other application, until
+its display time ran out.
+
+Let the driver tell win32u that the pointer left: the tracking then treats
+it as over no window of ours until the next mouse message for one. winex11
+does so on a LeaveNotify, now selected for, and when the X focus moves to
+another application: X reports the crossing only once the pointer moves
+(Xwayland sent nothing when a window came up under a still pointer).
+
+Checked under a nested KWin: with the pointer on a tool icon and its
+tooltip shown, a window brought up over it (kcalc, activated) left the
+tooltip on top for about two seconds before, and closed it at once after.
+Hovering still shows the tooltip.
+
+diff --git a/dlls/win32u/input.c b/dlls/win32u/input.c
+index c24bbab..d4bd41b 100644
+--- a/dlls/win32u/input.c
++++ b/dlls/win32u/input.c
+@@ -1784,6 +1784,21 @@ void update_current_mouse_window( HWND hwnd, INT hittest, POINT pos )
+     tracking->last_mouse_message_hwnd = hwnd;
+     tracking->last_mouse_message_hittest = hittest;
+     tracking->last_mouse_message_pos = pos;
++    tracking->pointer_outside = FALSE;
++}
++
++/* The driver saw the pointer leave one of our windows. window_from_point() only knows
++ * this process's windows, so without this a tracked window covered by another
++ * application's window under a pointer that does not move never gets WM_MOUSELEAVE.
++ * The next mouse message for one of our windows clears it. */
++void pointer_left_window( HWND hwnd )
++{
++    struct mouse_tracking_info *tracking = get_mouse_tracking_info();
++
++    TRACE( "hwnd %p, tracking %p flags %#x\n", hwnd, tracking->info.hwndTrack, (int)tracking->info.dwFlags );
++    tracking->pointer_outside = TRUE;
++    if (tracking->info.hwndTrack && (tracking->info.dwFlags & (TME_LEAVE | TME_HOVER)))
++        update_mouse_tracking_info( tracking->info.hwndTrack );
+ }
+ 
+ static void check_mouse_leave( HWND hwnd, int hittest, struct mouse_tracking_info *tracking )
+@@ -1824,6 +1839,13 @@ static HWND get_mouse_window( HWND hwnd, INT *hittest, POINT *ret_pos, struct mo
+     HWND ret;
+ 
+     NtUserGetCursorPos( &pos );
++    if (tracking->pointer_outside)
++    {
++        *hittest = HTNOWHERE;
++        *ret_pos = pos;
++        TRACE( "point %s over another application\n", wine_dbgstr_point(&pos) );
++        return 0;
++    }
+     ret = window_from_point( hwnd, pos, hittest, FALSE );
+     if (ret && ret == tracking->last_mouse_message_hwnd)
+     {
+diff --git a/dlls/win32u/ntuser_private.h b/dlls/win32u/ntuser_private.h
+index 26bab84..add1456 100644
+--- a/dlls/win32u/ntuser_private.h
++++ b/dlls/win32u/ntuser_private.h
+@@ -98,6 +98,7 @@ struct mouse_tracking_info
+     HWND last_mouse_message_hwnd;
+     int last_mouse_message_hittest;
+     POINT last_mouse_message_pos;
++    BOOL pointer_outside; /* the pointer is over a window of another application */
+ };
+ 
+ /* internal per-thread data */
+diff --git a/dlls/win32u/win32u_private.h b/dlls/win32u/win32u_private.h
+index e7adb49..30e4f28 100644
+--- a/dlls/win32u/win32u_private.h
++++ b/dlls/win32u/win32u_private.h
+@@ -108,6 +108,7 @@ extern BOOL set_ime_composition_rect( HWND hwnd, RECT rect );
+ extern void toggle_caret( HWND hwnd );
+ extern void update_mouse_tracking_info( HWND hwnd );
+ extern void update_current_mouse_window( HWND hwnd, INT hittest, POINT pos );
++extern void pointer_left_window( HWND hwnd );
+ extern BOOL process_wine_clipcursor( HWND hwnd, UINT flags, BOOL reset );
+ extern BOOL clip_fullscreen_window( HWND hwnd, BOOL reset );
+ extern USHORT map_scan_to_kbd_vkey( USHORT scan, HKL layout, UINT *mapped );
+diff --git a/dlls/win32u/window.c b/dlls/win32u/window.c
+index 1293df5..bd73e23 100644
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -6481,6 +6481,11 @@ ULONG_PTR WINAPI NtUserCallHwndParam( HWND hwnd, DWORD_PTR param, DWORD code )
+         return set_window_long_internal( hwnd, params->offset, params->size, params->value, FALSE, TRUE );
+     }
+ 
++    /* temporary exports */
++    case NtUserPointerLeftWindow:
++        pointer_left_window( hwnd );
++        return 0;
++
+     default:
+         FIXME( "invalid code %u\n", code );
+         return 0;
+diff --git a/dlls/winex11.drv/event.c b/dlls/winex11.drv/event.c
+index 2817c03..c4b6c01 100644
+--- a/dlls/winex11.drv/event.c
++++ b/dlls/winex11.drv/event.c
+@@ -103,7 +103,7 @@ static x11drv_event_handler handlers[MAX_EVENT_HANDLERS] =
+     X11DRV_ButtonRelease,     /*  5 ButtonRelease */
+     X11DRV_MotionNotify,      /*  6 MotionNotify */
+     X11DRV_EnterNotify,       /*  7 EnterNotify */
+-    NULL,                     /*  8 LeaveNotify */
++    X11DRV_LeaveNotify,       /*  8 LeaveNotify */
+     X11DRV_FocusIn,           /*  9 FocusIn */
+     X11DRV_FocusOut,          /* 10 FocusOut */
+     X11DRV_KeymapNotify,      /* 11 KeymapNotify */
+@@ -807,6 +807,11 @@ static void focus_out( Display *display , HWND hwnd )
+     if (!(NtUserGetWindowLongW( hwnd, GWL_STYLE ) & WS_MINIMIZE))
+         send_message( hwnd, WM_CANCELMODE, 0, 0 );
+ 
++    /* Another application took the focus, so its window has most likely come up under
++     * the pointer, as with Alt-Tab. X reports that with a LeaveNotify only once the
++     * pointer moves, so let the mouse tracking know now. */
++    if (!is_current_process_focused()) NtUserCallHwndParam( hwnd, 0, NtUserPointerLeftWindow );
++
+     /* don't reset the foreground window, if the window which is
+        getting the focus is a Wine window */
+ 
+diff --git a/dlls/winex11.drv/mouse.c b/dlls/winex11.drv/mouse.c
+index cb79ed5..f717be7 100644
+--- a/dlls/winex11.drv/mouse.c
++++ b/dlls/winex11.drv/mouse.c
+@@ -1660,6 +1660,26 @@ BOOL X11DRV_EnterNotify( HWND hwnd, XEvent *xev )
+     return TRUE;
+ }
+ 
++/***********************************************************************
++ *           X11DRV_LeaveNotify
++ *
++ * Wine's mouse tracking finds the window under the pointer among its own windows
++ * only, so it cannot tell that another application's window now covers ours, for
++ * instance after Alt-Tab with the pointer still. Tell win32u, so that a tracked
++ * window gets its WM_MOUSELEAVE; WPF closes its tooltips on it.
++ */
++BOOL X11DRV_LeaveNotify( HWND hwnd, XEvent *xev )
++{
++    XCrossingEvent *event = &xev->xcrossing;
++
++    TRACE( "hwnd %p/%lx mode %d detail %d\n", hwnd, event->window, event->mode, event->detail );
++
++    if (event->mode != NotifyNormal || event->detail == NotifyInferior) return FALSE;
++    if (hwnd == NtUserGetAncestor( get_capture_window(), GA_ROOT )) return FALSE;
++    NtUserCallHwndParam( hwnd, 0, NtUserPointerLeftWindow );
++    return TRUE;
++}
++
+ #ifdef HAVE_X11_EXTENSIONS_XINPUT2_H
+ 
+ /***********************************************************************
+diff --git a/dlls/winex11.drv/window.c b/dlls/winex11.drv/window.c
+index 2812dc3..862038e 100644
+--- a/dlls/winex11.drv/window.c
++++ b/dlls/winex11.drv/window.c
+@@ -539,7 +539,8 @@ static int get_window_attributes( struct x11drv_win_data *data, XSetWindowAttrib
+                                FocusChangeMask | KeymapStateMask | StructureNotifyMask | PropertyChangeMask);
+     /* for transparent windows, exclude mouse events to allow mouse pass-through */
+     if (!(ex_style & WS_EX_TRANSPARENT)) attr->event_mask |= (PointerMotionMask | ButtonPressMask |
+-                                                              ButtonReleaseMask | EnterWindowMask);
++                                                              ButtonReleaseMask | EnterWindowMask |
++                                                              LeaveWindowMask);
+ 
+     return (CWSaveUnder | CWColormap | CWBorderPixel | CWBackPixel |
+             CWEventMask | CWBitGravity | CWBackingStore);
+diff --git a/dlls/winex11.drv/x11drv.h b/dlls/winex11.drv/x11drv.h
+index b4aa020..95281ea 100644
+--- a/dlls/winex11.drv/x11drv.h
++++ b/dlls/winex11.drv/x11drv.h
+@@ -612,6 +612,7 @@ extern BOOL X11DRV_ButtonPress( HWND hwnd, XEvent *event );
+ extern BOOL X11DRV_ButtonRelease( HWND hwnd, XEvent *event );
+ extern BOOL X11DRV_MotionNotify( HWND hwnd, XEvent *event );
+ extern BOOL X11DRV_EnterNotify( HWND hwnd, XEvent *event );
++extern BOOL X11DRV_LeaveNotify( HWND hwnd, XEvent *event );
+ extern BOOL X11DRV_KeyEvent( HWND hwnd, XEvent *event );
+ extern BOOL X11DRV_KeymapNotify( HWND hwnd, XEvent *event );
+ extern BOOL X11DRV_DestroyNotify( HWND hwnd, XEvent *event );
+diff --git a/include/ntuser.h b/include/ntuser.h
+index be41b33..99ecce4 100644
+--- a/include/ntuser.h
++++ b/include/ntuser.h
+@@ -1420,6 +1420,8 @@ enum
+     NtUserCallHwndParam_SetRawWindowPos,
+     NtUserCallHwndParam_GetPrivateData,
+     NtUserCallHwndParam_SetPrivateData,
++    /* temporary exports */
++    NtUserPointerLeftWindow,
+ };
+ 
+ struct get_window_rects_params

@@ -1,0 +1,129 @@
+From: ryzendew
+Date: 2026-06-23
+Subject: Cache clSetKernelArg arguments to skip redundant thunk calls
+
+Caches per-(kernel, arg_index) argument values. When clSetKernelArg is
+called with identical kernel, arg_index, arg_size, and arg_value, the
+PE-to-unix thunk call is skipped. Cache is invalidated on clReleaseKernel
+or when arg_value is NULL.
+
+diff --git a/dlls/opencl/pe_thunks.c b/dlls/opencl/pe_thunks.c
+--- a/dlls/opencl/pe_thunks.c	2026-06-23 04:47:46.078948605 -0300
++++ b/dlls/opencl/pe_thunks.c	2026-06-23 04:47:46.079891292 -0300
+@@ -570,4 +570,6 @@
+     return OPENCL_CALL( clReleaseEvent, &params );
+ }
+ 
++static void invalidate_kernel_args( cl_kernel kernel );
++
+ cl_int WINAPI clReleaseKernel( cl_kernel kernel )
+ {
+     struct clReleaseKernel_params params = { kernel };
+     TRACE( "(%p)\n", kernel );
++    invalidate_kernel_args( kernel );
+     return OPENCL_CALL( clReleaseKernel, &params );
+ }
+ 
+@@ -653,6 +654,38 @@ cl_int WINAPI clRetainSampler( cl_sample
+     return OPENCL_CALL( clRetainSampler, &params );
+ }
+ 
++struct kernel_arg_cache
++{
++    struct kernel_arg_cache *next;
++    cl_kernel kernel;
++    cl_uint arg_index;
++    size_t arg_size;
++    void *arg_data;
++};
++
++static struct kernel_arg_cache *kernel_arg_cache_head;
++
++static void invalidate_kernel_args( cl_kernel kernel )
++{
++    struct kernel_arg_cache **pp = &kernel_arg_cache_head;
++    while (*pp)
++    {
++        struct kernel_arg_cache *entry = *pp;
++        if (entry->kernel == kernel)
++        {
++            *pp = entry->next;
++            free( entry->arg_data );
++            HeapFree( GetProcessHeap(), 0, entry );
++        }
++        else
++        {
++            pp = &entry->next;
++        }
++    }
++}
++
++
++
+ cl_int WINAPI clSetEventCallback( cl_event event, cl_int command_exec_callback_type, void (WINAPI* pfn_notify)(cl_event event, cl_int event_command_status, void *user_data), void* user_data )
+ {
+     struct clGetEventInfo_params info;
+@@ -694,9 +727,60 @@ cl_int WINAPI clSetEventCallback( cl_eve
+ 
+ cl_int WINAPI clSetKernelArg( cl_kernel kernel, cl_uint arg_index, size_t arg_size, const void* arg_value )
+ {
+-    struct clSetKernelArg_params params = { kernel, arg_index, arg_size, arg_value };
+-    TRACE( "(%p, %u, %Iu, %p)\n", kernel, arg_index, arg_size, arg_value );
+-    return OPENCL_CALL( clSetKernelArg, &params );
++    struct kernel_arg_cache *entry;
++    cl_int ret;
++
++    if (!arg_value)
++    {
++        struct clSetKernelArg_params params = { kernel, arg_index, arg_size, arg_value };
++        invalidate_kernel_args( kernel );
++        TRACE( "(%p, %u, %Iu, %p)\n", kernel, arg_index, arg_size, arg_value );
++        return OPENCL_CALL( clSetKernelArg, &params );
++    }
++
++    for (entry = kernel_arg_cache_head; entry; entry = entry->next)
++    {
++        if (entry->kernel == kernel && entry->arg_index == arg_index)
++        {
++            if (entry->arg_size == arg_size && !memcmp( entry->arg_data, arg_value, arg_size ))
++            {
++                TRACE( "(%p, %u, %Iu, %p) cached, skipping thunk\n", kernel, arg_index, arg_size, arg_value );
++                return CL_SUCCESS;
++            }
++            break;
++        }
++    }
++
++    {
++        struct clSetKernelArg_params params = { kernel, arg_index, arg_size, arg_value };
++        TRACE( "(%p, %u, %Iu, %p)\n", kernel, arg_index, arg_size, arg_value );
++        ret = OPENCL_CALL( clSetKernelArg, &params );
++        if (ret != CL_SUCCESS) return ret;
++    }
++
++    if (entry)
++    {
++        free( entry->arg_data );
++        entry->arg_data = malloc( arg_size );
++        if (entry->arg_data) memcpy( entry->arg_data, arg_value, arg_size );
++        entry->arg_size = arg_size;
++    }
++    else
++    {
++        entry = HeapAlloc( GetProcessHeap(), 0, sizeof(*entry) );
++        if (entry)
++        {
++            entry->kernel = kernel;
++            entry->arg_index = arg_index;
++            entry->arg_size = arg_size;
++            entry->arg_data = malloc( arg_size );
++            if (entry->arg_data) memcpy( entry->arg_data, arg_value, arg_size );
++            entry->next = kernel_arg_cache_head;
++            kernel_arg_cache_head = entry;
++        }
++    }
++
++    return CL_SUCCESS;
+ }
+ 
+ cl_int WINAPI clSetMemObjectDestructorCallback( cl_mem memobj, void (WINAPI* pfn_notify)(cl_mem memobj, void* user_data), void* user_data )

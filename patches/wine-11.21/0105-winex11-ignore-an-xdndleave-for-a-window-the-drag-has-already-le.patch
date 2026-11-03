@@ -1,0 +1,62 @@
+winex11: Ignore an XdndLeave for a window the drag has already left.
+
+The source must leave the old window before it enters the next one,
+but KWin's Xwayland bridge can send the XdndLeave for the old window
+after the XdndEnter for the new one, for example when the pointer moves
+from an owned panel onto its owner. The drag state is not per window,
+so that late leave ended the drag that had just entered: every later
+position was refused and the source canceled the drop.
+
+Remember the window the drag entered and ignore a leave for any other.
+---
+ dlls/winex11.drv/event.c | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+diff --git a/dlls/winex11.drv/event.c b/dlls/winex11.drv/event.c
+index d66dc97..37f549a 100644
+--- a/dlls/winex11.drv/event.c
++++ b/dlls/winex11.drv/event.c
+@@ -1484,6 +1484,8 @@ static void handle_dnd_protocol( HWND hwnd, XClientMessageEvent *event )
+ /* the last XdndPosition point inside the target window, see handle_xdnd_position_event */
+ static BOOL xdnd_have_pos;
+ static int xdnd_last_x, xdnd_last_y;
++/* the X window the current drag entered, see handle_xdnd_leave_event */
++static Window xdnd_target;
+ 
+ /**************************************************************************
+  *           handle_xdnd_enter_event
+@@ -1546,6 +1548,7 @@ static void handle_xdnd_enter_event( HWND hWnd, XClientMessageEvent *event )
+     }
+ 
+     xdnd_have_pos = FALSE;
++    xdnd_target = event->window;
+     data = import_xdnd_selection( event->display, event->window, x11drv_atom(XdndSelection),
+                                   xdndtypes, count, &size );
+     if (data) drag_drop_enter( size, data );
+@@ -1653,6 +1656,7 @@ static void handle_xdnd_drop_event( HWND hwnd, XClientMessageEvent *event )
+     XClientMessageEvent e;
+     UINT effect;
+ 
++    xdnd_target = 0;
+     effect = drag_drop_drop( hwnd );
+ 
+     /* Tell the target we are finished. */
+@@ -1671,6 +1675,18 @@ static void handle_xdnd_drop_event( HWND hwnd, XClientMessageEvent *event )
+ 
+ static void handle_xdnd_leave_event( HWND hwnd, XClientMessageEvent *event )
+ {
++    /* The source must leave the old window before it enters the next one, but KWin's
++     * Xwayland bridge can send the XdndLeave for the old window after the XdndEnter for
++     * the new one, for example when the pointer moves from an owned panel onto its
++     * owner. The drag state is not per window, so that late leave ended the drag that
++     * had just entered: every later position was refused and the source cancelled the
++     * drop. Ignore a leave for a window the drag is no longer in. */
++    if (xdnd_target && event->window != xdnd_target)
++    {
++        TRACE( "ignoring XdndLeave for %lx, the drag is in %lx\n", event->window, xdnd_target );
++        return;
++    }
++    xdnd_target = 0;
+     drag_drop_leave();
+ }
+ 

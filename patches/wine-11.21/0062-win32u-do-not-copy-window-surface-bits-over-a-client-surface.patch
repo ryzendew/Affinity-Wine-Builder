@@ -1,0 +1,108 @@
+win32u: Do not copy window surface bits over a client surface.
+
+When a window gets its first onscreen client surface, winex11 stops giving
+it a window surface and draws to the window directly. apply_window_pos then
+copies the old surface's bits to the window, to keep what was on screen. A
+client surface draws that window's client area, so the old surface holds
+nothing valid there -- its initial white, if no one painted it -- and the
+window DC includes inferiors, so the copy covers the client surface's frame
+and stays until the next present.
+
+Leave the client area out of the copy when the window now draws directly and
+has a client surface.
+
+WPF shows a window and renders its first frame before the thread that owns
+it gets round to the posted state update; if that thread is busy, the switch
+comes late and the copy whites out a window that was already drawn. In a WPF
+test that blocks for 1.5 s after Show(), every dialog turned white and stayed
+so until it repainted; with this, none did. This is the likely cause of
+Affinity's prompts (close document, recovery) showing white for 1-2 s; that
+was seen by hand and not reproduced here, where Affinity was never busy
+enough.
+
+diff --git a/dlls/win32u/dce.c b/dlls/win32u/dce.c
+index 67d3dc8..62989a4 100644
+--- a/dlls/win32u/dce.c
++++ b/dlls/win32u/dce.c
+@@ -1677,17 +1677,33 @@ void move_window_bits( HWND hwnd, const struct window_rects *rects, const RECT *
+  * Move the window bits from a previous window surface when its surface is recreated.
+  */
+ void move_window_bits_surface( HWND hwnd, const RECT *window_rect, struct window_surface *old_surface,
+-                               const RECT *old_visible_rect, const RECT *valid_rects )
++                               const RECT *old_visible_rect, const RECT *valid_rects, BOOL exclude_client )
+ {
+     char buffer[FIELD_OFFSET( BITMAPINFO, bmiColors[256] )];
+     BITMAPINFO *info = (BITMAPINFO *)buffer;
+     UINT flags = UPDATE_NOCHILDREN | UPDATE_CLIPCHILDREN;
+     HRGN rgn = get_update_region( hwnd, &flags, NULL );
+-    HDC hdc = NtUserGetDCEx( hwnd, rgn, DCX_CACHE | DCX_WINDOW | DCX_EXCLUDERGN );
+-    void *bits;
+-
++    struct window_rects rects;
+     RECT dst = valid_rects[0];
+     RECT src = valid_rects[1];
++    HDC hdc;
++    void *bits;
++
++    /* The window is now drawn directly and a client surface draws its client
++     * area, so the old surface holds nothing valid there: it is the surface's
++     * initial white if nothing painted it. The window DC includes inferiors,
++     * so copying it would cover the client surface until that presents again. */
++    if (exclude_client && get_window_rects( hwnd, COORDS_SCREEN, &rects, get_thread_dpi() ))
++    {
++        HRGN client = NtGdiCreateRectRgn( rects.client.left, rects.client.top, rects.client.right, rects.client.bottom );
++        if (!rgn) rgn = client;
++        else
++        {
++            NtGdiCombineRgn( rgn, rgn, client, RGN_OR );
++            NtGdiDeleteObjectApp( client );
++        }
++    }
++    hdc = NtUserGetDCEx( hwnd, rgn, DCX_CACHE | DCX_WINDOW | DCX_EXCLUDERGN );
+ 
+     TRACE( "copying %s -> %s\n", wine_dbgstr_rect( &src ), wine_dbgstr_rect( &dst ));
+     OffsetRect( &src, -old_visible_rect->left, -old_visible_rect->top );
+diff --git a/dlls/win32u/win32u_private.h b/dlls/win32u/win32u_private.h
+index 2c92515..e7adb49 100644
+--- a/dlls/win32u/win32u_private.h
++++ b/dlls/win32u/win32u_private.h
+@@ -52,7 +52,7 @@ extern void erase_now( HWND hwnd, UINT rdw_flags );
+ extern void flush_window_surfaces( BOOL idle );
+ extern void move_window_bits( HWND hwnd, const struct window_rects *rects, const RECT *valid_rects );
+ extern void move_window_bits_surface( HWND hwnd, const RECT *window_rect, struct window_surface *old_surface,
+-                                      const RECT *old_visible_rect, const RECT *valid_rects );
++                                      const RECT *old_visible_rect, const RECT *valid_rects, BOOL exclude_client );
+ extern void register_window_surface( struct window_surface *old,
+                                      struct window_surface *new );
+ 
+diff --git a/dlls/win32u/window.c b/dlls/win32u/window.c
+index e2bde69..4b16446 100644
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -2319,7 +2319,7 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
+     WND *win;
+     HWND owner_hint, surface_win = 0, toplevel;
+     struct ratio raw_dpi, dpi = get_thread_dpi();
+-    BOOL ret, is_layered, is_child, need_icons = FALSE;
++    BOOL ret, is_layered, is_child, need_icons = FALSE, clip_clients;
+     struct window_rects old_rects;
+     RECT extra_rects[3];
+     struct window_surface *old_surface;
+@@ -2338,6 +2338,7 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
+ 
+     if (!(win = get_win_ptr( hwnd )) || win == WND_DESKTOP || win == WND_OTHER_PROCESS) return FALSE;
+     old_surface = win->surface;
++    clip_clients = win->clip_clients;
+     if (old_surface != new_surface) swp_flags |= SWP_FRAMECHANGED;  /* force refreshing non-client area */
+ 
+     if (new_surface == &dummy_surface) swp_flags |= SWP_NOREDRAW;
+@@ -2440,7 +2441,8 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
+                 valid_rects = rects;
+ 
+                 if (old_surface != new_surface)
+-                    move_window_bits_surface( hwnd, &new_rects->window, old_surface, &old_rects.visible, valid_rects );
++                    move_window_bits_surface( hwnd, &new_rects->window, old_surface, &old_rects.visible, valid_rects,
++                                              !new_surface && clip_clients );
+                 else
+                 {
+                     OffsetRect( &rects[1], new_rects->visible.left - old_rects.visible.left, new_rects->visible.top - old_rects.visible.top );

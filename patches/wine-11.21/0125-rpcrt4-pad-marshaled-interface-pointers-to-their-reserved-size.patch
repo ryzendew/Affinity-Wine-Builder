@@ -1,0 +1,49 @@
+rpcrt4: Pad marshaled interface pointers to their reserved size.
+
+NdrInterfacePointerBufferSize() reserves CoGetMarshalSizeMax() bytes,
+which includes the whole OBJREF union, and complex arrays and structures
+place their pointer data after the reserved sizes. The data itself is
+written inline and is usually smaller, so the fields after an array of
+interface pointers were written where the unmarshaling side, which
+follows the actual data, did not read them: IEnumWbemClassObject::Next()
+returned its count and result from the wrong place. Take up the
+reserved size, padded with zeros.
+---
+ dlls/rpcrt4/ndr_ole.c | 18 ++++++++++++++++++
+ 1 file changed, 18 insertions(+)
+
+diff --git a/dlls/rpcrt4/ndr_ole.c b/dlls/rpcrt4/ndr_ole.c
+index aa7ca1a..6f60a2a 100644
+--- a/dlls/rpcrt4/ndr_ole.c
++++ b/dlls/rpcrt4/ndr_ole.c
+@@ -285,12 +285,30 @@ unsigned char * WINAPI NdrInterfacePointerMarshall(PMIDL_STUB_MESSAGE pStubMsg,
+   TRACE("(%p,%p,%p)\n", pStubMsg, pMemory, pFormat);
+   pStubMsg->MaxCount = 0;
+   if (pStubMsg->Buffer + sizeof(DWORD) <= (unsigned char *)pStubMsg->RpcMsg->Buffer + pStubMsg->BufferLength) {
++    DWORD *size = (DWORD *)pStubMsg->Buffer;
++    unsigned char *data = pStubMsg->Buffer + sizeof(DWORD);
++    ULONG max_size;
++
+     hr = RpcStream_Create(pStubMsg, TRUE, NULL, &stream);
+     if (hr == S_OK) {
+       if (pMemory)
+         hr = CoMarshalInterface(stream, riid, (IUnknown *)pMemory,
+                                 pStubMsg->dwDestContext, pStubMsg->pvDestContext,
+                                 MSHLFLAGS_NORMAL);
++      /* Take up the size NdrInterfacePointerBufferSize reserved, padded with
++       * zeros: the data is written inline, and complex arrays and structures
++       * place their pointer data after the reserved size. Marshaling data
++       * smaller than its maximum (the free-threaded marshaler's) put the
++       * following fields where the unmarshaling side did not look for them. */
++      if (hr == S_OK && pMemory &&
++          CoGetMarshalSizeMax(&max_size, riid, (IUnknown *)pMemory, pStubMsg->dwDestContext,
++                              pStubMsg->pvDestContext, MSHLFLAGS_NORMAL) == S_OK &&
++          *size < max_size &&
++          data + max_size <= (unsigned char *)pStubMsg->RpcMsg->Buffer + pStubMsg->BufferLength)
++      {
++        memset(data + *size, 0, max_size - *size);
++        *size = max_size;
++      }
+       IStream_Release(stream);
+     }
+ 

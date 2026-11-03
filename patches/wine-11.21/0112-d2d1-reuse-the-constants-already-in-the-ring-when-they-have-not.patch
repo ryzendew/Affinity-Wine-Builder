@@ -1,0 +1,148 @@
+d2d1: Reuse the constants already in the ring when they have not changed.
+
+Every primitive mapped the constant buffer ring and wrote its vertex
+and pixel shader constants, though consecutive primitives usually
+share them: about half of Affinity's 540 draws a frame while dragging
+a selection have the same constants as the draw before. Keep what was
+last written and, when the new constants are the same, leave them
+where they are: no map, and the bound offsets stay as they were, so
+no rebinding either. A discard of the ring and Clear, which writes its
+own constants there, forget it.
+
+Affinity, three alternating rounds: dragging a selection, 3% more
+frames, UI-thread time per frame -4% and wined3d's command thread
+-15%; node editing, 9% more frames, -11% and -16%. The d2d1
+conformance tests give the same results, and the canvas is pixel
+identical.
+---
+ dlls/d2d1/d2d1_private.h |  3 +++
+ dlls/d2d1/device.c       | 48 +++++++++++++++++++++++++++++++---------
+ 2 files changed, 41 insertions(+), 10 deletions(-)
+
+diff --git a/dlls/d2d1/d2d1_private.h b/dlls/d2d1/d2d1_private.h
+index 8cd3136..7117489 100644
+--- a/dlls/d2d1/d2d1_private.h
++++ b/dlls/d2d1/d2d1_private.h
+@@ -206,6 +206,9 @@ struct d2d_device_context
+     unsigned int vs_cb_offset, ps_cb_offset;
+     struct d2d_vs_cb vs_cb_data;  /* written with the next pixel shader constants, in one map */
+     BOOL vs_cb_pending;
++    /* The constants at vs_cb_offset and ps_cb_offset are vs_cb_data and ps_cb_last. */
++    BOOL vs_cb_uploaded, ps_cb_uploaded;
++    struct d2d_ps_cb ps_cb_last;
+     ID3DDeviceContextState *batch_prev_state; /* the application's state, while ours stays bound */
+     struct d2d_bound_state
+     {
+diff --git a/dlls/d2d1/device.c b/dlls/d2d1/device.c
+index f66ee41..a9c3785 100644
+--- a/dlls/d2d1/device.c
++++ b/dlls/d2d1/device.c
+@@ -1113,6 +1113,10 @@ static void *d2d_device_context_map_cb(struct d2d_device_context *context,
+         map_type = D3D11_MAP_WRITE_DISCARD;
+     }
+ 
++    /* Discarding renames the buffer: what was uploaded before is gone for later draws. */
++    if (map_type == D3D11_MAP_WRITE_DISCARD)
++        context->vs_cb_uploaded = context->ps_cb_uploaded = FALSE;
++
+     if (FAILED(hr = ID3D11DeviceContext_Map(d3d_context, (ID3D11Resource *)ring->buffer, 0, map_type, 0, &map)))
+     {
+         WARN("Failed to map constant buffer, hr %#lx.\n", hr);
+@@ -1135,6 +1139,7 @@ static void d2d_device_context_flush_vs_cb(struct d2d_device_context *context)
+     {
+         *cb_data = context->vs_cb_data;
+         ID3D11DeviceContext_Unmap(d3d_context, (ID3D11Resource *)context->cb_ring.buffer, 0);
++        context->vs_cb_uploaded = TRUE;
+     }
+     ID3D11DeviceContext_Release(d3d_context);
+ }
+@@ -1144,11 +1149,27 @@ static HRESULT d2d_device_context_update_ps_cb(struct d2d_device_context *contex
+ {
+     const unsigned int vs_size = (sizeof(struct d2d_vs_cb) + 255) & ~255u;
+     ID3D11DeviceContext *d3d_context;
+-    struct d2d_ps_cb *cb_data;
++    struct d2d_ps_cb *cb_data, new_data;
++    BOOL with_vs = FALSE;
+     unsigned int offset;
+     BYTE *data;
+     HRESULT hr;
+ 
++    memset(&new_data, 0, sizeof(new_data));
++    new_data.outline = outline;
++    new_data.is_arc = is_arc;
++    if (!d2d_brush_fill_cb(brush, &new_data.colour_brush))
++        WARN("Failed to initialize colour brush buffer.\n");
++    if (!d2d_brush_fill_cb(opacity_brush, &new_data.opacity_brush))
++        WARN("Failed to initialize opacity brush buffer.\n");
++
++    /* Consecutive primitives often have the same constants: about half of
++     * Affinity's draws. Use the copy already in the ring instead of mapping it
++     * again. */
++    if (!context->vs_cb_pending && context->ps_cb_uploaded
++            && !memcmp(&new_data, &context->ps_cb_last, sizeof(new_data)))
++        return S_OK;
++
+     ID3D11Device1_GetImmediateContext(context->d3d_device, &d3d_context);
+ 
+     /* Most draws set both; one map for both halves the maps per draw. */
+@@ -1164,6 +1185,7 @@ static HRESULT d2d_device_context_update_ps_cb(struct d2d_device_context *contex
+         context->ps_cb_offset = offset + vs_size;
+         context->vs_cb_pending = FALSE;
+         cb_data = (struct d2d_ps_cb *)(data + vs_size);
++        with_vs = TRUE;
+     }
+     else if (!(cb_data = d2d_device_context_map_cb(context, d3d_context, sizeof(*cb_data), &context->ps_cb_offset)))
+     {
+@@ -1172,14 +1194,11 @@ static HRESULT d2d_device_context_update_ps_cb(struct d2d_device_context *contex
+     }
+     hr = S_OK;
+ 
+-    cb_data->outline = outline;
+-    cb_data->is_arc = is_arc;
+-    cb_data->pad[0] = 0;
+-    cb_data->pad[1] = 0;
+-    if (!d2d_brush_fill_cb(brush, &cb_data->colour_brush))
+-        WARN("Failed to initialize colour brush buffer.\n");
+-    if (!d2d_brush_fill_cb(opacity_brush, &cb_data->opacity_brush))
+-        WARN("Failed to initialize opacity brush buffer.\n");
++    *cb_data = new_data;
++    context->ps_cb_last = new_data;
++    context->ps_cb_uploaded = TRUE;
++    if (with_vs)
++        context->vs_cb_uploaded = TRUE;
+ 
+     ID3D11DeviceContext_Unmap(d3d_context, (ID3D11Resource *)context->cb_ring.buffer, 0);
+     ID3D11DeviceContext_Release(d3d_context);
+@@ -1190,7 +1209,7 @@ static HRESULT d2d_device_context_update_ps_cb(struct d2d_device_context *contex
+ static HRESULT d2d_device_context_update_vs_cb(struct d2d_device_context *context,
+         const D2D_MATRIX_3X2_F *geometry_transform, float stroke_width)
+ {
+-    struct d2d_vs_cb *cb_data = &context->vs_cb_data;
++    struct d2d_vs_cb new_data, *cb_data = &new_data;
+     const D2D1_MATRIX_3X2_F *w;
+     float tmp_x, tmp_y;
+ 
+@@ -1217,7 +1236,13 @@ static HRESULT d2d_device_context_update_vs_cb(struct d2d_device_context *contex
+     cb_data->transform_rty.z = w->_32 * tmp_y;
+     cb_data->transform_rty.w = -2.0f / context->pixel_size.height;
+ 
++    /* Unchanged and already in the ring: nothing to write. */
++    if (!context->vs_cb_pending && context->vs_cb_uploaded
++            && !memcmp(&new_data, &context->vs_cb_data, sizeof(new_data)))
++        return S_OK;
++
+     /* Written by the next d2d_device_context_update_ps_cb(), or at the draw. */
++    context->vs_cb_data = new_data;
+     context->vs_cb_pending = TRUE;
+     return S_OK;
+ }
+@@ -2227,6 +2252,9 @@ static void STDMETHODCALLTYPE d2d_device_context_Clear(ID2D1DeviceContext6 *ifac
+ 
+     ID3D11Device1_GetImmediateContext(context->d3d_device, &d3d_context);
+ 
++    /* Clear writes its own constants at these offsets. */
++    context->vs_cb_uploaded = context->ps_cb_uploaded = FALSE;
++
+     if (!(vs_cb_data = d2d_device_context_map_cb(context, d3d_context, sizeof(*vs_cb_data), &context->vs_cb_offset)))
+     {
+         ID3D11DeviceContext_Release(d3d_context);

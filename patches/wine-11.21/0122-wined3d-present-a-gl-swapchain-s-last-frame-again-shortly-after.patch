@@ -1,0 +1,55 @@
+wined3d: Present a GL swapchain's last frame again shortly after, too.
+
+A window that presents once and then only when something changes can
+lose that frame on the GL renderer: WPF presents a floating panel
+before Xwayland has mapped its window, the copy into the window is
+lost, and nothing presents again. In Affinity, the Help panel came back
+from a studio switch with an empty white frame. Whether it happened
+depended on timing.
+
+Extend the re-present of a COPY swapchain's last frame, 5 ms and 50 ms
+later, to GL swapchains that present to their window. Cancel a pending
+one on the command stream thread before the swapchain goes away, as for
+Vulkan.
+---
+ dlls/wined3d/swapchain.c | 18 ++++++++++++++++--
+ 1 file changed, 16 insertions(+), 2 deletions(-)
+
+diff --git a/dlls/wined3d/swapchain.c b/dlls/wined3d/swapchain.c
+index 3d0b842..13a2b02 100644
+--- a/dlls/wined3d/swapchain.c
++++ b/dlls/wined3d/swapchain.c
+@@ -101,8 +101,20 @@ void wined3d_swapchain_cleanup(struct wined3d_swapchain *swapchain)
+     }
+ }
+ 
++static void wined3d_swapchain_gl_destroy_object(void *object)
++{
++    struct wined3d_swapchain_gl *swapchain_gl = object;
++
++    wined3d_cs_cancel_nudge(&swapchain_gl->s);
++}
++
+ void wined3d_swapchain_gl_cleanup(struct wined3d_swapchain_gl *swapchain_gl)
+ {
++    struct wined3d_cs *cs = swapchain_gl->s.device->cs;
++
++    wined3d_cs_destroy_object(cs, wined3d_swapchain_gl_destroy_object, swapchain_gl);
++    wined3d_cs_finish(cs, WINED3D_CS_QUEUE_DEFAULT);
++
+     wined3d_swapchain_cleanup(&swapchain_gl->s);
+ }
+ 
+@@ -1484,8 +1496,10 @@ bool wined3d_swapchain_wants_nudge(const struct wined3d_swapchain *swapchain,
+     const struct wined3d_swapchain_desc *desc = &swapchain->state.desc;
+     RECT full_rect;
+ 
+-    return swapchain->swapchain_ops == &swapchain_vk_ops
+-            && wined3d_swapchain_vk((struct wined3d_swapchain *)swapchain)->vk_swapchain
++    return ((swapchain->swapchain_ops == &swapchain_vk_ops
++            && wined3d_swapchain_vk((struct wined3d_swapchain *)swapchain)->vk_swapchain)
++            || (swapchain->swapchain_ops == &swapchain_gl_ops
++            && wined3d_swapchain_gl((struct wined3d_swapchain *)swapchain)->attached))
+             && !swap_interval && desc->windowed && desc->backbuffer_count == 1
+             && (desc->swap_effect == WINED3D_SWAP_EFFECT_COPY || desc->swap_effect == WINED3D_SWAP_EFFECT_COPY_VSYNC)
+             && (!swapchain_present_is_partial_copy((struct wined3d_swapchain *)swapchain, dst_rect)

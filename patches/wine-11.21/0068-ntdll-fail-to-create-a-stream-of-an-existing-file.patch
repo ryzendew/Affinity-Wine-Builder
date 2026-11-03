@@ -1,0 +1,47 @@
+ntdll: Fail to create a stream of an existing file instead of a file named after it.
+
+"file:stream" names an alternate data stream of a file. Unix file systems
+have none, and Wine created a file called "file:stream" instead, which stays
+behind when "file" is deleted or renamed. Affinity tags each lock file it
+makes next to a document with a com.dropbox.ignored stream, so every document
+it ever opened left a "<name>~lock~:com.dropbox.ignored" file beside it --
+140 of them in one work tree.
+
+When the last element of a name being created has a colon and the part
+before it exists, fail with STATUS_OBJECT_NAME_INVALID, as Windows file
+systems without streams do (FAT, exFAT, most network shares); applications
+already have to cope with that. Existing files with a colon in their name
+still open and can be deleted, and a colon name whose part before it does
+not exist is still created as before.
+
+A test creating "doc.af~lock~" and then "doc.af~lock~:com.dropbox.ignored"
+now gets ERROR_INVALID_NAME for the second and leaves only the first; an
+existing "legacy:junk" still opens and deletes, and "nobase:literal" is
+still created.
+
+diff --git a/dlls/ntdll/unix/file.c b/dlls/ntdll/unix/file.c
+index 1bfec7a..21c5cbe 100644
+--- a/dlls/ntdll/unix/file.c
++++ b/dlls/ntdll/unix/file.c
+@@ -3675,6 +3675,21 @@ static NTSTATUS lookup_unix_name( int root_fd, OBJECT_ATTRIBUTES *attr, UNICODE_
+         {
+             if (status == STATUS_OBJECT_NAME_NOT_FOUND)
+             {
++                const WCHAR *colon = NULL;
++
++                if (!is_unix) for (colon = name; colon < end && *colon != ':'; colon++);
++
++                /* "file:stream" names an alternate data stream of an existing file. Unix
++                 * file systems have none, and creating a file of that name instead leaves
++                 * it behind when the file goes: Affinity tags each of its lock files with
++                 * a com.dropbox.ignored stream, so every document it opened left one next
++                 * to it. Fail like a Windows file system without streams does (FAT, most
++                 * network shares); a name with a colon whose part before it does not
++                 * exist is still created as it is. */
++                if (colon && colon > name && colon < end &&
++                    find_file_in_dir( root_fd, unix_name, pos, name, colon - name, is_unix ) == STATUS_SUCCESS)
++                    return STATUS_OBJECT_NAME_INVALID;
++
+                 if (disposition != FILE_OPEN && disposition != FILE_OVERWRITE)
+                 {
+                     ret = ntdll_wcstoumbs( name, end - name, unix_name + pos + 1, MAX_DIR_ENTRY_LEN + 1, TRUE );

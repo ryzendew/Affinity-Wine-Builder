@@ -1,0 +1,120 @@
+wined3d: Put small GPU-only buffers in device memory the CPU can map, where it can map all of it.
+
+A Vulkan buffer in device memory that the CPU cannot map is filled with a
+staging copy: a staging buffer is allocated, the render pass ends, and the
+copy is wrapped in two all-commands barriers. Direct2D creates a vertex
+and an index buffer with initial data for every primitive it draws.
+Affinity's canvas draws about 800 primitives per frame that way, so each
+frame carried about 3000 staging copies, and the GPU spent its time
+stalled between render passes. With OpenCL on, the brush computation
+queued behind that work, and the canvas presented every 27 ms.
+
+When a device-local memory type is host-visible and its heap covers the
+device memory (resizable BAR, or a device without dedicated memory),
+create buffers of up to 64 KiB that only the GPU uses there. Filling a new
+buffer is then a CPU copy, and replacing the contents of one still in use
+renames it, both existing paths. Stream output and unordered access
+buffers keep plain device memory.
+
+Measured on an Arc A750 with resizable BAR (nested KWin, brush tip behind
+the cursor, medians of nine strokes), together with 0051:
+
+                 before    after
+  OpenCL off     106 ms    49 ms
+  OpenCL on      121 ms    61 ms
+
+On its own this patch makes Affinity render faster than the display, and
+with FIFO presentation the extra frames queue; 0051 is needed for the gain.
+
+diff --git a/dlls/wined3d/adapter_vk.c b/dlls/wined3d/adapter_vk.c
+index 035ab48..43d35b0 100644
+--- a/dlls/wined3d/adapter_vk.c
++++ b/dlls/wined3d/adapter_vk.c
+@@ -2145,6 +2145,31 @@ static enum wined3d_display_driver guess_display_driver(enum wined3d_pci_vendor
+     }
+ }
+ 
++/* Whether the CPU can map device memory at large, through a resizable BAR or
++ * because the device uses system memory, rather than only a small window. */
++static bool adapter_vk_has_mappable_vram(const VkPhysicalDeviceMemoryProperties *memory_properties)
++{
++    const VkMemoryPropertyFlags flags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
++    VkDeviceSize vram = 0, mappable = 0;
++    unsigned int i;
++
++    for (i = 0; i < memory_properties->memoryHeapCount; ++i)
++    {
++        if (memory_properties->memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
++            vram = max(vram, memory_properties->memoryHeaps[i].size);
++    }
++    for (i = 0; i < memory_properties->memoryTypeCount; ++i)
++    {
++        const VkMemoryType *type = &memory_properties->memoryTypes[i];
++
++        if ((type->propertyFlags & flags) == flags)
++            mappable = max(mappable, memory_properties->memoryHeaps[type->heapIndex].size);
++    }
++    TRACE("Largest device-local heap 0x%s, largest mappable device-local heap 0x%s.\n",
++            wine_dbgstr_longlong(vram), wine_dbgstr_longlong(mappable));
++    return vram && mappable >= vram / 2;
++}
++
+ static bool adapter_vk_init_driver_info(struct wined3d_adapter_vk *adapter_vk,
+         const VkPhysicalDeviceProperties *properties)
+ {
+@@ -2586,6 +2611,7 @@ static BOOL wined3d_adapter_vk_init(struct wined3d_adapter_vk *adapter_vk,
+     adapter_vk->device_limits = properties2.properties.limits;
+ 
+     VK_CALL(vkGetPhysicalDeviceMemoryProperties(adapter_vk->physical_device, &adapter_vk->memory_properties));
++    adapter_vk->mappable_vram = adapter_vk_has_mappable_vram(&adapter_vk->memory_properties);
+ 
+     if (id_properties.deviceLUIDValid)
+         luid = (LUID *)id_properties.deviceLUID;
+diff --git a/dlls/wined3d/buffer.c b/dlls/wined3d/buffer.c
+index 5e1f0de..ba0e0c0 100644
+--- a/dlls/wined3d/buffer.c
++++ b/dlls/wined3d/buffer.c
+@@ -1171,15 +1171,29 @@ VkMemoryPropertyFlags vk_memory_type_from_access_flags(uint32_t access, uint32_t
+ static BOOL wined3d_buffer_vk_create_buffer_object(struct wined3d_buffer_vk *buffer_vk,
+         struct wined3d_context_vk *context_vk)
+ {
++    const struct wined3d_adapter_vk *adapter_vk = wined3d_adapter_vk(context_vk->c.device->adapter);
+     struct wined3d_resource *resource = &buffer_vk->b.resource;
++    VkMemoryPropertyFlags memory_type;
+     struct wined3d_bo_vk *bo_vk;
+ 
+     if (!(bo_vk = malloc(sizeof(*bo_vk))))
+         return FALSE;
+ 
++    memory_type = vk_memory_type_from_access_flags(resource->access, resource->usage);
++    /* A buffer in device memory the CPU cannot map is filled with a staging
++     * copy, which ends the render pass and waits with two barriers. Direct2D
++     * creates a vertex and an index buffer with initial data for each
++     * primitive, thousands per frame in Affinity, and the copies held the
++     * GPU up far longer than the draws. Where the CPU can map device memory
++     * anyway, put small buffers there: filling a new one is then a copy on
++     * the CPU, and replacing the contents of one in use renames it. */
++    if (memory_type == VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT && adapter_vk->mappable_vram
++            && resource->size <= 0x10000
++            && !(resource->bind_flags & (WINED3D_BIND_STREAM_OUTPUT | WINED3D_BIND_UNORDERED_ACCESS)))
++        memory_type |= VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
++
+     if (!(wined3d_context_vk_create_bo(context_vk, resource->size,
+-            vk_buffer_usage_from_bind_flags(resource->bind_flags),
+-            vk_memory_type_from_access_flags(resource->access, resource->usage), bo_vk)))
++            vk_buffer_usage_from_bind_flags(resource->bind_flags), memory_type, bo_vk)))
+     {
+         WARN("Failed to create Vulkan buffer.\n");
+         free(bo_vk);
+diff --git a/dlls/wined3d/wined3d_vk.h b/dlls/wined3d/wined3d_vk.h
+index 3c38b47..70fb9f9 100644
+--- a/dlls/wined3d/wined3d_vk.h
++++ b/dlls/wined3d/wined3d_vk.h
+@@ -834,6 +834,7 @@ struct wined3d_adapter_vk
+ 
+     VkPhysicalDeviceLimits device_limits;
+     VkPhysicalDeviceMemoryProperties memory_properties;
++    bool mappable_vram;
+ };
+ 
+ static inline struct wined3d_adapter_vk *wined3d_adapter_vk(struct wined3d_adapter *adapter)

@@ -1,0 +1,116 @@
+diff --git a/tools/widl/metadata.c b/tools/widl/metadata.c
+index 4d70254..1a3d78d 100644
+--- a/tools/widl/metadata.c
++++ b/tools/widl/metadata.c
+@@ -1652,6 +1652,16 @@ static void create_typeref( type_t *type )
+ 
+     if (base_type->md.ref) return;
+ 
++    /* A parameterized type is encoded as GENERICINST plus its arguments, so each
++     * argument needs a reference of its own; without one the encoder would emit a
++     * class token of zero and the CLR rejects the whole signature. */
++    if (base_type->winmd_params)
++    {
++        typeref_t *ref;
++        LIST_FOR_EACH_ENTRY( ref, base_type->winmd_params, typeref_t, entry )
++            create_typeref( ref->type );
++    }
++
+     /* basic types don't get a reference */
+     if (!base_type->name) return;
+ 
+@@ -1869,13 +1879,57 @@ static UINT make_type_sig( const type_t *type, BYTE *buf )
+         break;
+ 
+     case TYPE_INTERFACE:
+-        buf[len++] = ELEMENT_TYPE_OBJECT;
++        /* IInspectable and HSTRING are WinRT fundamentals: create_typeref()
++         * deliberately leaves md.ref zero for them and IInspectable projects to
++         * System.Object. Every other interface has to be encoded as a real type
++         * reference. Encoding them all as ELEMENT_TYPE_OBJECT makes the CLR
++         * project every interface parameter and return value as Object, so a
++         * caller compiled against the true signature fails to bind:
++         *   MissingMethodException: 'IAsyncOperation`1<StorageFile>
++         *     SharedStorageAccessManager.RedeemTokenForFileAsync(String)'
++         * Runtimeclasses and delegates below already do this correctly. */
++        if (!type->md.ref) buf[len++] = ELEMENT_TYPE_OBJECT;
++        else if (type->winmd_params)
++        {
++            typeref_t *ref;
++
++            /* A parameterized interface is a generic instantiation: the open
++             * generic reference followed by its type arguments. */
++            buf[len++] = ELEMENT_TYPE_GENERICINST;
++            buf[len++] = ELEMENT_TYPE_CLASS;
++            len += encode_int( typedef_or_ref(TABLE_TYPEREF, type->md.ref), buf + len );
++            len += encode_int( list_count( type->winmd_params ), buf + len );
++            LIST_FOR_EACH_ENTRY( ref, type->winmd_params, typeref_t, entry )
++                len += make_type_sig( ref->type, buf + len );
++        }
++        else
++        {
++            buf[len++] = ELEMENT_TYPE_CLASS;
++            len += encode_int( typedef_or_ref(TABLE_TYPEREF, type->md.ref), buf + len );
++        }
+         break;
+ 
+     case TYPE_DELEGATE:
+     case TYPE_RUNTIMECLASS:
+-        buf[len++] = ELEMENT_TYPE_CLASS;
+-        len += encode_int( typedef_or_ref(TABLE_TYPEREF, type->md.ref), buf + 1 );
++        if (type->winmd_params)
++        {
++            typeref_t *ref;
++
++            /* A parameterized delegate such as EventHandler<T> is a generic
++             * instantiation too; emitting a bare reference to the open generic
++             * makes the signature invalid. */
++            buf[len++] = ELEMENT_TYPE_GENERICINST;
++            buf[len++] = ELEMENT_TYPE_CLASS;
++            len += encode_int( typedef_or_ref(TABLE_TYPEREF, type->md.ref), buf + len );
++            len += encode_int( list_count( type->winmd_params ), buf + len );
++            LIST_FOR_EACH_ENTRY( ref, type->winmd_params, typeref_t, entry )
++                len += make_type_sig( ref->type, buf + len );
++        }
++        else
++        {
++            buf[len++] = ELEMENT_TYPE_CLASS;
++            len += encode_int( typedef_or_ref(TABLE_TYPEREF, type->md.ref), buf + len );
++        }
+         break;
+ 
+     case TYPE_ENUM:
+diff --git a/tools/widl/typetree.c b/tools/widl/typetree.c
+index 4aa3d95..9fbe4a6 100644
+--- a/tools/widl/typetree.c
++++ b/tools/widl/typetree.c
+@@ -56,6 +56,7 @@ type_t *make_type(enum type_type type)
+     t->param_name = NULL;
+     t->short_name = NULL;
+     t->winmd_short_name = NULL;
++    t->winmd_params = NULL;
+     memset(&t->details, 0, sizeof(t->details));
+     memset(&t->md, 0, sizeof(t->md));
+     t->typestring_offset = 0;
+@@ -1569,6 +1570,9 @@ type_t *type_parameterized_type_specialize_declare(type_t *type, typeref_list_t
+     new_type->short_name = format_parameterized_type_short_name(type, params, "");
+     new_type->param_name = format_parameterized_type_c_name(type, params, "", "__C");
+     new_type->winmd_short_name = format_parameterized_type_winmd_short_name(type, params);
++    /* keep the type arguments: a parameterized interface must be encoded in a
++     * signature as ELEMENT_TYPE_GENERICINST followed by its arguments. */
++    new_type->winmd_params = params;
+ 
+     if (new_type->type_type == TYPE_DELEGATE)
+     {
+diff --git a/tools/widl/widltypes.h b/tools/widl/widltypes.h
+index 03b4daf..ac0a0c3 100644
+--- a/tools/widl/widltypes.h
++++ b/tools/widl/widltypes.h
+@@ -547,6 +547,7 @@ struct _type_t {
+   const char *param_name;         /* used to build c_name of a parameterized type, when used as a parameter */
+   const char *short_name;         /* widl specific short name */
+   const char *winmd_short_name;   /* metadata short name for parameterized type */
++  typeref_list_t *winmd_params;   /* type arguments, for ELEMENT_TYPE_GENERICINST */
+   unsigned int typestring_offset;
+   unsigned int ptrdesc;           /* used for complex structs */
+   int typelib_idx;

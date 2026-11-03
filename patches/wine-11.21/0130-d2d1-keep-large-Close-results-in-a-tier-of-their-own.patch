@@ -1,0 +1,119 @@
+From 854149f2018a581f6465d8e33fe06330f1715a01 Mon Sep 17 00:00:00 2001
+From: jfacemyer <1776340+jfacemyer@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 12:36:38 -0500
+Subject: [PATCH 2/2] d2d1: Keep large Close() results in a tier of their own.
+
+The close cache skipped any result over a sixteenth of its 24 MiB budget,
+so a large path was recomputed every time. Affinity closes the same path
+several times while selecting or moving it: five times on selecting a
+138,242-curve engraving and six to ten times per nudge, at about a second
+each.
+
+Large results now go to their own LRU with a 128 MiB budget, apart from
+the small ones, so they cannot push out the thousands of glyph and ruler
+paths the cache is for. A hit on that engraving takes 7 ms. In Affinity,
+selecting it went from 7 s to 2 s and a nudge from 8-11 s to 2-3 s, one
+computed close each; undo is all hits.
+---
+ dlls/d2d1/geometry.c | 50 +++++++++++++++++++++++++++++++++-----------
+ 1 file changed, 38 insertions(+), 12 deletions(-)
+
+diff --git a/dlls/d2d1/geometry.c b/dlls/d2d1/geometry.c
+index f1ce55d..0002744 100644
+--- a/dlls/d2d1/geometry.c
++++ b/dlls/d2d1/geometry.c
+@@ -4900,6 +4900,11 @@ oom:
+ #define D2D_CLOSE_CACHE_MIN_VERTICES 8
+ #define D2D_CLOSE_CACHE_BUCKETS 1024
+ #define D2D_CLOSE_CACHE_MAX_BYTES (24u << 20)
++/* Results bigger than a sixteenth of that are kept apart, in their own LRU
++ * with its own budget, so that one very large path cannot push out the
++ * thousands of small ones the cache is for. Affinity closes the same large
++ * path several times while selecting or moving it. */
++#define D2D_CLOSE_CACHE_LARGE_MAX_BYTES (128u << 20)
+ 
+ struct d2d_close_cache_figure
+ {
+@@ -4918,6 +4923,7 @@ struct d2d_close_cache_entry
+     struct list bucket_entry;
+     UINT64 hash;
+     size_t bytes;
++    BOOL large;
+ 
+     unsigned char *key;
+     size_t key_size;
+@@ -4939,7 +4945,9 @@ static struct
+     struct list buckets[D2D_CLOSE_CACHE_BUCKETS];
+     BOOL initialised;
+     size_t bytes;
+-} d2d_close_cache = {SRWLOCK_INIT, LIST_INIT(d2d_close_cache.lru)};
++    struct list large_lru;
++    size_t large_bytes;
++} d2d_close_cache = {SRWLOCK_INIT, LIST_INIT(d2d_close_cache.lru), .large_lru = LIST_INIT(d2d_close_cache.large_lru)};
+ 
+ static void *d2d_memdup(const void *src, size_t size)
+ {
+@@ -5253,7 +5261,7 @@ static BOOL d2d_geometry_close_cache_lookup(struct d2d_geometry *geometry,
+             if ((found = d2d_geometry_close_cache_apply(geometry, entry)))
+             {
+                 list_remove(&entry->lru_entry);
+-                list_add_head(&d2d_close_cache.lru, &entry->lru_entry);
++                list_add_head(entry->large ? &d2d_close_cache.large_lru : &d2d_close_cache.lru, &entry->lru_entry);
+             }
+             break;
+         }
+@@ -5319,7 +5327,8 @@ static void d2d_geometry_close_cache_store(const struct d2d_geometry *geometry,
+                 + entry->face_count * sizeof(*entry->faces)
+                 + entry->bezier_vertex_count * sizeof(*entry->bezier_vertices);
+     }
+-    if (!ok || entry->bytes > D2D_CLOSE_CACHE_MAX_BYTES / 16)
++    entry->large = entry->bytes > D2D_CLOSE_CACHE_MAX_BYTES / 16;
++    if (!ok || entry->bytes > D2D_CLOSE_CACHE_LARGE_MAX_BYTES / 2)
+     {
+         d2d_close_cache_entry_free(entry);
+         return;
+@@ -5344,15 +5353,32 @@ static void d2d_geometry_close_cache_store(const struct d2d_geometry *geometry,
+         }
+     }
+     list_add_head(bucket, &entry->bucket_entry);
+-    list_add_head(&d2d_close_cache.lru, &entry->lru_entry);
+-    d2d_close_cache.bytes += entry->bytes;
+-    while (d2d_close_cache.bytes > D2D_CLOSE_CACHE_MAX_BYTES && (tail = list_tail(&d2d_close_cache.lru)))
+-    {
+-        old = LIST_ENTRY(tail, struct d2d_close_cache_entry, lru_entry);
+-        list_remove(&old->lru_entry);
+-        list_remove(&old->bucket_entry);
+-        d2d_close_cache.bytes -= old->bytes;
+-        d2d_close_cache_entry_free(old);
++    if (entry->large)
++    {
++        list_add_head(&d2d_close_cache.large_lru, &entry->lru_entry);
++        d2d_close_cache.large_bytes += entry->bytes;
++        while (d2d_close_cache.large_bytes > D2D_CLOSE_CACHE_LARGE_MAX_BYTES
++                && (tail = list_tail(&d2d_close_cache.large_lru)))
++        {
++            old = LIST_ENTRY(tail, struct d2d_close_cache_entry, lru_entry);
++            list_remove(&old->lru_entry);
++            list_remove(&old->bucket_entry);
++            d2d_close_cache.large_bytes -= old->bytes;
++            d2d_close_cache_entry_free(old);
++        }
++    }
++    else
++    {
++        list_add_head(&d2d_close_cache.lru, &entry->lru_entry);
++        d2d_close_cache.bytes += entry->bytes;
++        while (d2d_close_cache.bytes > D2D_CLOSE_CACHE_MAX_BYTES && (tail = list_tail(&d2d_close_cache.lru)))
++        {
++            old = LIST_ENTRY(tail, struct d2d_close_cache_entry, lru_entry);
++            list_remove(&old->lru_entry);
++            list_remove(&old->bucket_entry);
++            d2d_close_cache.bytes -= old->bytes;
++            d2d_close_cache_entry_free(old);
++        }
+     }
+     ReleaseSRWLockExclusive(&d2d_close_cache.lock);
+ }
+-- 
+2.55.0
+

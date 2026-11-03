@@ -1,0 +1,52 @@
+winex11: Manage owned windows that are neither popups nor topmost.
+
+is_window_managed() leaves a window unmanaged (override-redirect) when it
+is shown without activation and has no caption, frame, popup system menu,
+WS_EX_APPWINDOW or owned popups. A borderless WPF window owned by the main
+window, such as Affinity's sub-tool panel, is exactly that. KWin on Wayland
+keeps override-redirect windows above every window, so the panel stayed
+above other applications after the user switched to them. On Windows an
+owned window that is not topmost stays above its owner and goes behind
+other applications with it, which only the window manager can do. Manage
+such windows; popups (menus, tooltips, WPF popups) and topmost windows stay
+unmanaged.
+
+Also leave owned windows without a caption out of the pager and of KDE's
+window switcher, as Windows leaves owned windows out of Alt-Tab: managed,
+the panel had become an Alt-Tab entry of its own. Owned dialogs keep their
+entry.
+
+With a native Wayland window activated over it, the panel is covered;
+before, it stayed on top. KWin sees it as a transient of the main window,
+in the normal layer, at the position Affinity gives it.
+
+diff --git a/dlls/winex11.drv/window.c b/dlls/winex11.drv/window.c
+index f1ed029..b3bb8c3 100644
+--- a/dlls/winex11.drv/window.c
++++ b/dlls/winex11.drv/window.c
+@@ -464,6 +464,11 @@ static BOOL is_window_managed( HWND hwnd, UINT swp_flags, BOOL fullscreen )
+     if (ex_style & WS_EX_APPWINDOW) return TRUE;
+     /* windows that own popups are managed */
+     if (has_owned_popups( hwnd )) return TRUE;
++    /* owned windows that are neither popups nor topmost are managed: they
++     * belong above their owner and below other applications' windows, and
++     * only the window manager can keep them there. An unmanaged window stays
++     * above every window, under KWin on Wayland at least. */
++    if (!(style & WS_POPUP) && !(ex_style & WS_EX_TOPMOST) && NtUserGetWindowRelative( hwnd, GW_OWNER )) return TRUE;
+     /* default: not managed */
+     return FALSE;
+ }
+@@ -1540,7 +1545,13 @@ static void update_net_wm_states( struct x11drv_win_data *data )
+             || (ex_style & WS_EX_TOOLWINDOW && !(ex_style & WS_EX_APPWINDOW)))
+             new_state |= (1 << NET_WM_STATE_SKIP_TASKBAR) | (1 << NET_WM_STATE_SKIP_PAGER) | (1 << KDE_NET_WM_STATE_SKIP_SWITCHER);
+         else if (!(ex_style & WS_EX_APPWINDOW) && NtUserGetWindowRelative( data->hwnd, GW_OWNER ))
++        {
+             new_state |= (1 << NET_WM_STATE_SKIP_TASKBAR);
++            /* an owned window without a caption is a panel or palette, which
++             * Windows leaves out of Alt-Tab; owned dialogs stay in it */
++            if ((style & WS_CAPTION) != WS_CAPTION)
++                new_state |= (1 << NET_WM_STATE_SKIP_PAGER) | (1 << KDE_NET_WM_STATE_SKIP_SWITCHER);
++        }
+     }
+ 
+     window_set_net_wm_state( data, new_state );

@@ -1,0 +1,412 @@
+opencl: Deliver event callbacks from a dispatcher thread, and flush for real.
+
+ElementalWarrior's OpenCL bridge delivers clSetEventCallback callbacks by
+polling, as a side effect of later OpenCL calls (base 0003, retimed by the
+set's 0012), and its 0030 turns clFlush into a no-op. Affinity registers a
+completion callback while starting up and then waits for it without making
+another OpenCL call, so the callback never ran -- and with clFlush gone the
+command it waited on was not necessarily submitted at all. Affinity hung at
+startup whenever OpenCL was enabled on a real GPU, which is why the
+launchers disable opencl.dll.
+
+Register callbacks with the host driver. The driver fires them on threads
+of its own, which cannot run PE code, so the unix side takes a reference to
+the event and queues it, and one Wine thread, started on first use, calls
+the application's callback and releases the event, the way a Windows driver
+calls it from a thread of its own. Callbacks run one at a time in the order
+the driver fired them. clFlush submits the queue again. clSVMAlloc and
+clSVMFree, which the bridge did not export, are added.
+
+With this, Affinity 3.3 starts with OpenCL on an Intel Arc A750 (2026-10-02);
+filter-heavy exports are ~30% faster, interactive work unchanged. opencl=d
+stays the default in the launchers until this is in a release.
+
+diff --git a/dlls/opencl/opencl.spec b/dlls/opencl/opencl.spec
+index 31270c0..44fc670 100644
+--- a/dlls/opencl/opencl.spec
++++ b/dlls/opencl/opencl.spec
+@@ -96,3 +96,5 @@
+ @ stdcall clUnloadCompiler()
+ @ stdcall clUnloadPlatformCompiler(ptr)
+ @ stdcall clWaitForEvents(long ptr)
++@ stdcall clSVMAlloc(ptr int64 long long)
++@ stdcall clSVMFree(ptr ptr)
+diff --git a/dlls/opencl/pe_thunks.c b/dlls/opencl/pe_thunks.c
+index 4876b82..393b61e 100644
+--- a/dlls/opencl/pe_thunks.c
++++ b/dlls/opencl/pe_thunks.c
+@@ -7,71 +7,56 @@
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(opencl);
+ 
+-/* Event callback tracking for clSetEventCallback */
+-/* Fires callbacks as a side effect of other OpenCL API calls */
+-
+-struct event_callback
+-{
+-    struct event_callback *next;
+-    cl_event event;
+-    cl_int trigger_status;
+-    cl_int actual_status;
+-    void (WINAPI *pfn_notify)(cl_event event, cl_int event_command_status, void *user_data);
+-    void *user_data;
+-};
+-
++/* Event callbacks for clSetEventCallback.
++ *
++ * Registered with the host driver for real. The driver fires them on threads
++ * of its own, which cannot run PE code, so the unix side queues each one and
++ * this dispatcher thread -- a Wine thread, started on first use -- calls the
++ * application's callback, the way a Windows driver calls it from a thread of
++ * its own. Callbacks run one at a time, in the order the driver fired them.
++ *
++ * Callbacks used to be fired only as a side effect of later OpenCL calls. An
++ * application that registers a completion callback and then waits for it --
++ * Affinity does exactly that while starting up -- makes no further call, so
++ * the callback never ran and the application waited forever. */
++
++struct event_callback;
+ struct event_callback *callback_list;
+-static SRWLOCK callback_lock = SRWLOCK_INIT;
+-static LONG pending_callbacks;
+ 
+-static void check_completed_callbacks(void)
++static void release_callback_event( cl_event event )
+ {
+-    struct event_callback *completed = NULL;
+-    struct event_callback **pp;
+-    cl_int i = 0;
++    struct clReleaseEvent_params params = { event };
++    OPENCL_CALL( clReleaseEvent, &params );
++}
+ 
+-    if (!pending_callbacks) return;
++static DWORD WINAPI event_callback_dispatcher( void *arg )
++{
++    struct wait_event_callback_params params;
+ 
+-    AcquireSRWLockShared(&callback_lock);
+-    pp = &callback_list;
+-    while (*pp)
++    SetThreadDescription( GetCurrentThread(), L"wine_opencl_callbacks" );
++    for (;;)
+     {
+-        struct event_callback *cb = *pp;
+-        struct clGetEventInfo_params params;
+-        cl_int status;
+-
+-        params.event = cb->event;
+-        params.param_name = CL_EVENT_COMMAND_EXECUTION_STATUS;
+-        params.param_value_size = sizeof(status);
+-        params.param_value = &status;
+-        params.param_value_size_ret = NULL;
+-        OPENCL_CALL(clGetEventInfo, &params);
+-        i++;
+-
+-        if (status == cb->trigger_status || status < 0)
+-        {
+-            cb->actual_status = status;
+-            *pp = cb->next;
+-            cb->next = completed;
+-            completed = cb;
+-            continue;
+-        }
+-        pp = &cb->next;
++        OPENCL_CALL( wait_event_callback, &params );
++        TRACE( "event %p reached %d, calling %p\n", params.event, params.status, params.pfn_notify );
++        params.pfn_notify( params.event, params.status, params.user_data );
++        release_callback_event( params.event );
+     }
++    return 0;
++}
+ 
+-    if (i > 10) SwitchToThread();
++static BOOL WINAPI start_event_callback_dispatcher( INIT_ONCE *once, void *param, void **context )
++{
++    HANDLE thread = CreateThread( NULL, 0, event_callback_dispatcher, NULL, 0, NULL );
+ 
+-    ReleaseSRWLockShared(&callback_lock);
++    if (!thread) return FALSE;
++    CloseHandle( thread );
++    return TRUE;
++}
+ 
+-    while (completed)
+-    {
+-        struct event_callback *cb = completed;
+-        completed = cb->next;
+-        TRACE("Firing event callback for event %p (status %d)\n", cb->event, cb->actual_status);
+-        cb->pfn_notify(cb->event, cb->actual_status, cb->user_data);
+-        InterlockedDecrement(&pending_callbacks);
+-        HeapFree(GetProcessHeap(), 0, cb);
+-    }
++/* Nothing to do here any more; kept so the calls added to other entry points
++ * by earlier patches still compile. */
++static void check_completed_callbacks(void)
++{
+ }
+ 
+ 
+@@ -448,8 +433,11 @@ cl_int WINAPI clFinish( cl_command_queue command_queue )
+ 
+ cl_int WINAPI clFlush( cl_command_queue command_queue )
+ {
++    /* Not a hint: clFlush is what submits the queued commands to the device.
++     * Without it a command whose completion is awaited may never be sent. */
++    struct clFlush_params params = { command_queue };
+     TRACE( "(%p)\n", command_queue );
+-    return CL_SUCCESS;
++    return OPENCL_CALL( clFlush, &params );
+ }
+ 
+ cl_int WINAPI clGetCommandQueueInfo( cl_command_queue command_queue, cl_command_queue_info param_name, size_t param_value_size, void* param_value, size_t* param_value_size_ret )
+@@ -686,44 +674,33 @@ cl_int WINAPI clRetainSampler( cl_sampler sampler )
+     return OPENCL_CALL( clRetainSampler, &params );
+ }
+ 
+-cl_int WINAPI clSetEventCallback( cl_event event, cl_int command_exec_callback_type, void (WINAPI* pfn_notify)(cl_event event, cl_int event_command_status, void *user_data), void* user_data )
++void * WINAPI clSVMAlloc( cl_context context, cl_bitfield flags, size_t size, cl_uint alignment )
+ {
+-    struct clGetEventInfo_params info;
+-    cl_int status;
+-    struct event_callback *cb;
+-
+-    TRACE( "(%p, %d, %p, %p)\n", event, command_exec_callback_type, pfn_notify, user_data );
+-
+-    info.event = event;
+-    info.param_name = CL_EVENT_COMMAND_EXECUTION_STATUS;
+-    info.param_value_size = sizeof(status);
+-    info.param_value = &status;
+-    info.param_value_size_ret = NULL;
+-    OPENCL_CALL(clGetEventInfo, &info);
+-
+-    if (status == command_exec_callback_type || status < 0)
+-    {
+-        pfn_notify(event, status, user_data);
+-        return CL_SUCCESS;
+-    }
+-
+-    cb = HeapAlloc(GetProcessHeap(), 0, sizeof(*cb));
+-    if (!cb) return CL_OUT_OF_HOST_MEMORY;
++    void *__retval;
++    struct clSVMAlloc_params params = { &__retval, context, flags, size, alignment };
++    TRACE( "(%p, %s, %Iu, %u)\n", context, wine_dbgstr_longlong(flags), size, alignment );
++    OPENCL_CALL( clSVMAlloc, &params );
++    TRACE( "-> %p\n", __retval );
++    return __retval;
++}
+ 
+-    cb->event = event;
+-    cb->trigger_status = command_exec_callback_type;
+-    cb->pfn_notify = pfn_notify;
+-    cb->user_data = user_data;
++void WINAPI clSVMFree( cl_context context, void *svm_pointer )
++{
++    struct clSVMFree_params params = { context, svm_pointer };
++    TRACE( "(%p, %p)\n", context, svm_pointer );
++    OPENCL_CALL( clSVMFree, &params );
++}
+ 
+-    InterlockedIncrement(&pending_callbacks);
+-    AcquireSRWLockExclusive(&callback_lock);
+-    cb->next = callback_list;
+-    callback_list = cb;
+-    ReleaseSRWLockExclusive(&callback_lock);
++cl_int WINAPI clSetEventCallback( cl_event event, cl_int command_exec_callback_type, void (WINAPI* pfn_notify)(cl_event event, cl_int event_command_status, void *user_data), void* user_data )
++{
++    static INIT_ONCE dispatcher_once = INIT_ONCE_STATIC_INIT;
++    struct clSetEventCallback_params params = { event, command_exec_callback_type, pfn_notify, user_data };
+ 
+-    check_completed_callbacks();
++    TRACE( "(%p, %d, %p, %p)\n", event, command_exec_callback_type, pfn_notify, user_data );
+ 
+-    return CL_SUCCESS;
++    if (!InitOnceExecuteOnce( &dispatcher_once, start_event_callback_dispatcher, NULL, NULL ))
++        return CL_OUT_OF_RESOURCES;
++    return OPENCL_CALL( clSetEventCallback, &params );
+ }
+ 
+ cl_int WINAPI clSetKernelArg( cl_kernel kernel, cl_uint arg_index, size_t arg_size, const void* arg_value )
+diff --git a/dlls/opencl/unix_private.h b/dlls/opencl/unix_private.h
+index 4e6172c..8a2e379 100644
+--- a/dlls/opencl/unix_private.h
++++ b/dlls/opencl/unix_private.h
+@@ -44,6 +44,7 @@
+ #include "unixlib.h"
+ 
+ NTSTATUS wrap_clBuildProgram( void *args );
++NTSTATUS wait_event_callback( void *args );
+ NTSTATUS wrap_clCreateContext( void *args );
+ NTSTATUS wrap_clCreateContextFromType( void *args );
+ NTSTATUS wrap_clEnqueueNativeKernel( void *args );
+diff --git a/dlls/opencl/unix_thunks.c b/dlls/opencl/unix_thunks.c
+index 5de92f4..087ada0 100644
+--- a/dlls/opencl/unix_thunks.c
++++ b/dlls/opencl/unix_thunks.c
+@@ -573,6 +573,22 @@ static NTSTATUS wrap_clWaitForEvents( void *args )
+ #pragma clang diagnostic pop
+ #endif
+ 
++static NTSTATUS wrap_clSVMAlloc( void *args )
++{
++    struct clSVMAlloc_params *params = args;
++
++    *params->__retval = clSVMAlloc( params->context, params->flags, params->size, params->alignment );
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS wrap_clSVMFree( void *args )
++{
++    struct clSVMFree_params *params = args;
++
++    clSVMFree( params->context, params->svm_pointer );
++    return STATUS_SUCCESS;
++}
++
+ const unixlib_entry_t __wine_unix_call_funcs[] =
+ {
+     wrap_clBuildProgram,
+@@ -661,4 +677,7 @@ const unixlib_entry_t __wine_unix_call_funcs[] =
+     wrap_clUnloadCompiler,
+     wrap_clUnloadPlatformCompiler,
+     wrap_clWaitForEvents,
++    wait_event_callback,
++    wrap_clSVMAlloc,
++    wrap_clSVMFree,
+ };
+diff --git a/dlls/opencl/unix_wrappers.c b/dlls/opencl/unix_wrappers.c
+index 0941ed8..b311fa1 100644
+--- a/dlls/opencl/unix_wrappers.c
++++ b/dlls/opencl/unix_wrappers.c
+@@ -21,6 +21,7 @@
+ #endif
+ 
+ #include "config.h"
++#include <pthread.h>
+ #include <stdlib.h>
+ #include "unix_private.h"
+ 
+@@ -62,12 +63,76 @@ NTSTATUS wrap_clEnqueueNativeKernel( void *args )
+     return CL_INVALID_OPERATION;
+ }
+ 
++/* Event callbacks. The host calls them on a driver thread, which is not a
++ * Wine thread and cannot run the application's code. So the host callback
++ * only takes a reference to the event and queues it; a PE thread blocked in
++ * wait_event_callback() takes it off the queue and calls the application,
++ * then releases the event. One node per registration, allocated up front so
++ * the host callback never has to allocate. */
++struct event_callback_node
++{
++    struct event_callback_node *next;
++    cl_event event;
++    cl_int status;
++    void (WINAPI *pfn_notify)(cl_event event, cl_int event_command_status, void *user_data);
++    void *user_data;
++};
++
++static pthread_mutex_t fired_mutex = PTHREAD_MUTEX_INITIALIZER;
++static pthread_cond_t fired_cond = PTHREAD_COND_INITIALIZER;
++static struct event_callback_node *fired_head, *fired_tail;
++
++static void CL_CALLBACK host_event_callback( cl_event event, cl_int status, void *data )
++{
++    struct event_callback_node *node = data;
++
++    clRetainEvent( event );  /* the application's callback runs after this returns */
++    node->event = event;
++    node->status = status;
++    node->next = NULL;
++
++    pthread_mutex_lock( &fired_mutex );
++    if (fired_tail) fired_tail->next = node;
++    else fired_head = node;
++    fired_tail = node;
++    pthread_cond_signal( &fired_cond );
++    pthread_mutex_unlock( &fired_mutex );
++}
++
+ NTSTATUS wrap_clSetEventCallback( void *args )
+ {
+     struct clSetEventCallback_params *params = args;
+-    TRACE("(%p, %i, %p, %p) \n", params->event, params->command_exec_callback_type, params->pfn_notify, params->user_data);
+-    FIXME( "not yet implemented\n" );
+-    return CL_SUCCESS;
++    struct event_callback_node *node;
++    cl_int ret;
++
++    TRACE("(%p, %i, %p, %p)\n", params->event, params->command_exec_callback_type, params->pfn_notify, params->user_data);
++
++    if (!(node = calloc( 1, sizeof(*node) ))) return CL_OUT_OF_HOST_MEMORY;
++    node->pfn_notify = params->pfn_notify;
++    node->user_data = params->user_data;
++    if ((ret = clSetEventCallback( params->event, params->command_exec_callback_type,
++                                   host_event_callback, node )))
++        free( node );
++    return ret;
++}
++
++NTSTATUS wait_event_callback( void *args )
++{
++    struct wait_event_callback_params *params = args;
++    struct event_callback_node *node;
++
++    pthread_mutex_lock( &fired_mutex );
++    while (!fired_head) pthread_cond_wait( &fired_cond, &fired_mutex );
++    node = fired_head;
++    if (!(fired_head = node->next)) fired_tail = NULL;
++    pthread_mutex_unlock( &fired_mutex );
++
++    params->event = node->event;
++    params->status = node->status;
++    params->pfn_notify = node->pfn_notify;
++    params->user_data = node->user_data;
++    free( node );
++    return STATUS_SUCCESS;
+ }
+ 
+ NTSTATUS wrap_clSetMemObjectDestructorCallback( void *args )
+diff --git a/dlls/opencl/unixlib.h b/dlls/opencl/unixlib.h
+index 5a9b155..08bcbf6 100644
+--- a/dlls/opencl/unixlib.h
++++ b/dlls/opencl/unixlib.h
+@@ -762,6 +762,31 @@ struct clSetEventCallback_params
+     void* user_data;
+ };
+ 
++struct clSVMAlloc_params
++{
++    void** __retval;
++    cl_context context;
++    ULONGLONG flags;
++    SIZE_T size;
++    cl_uint alignment;
++};
++
++struct clSVMFree_params
++{
++    cl_context context;
++    void* svm_pointer;
++};
++
++/* Not an OpenCL entry point: blocks until the host has fired an event
++ * callback registered through clSetEventCallback, and returns it. */
++struct wait_event_callback_params
++{
++    cl_event event;
++    cl_int status;
++    void (WINAPI* pfn_notify)(cl_event event, cl_int event_command_status, void *user_data);
++    void* user_data;
++};
++
+ struct clSetKernelArg_params
+ {
+     cl_kernel kernel;
+@@ -886,4 +911,7 @@ enum opencl_funcs
+     unix_clUnloadCompiler,
+     unix_clUnloadPlatformCompiler,
+     unix_clWaitForEvents,
++    unix_wait_event_callback,
++    unix_clSVMAlloc,
++    unix_clSVMFree,
+ };

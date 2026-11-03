@@ -1,0 +1,150 @@
+user32: Fix the drop target session's effects and leave.
+
+Several parts of the drag and drop session differed from native ole32,
+and the drop target saw the differences:
+
+- DragEnter's chosen effect was discarded, so the source was answered
+  with the previous window's effect, or none, until the next DragOver.
+  On KWin every such flip makes the Xwayland bridge resend a stale
+  position.
+- The effects DragEnter and DragOver chose were not limited to the ones
+  the source allows, and the answer to the source was not the chosen
+  effect.
+- Drop got the effect chosen last instead of the effects the source
+  allows.
+- When a new drag started before the last one left its target, the
+  DragLeave came from the data object's final release, which can happen
+  much later, when the application's runtime frees its wrapper. That
+  DragLeave arrived in the middle of a later drag, and WPF fails fast
+  ("Unrecoverable system error") on the next DragOver.
+
+Use DragEnter's effect, limit every result to the allowed effects, pass
+Drop the allowed effects, and leave the old target in drag_drop_enter
+instead of in the final release.
+---
+ dlls/user32/clipboard.c | 55 ++++++++++++++++++++++++++++++++++++++-----------
+ 1 file changed, 43 insertions(+), 12 deletions(-)
+
+diff --git a/dlls/user32/clipboard.c b/dlls/user32/clipboard.c
+index 4a05d40..da25686 100644
+--- a/dlls/user32/clipboard.c
++++ b/dlls/user32/clipboard.c
+@@ -673,6 +673,7 @@ struct data_object
+     HWND target_hwnd; /* the last window the mouse was over */
+     POINT target_pos;
+     DWORD target_effect;
++    DWORD allowed_effect; /* the effects the source allows, from the last position */
+     IDropTarget *drop_target;
+ 
+     struct format_entry *entries_end;
+@@ -862,12 +863,11 @@ static ULONG WINAPI data_object_Release( IDataObject *iface )
+ 
+     if (!ref)
+     {
+-        if (object->drop_target)
+-        {
+-            HRESULT hr = IDropTarget_DragLeave( object->drop_target );
+-            if (FAILED(hr)) WARN( "IDropTarget_DragLeave returned %#lx\n", hr );
+-            IDropTarget_Release( object->drop_target );
+-        }
++        /* The session leaves its target in drag_drop_enter, drag_drop_leave and
++         * drag_drop_drop. The final release can come much later, when the application's
++         * runtime frees its wrapper, and a DragLeave from here would arrive in the middle
++         * of a later drag: WPF then fails fast on the next DragOver. */
++        if (object->drop_target) IDropTarget_Release( object->drop_target );
+ 
+         free( object );
+     }
+@@ -1148,7 +1148,19 @@ BOOL drag_drop_enter( UINT entries_size, const struct format_entry *entries )
+     dnd_data_object = object;
+     LeaveCriticalSection( &clipboard_cs );
+ 
+-    if (previous) IDataObject_Release( previous );
++    if (previous)
++    {
++        /* a new drag started without the last one leaving its target: leave it now */
++        struct data_object *old = data_object_from_IDataObject( previous );
++        if (old->drop_target)
++        {
++            HRESULT hr = IDropTarget_DragLeave( old->drop_target );
++            if (FAILED(hr)) WARN( "IDropTarget_DragLeave returned %#lx\n", hr );
++            IDropTarget_Release( old->drop_target );
++            old->drop_target = NULL;
++        }
++        IDataObject_Release( previous );
++    }
+     return TRUE;
+ }
+ 
+@@ -1179,6 +1191,7 @@ DWORD drag_drop_drag( HWND hwnd, POINT point, DWORD effect )
+ 
+     if (!(object = get_data_object( FALSE ))) return DROPEFFECT_NONE;
+     object->target_pos = point;
++    object->allowed_effect = effect;
+     hwnd = window_from_point_dnd( hwnd, object->target_pos );
+ 
+     if (!object->drop_target || object->target_hwnd != hwnd)
+@@ -1193,6 +1206,7 @@ DWORD drag_drop_drag( HWND hwnd, POINT point, DWORD effect )
+             IDropTarget_Release( object->drop_target );
+             object->drop_target = NULL;
+         }
++        object->target_effect = DROPEFFECT_NONE;
+ 
+         dropTargetWindow = hwnd;
+         do { object->drop_target = get_droptarget_pointer( dropTargetWindow ); }
+@@ -1201,10 +1215,18 @@ DWORD drag_drop_drag( HWND hwnd, POINT point, DWORD effect )
+ 
+         if (object->drop_target)
+         {
+-            DWORD effect_ignore = effect;
++            DWORD effect_enter = effect;
+             hr = IDropTarget_DragEnter( object->drop_target, &object->IDataObject_iface,
+-                                        MK_LBUTTON, pointl, &effect_ignore );
+-            if (hr == S_OK) TRACE( "the application accepted the drop (effect = %ld)\n", effect_ignore );
++                                        MK_LBUTTON, pointl, &effect_enter );
++            /* What DragEnter chose is the current effect until the next DragOver, as with
++             * native ole32. Ignoring it answered the source with the previous window's
++             * effect, or none: on KWin every such flip makes its Xwayland bridge resend a
++             * stale position. */
++            if (hr == S_OK)
++            {
++                TRACE( "the application accepted the drop (effect = %ld)\n", effect_enter );
++                object->target_effect = effect_enter & effect;
++            }
+             else
+             {
+                 WARN( "IDropTarget_DragEnter returned %#lx\n", hr );
+@@ -1215,13 +1237,18 @@ DWORD drag_drop_drag( HWND hwnd, POINT point, DWORD effect )
+     }
+     else if (object->drop_target)
+     {
+-        hr = IDropTarget_DragOver( object->drop_target, MK_LBUTTON, pointl, &effect );
+-        if (hr == S_OK) object->target_effect = effect;
++        DWORD effect_over = effect;
++        hr = IDropTarget_DragOver( object->drop_target, MK_LBUTTON, pointl, &effect_over );
++        /* the target may only choose among the effects the source allows */
++        if (hr == S_OK) object->target_effect = effect_over & effect;
+         else WARN( "IDropTarget_DragOver returned %#lx\n", hr );
+     }
+ 
+     if (object->drop_target && object->target_effect != DROPEFFECT_NONE)
++    {
+         accept = 1;
++        effect = object->target_effect;
++    }
+     else
+     {
+         /* fallback search for window able to accept these files. */
+@@ -1258,8 +1285,12 @@ DWORD drag_drop_drop( HWND hwnd )
+         POINTL pointl = {object->target_pos.x, object->target_pos.y};
+         HRESULT hr;
+ 
++        /* Drop gets the effects the source allows, as with native ole32, not the one
++         * chosen last; the result is limited to them */
++        effect = object->allowed_effect ? object->allowed_effect : effect;
+         hr = IDropTarget_Drop( object->drop_target, &object->IDataObject_iface,
+                                MK_LBUTTON, pointl, &effect );
++        if (object->allowed_effect) effect &= object->allowed_effect;
+         if (hr == S_OK)
+         {
+             if (effect != DROPEFFECT_NONE)

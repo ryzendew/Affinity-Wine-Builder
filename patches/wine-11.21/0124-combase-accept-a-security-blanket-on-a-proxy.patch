@@ -1,0 +1,39 @@
+combase: Accept a security blanket on a proxy.
+
+Calls are not authenticated, so there is nothing to change; Windows
+accepts the blanket. .NET's System.Management sets one on every WMI
+proxy and fails the query when that fails.
+---
+ dlls/combase/marshal.c     | 5 ++++-
+ dlls/ole32/tests/marshal.c | 2 +-
+ 2 files changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/dlls/combase/marshal.c b/dlls/combase/marshal.c
+index 6e3d35c..b2c74ee 100644
+--- a/dlls/combase/marshal.c
++++ b/dlls/combase/marshal.c
+@@ -1394,7 +1394,10 @@ static HRESULT WINAPI ProxyCliSec_SetBlanket(IClientSecurity *iface,
+     FIXME("%p, %ld, %ld, %s, %ld, %ld, %p, %#lx: stub\n", pProxy, AuthnSvc, AuthzSvc,
+           pServerPrincName == COLE_DEFAULT_PRINCIPAL ? "<default principal>" : debugstr_w(pServerPrincName),
+           AuthnLevel, ImpLevel, pAuthInfo, Capabilities);
+-    return E_NOTIMPL;
++    /* Calls are not authenticated, so there is nothing to change. Windows
++     * accepts a blanket on a proxy, and .NET's System.Management sets one on
++     * each WMI proxy and fails the query when that fails. */
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI ProxyCliSec_CopyProxy(IClientSecurity *iface,
+diff --git a/dlls/ole32/tests/marshal.c b/dlls/ole32/tests/marshal.c
+index 0e13c9d..c89f6a2 100644
+--- a/dlls/ole32/tests/marshal.c
++++ b/dlls/ole32/tests/marshal.c
+@@ -3907,7 +3907,7 @@ static void test_client_security(void)
+     todo_wine ok_ole_success(hr, "IClientSecurity_QueryBlanket");
+ 
+     hr = IClientSecurity_SetBlanket(pCliSec, (IUnknown *)pProxy, dwAuthnSvc, dwAuthzSvc, pServerPrincName, dwAuthnLevel, RPC_C_IMP_LEVEL_IMPERSONATE, pAuthInfo, dwCapabilities);
+-    todo_wine ok_ole_success(hr, "IClientSecurity_SetBlanket");
++    ok_ole_success(hr, "IClientSecurity_SetBlanket");
+ 
+     hr = IClassFactory_CreateInstance(pProxy, NULL, &IID_IWineTest, &pv);
+     ok(hr == E_NOINTERFACE, "COM call should have succeeded instead of returning 0x%08lx\n", hr);

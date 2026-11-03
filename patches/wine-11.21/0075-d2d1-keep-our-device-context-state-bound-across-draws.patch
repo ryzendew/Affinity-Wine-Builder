@@ -1,0 +1,227 @@
+d2d1: Keep our device context state bound across draws.
+
+Each primitive Direct2D drew swapped its own ID3DDeviceContextState in and
+the application's back out: two full state switches per draw, each a
+state comparison and a burst of commands on wined3d's queue. With hundreds
+of primitives per frame that was a large part of Affinity's cost of
+drawing selection outlines, handles and node edits.
+
+Keep our state bound from the first draw and give the application its
+state back where it can use the device context again: at EndDraw, Flush
+and SetTarget, when the context is destroyed, and before another device
+context draws on the same Direct3D device, so that ours is never saved as
+the application's. Native Direct2D only submits its batched drawing at
+those points too. WINE_D2D_NO_STATE_BATCHING=1 restores the old
+behaviour.
+
+The d2d1 conformance tests give the same result before and after (17491
+tests, 0 failures). In Affinity under a nested KWin, three rounds each,
+CPU per presented frame on wined3d's command thread and the UI thread:
+
+                 before          after
+  drag         7.5 / 11.4 ms   6.0 / 10.3 ms   (frames 216 -> 234)
+  node edit    7.3 / 10.3 ms   5.7 /  9.0 ms   (frames 164 -> 179)
+  zoom         9.4 / 12.2 ms   7.7 / 10.3 ms
+
+Selections, handles and node editing drew correctly.
+
+diff --git a/dlls/d2d1/d2d1_private.h b/dlls/d2d1/d2d1_private.h
+index 2500a6c..055c79c 100644
+--- a/dlls/d2d1/d2d1_private.h
++++ b/dlls/d2d1/d2d1_private.h
+@@ -203,6 +203,7 @@ struct d2d_device_context
+         ID3D11Buffer *buffer;
+         unsigned int size, pos;
+     } upload_ring;
++    ID3DDeviceContextState *batch_prev_state; /* the application's state, while ours stays bound */
+     ID3D11Buffer *vs_cb;
+     ID3D11PixelShader *ps;
+     ID3D11Buffer *ps_cb;
+diff --git a/dlls/d2d1/device.c b/dlls/d2d1/device.c
+index 36f63b1..e1e3823 100644
+--- a/dlls/d2d1/device.c
++++ b/dlls/d2d1/device.c
+@@ -116,6 +116,115 @@ static void d2d_clip_stack_pop(struct d2d_clip_stack *stack)
+     --stack->count;
+ }
+ 
++/* Direct2D draws with its own device context state, and swapped it in and the
++ * application's back out around every primitive: two full state switches per
++ * draw, a large part of the cost of drawing for an application that draws
++ * hundreds of primitives per frame. Keep our state bound across draws instead,
++ * and give the application its state back where it can use the device context
++ * again: at EndDraw, Flush and SetTarget, when the context goes away, and
++ * before another device context draws on the same Direct3D device. Native
++ * Direct2D only submits its batched drawing at those points too.
++ *
++ * Setting WINE_D2D_NO_STATE_BATCHING=1 restores the old behaviour. */
++static CRITICAL_SECTION d2d_batch_cs;
++static CRITICAL_SECTION_DEBUG d2d_batch_cs_debug =
++{
++    0, 0, &d2d_batch_cs,
++    {&d2d_batch_cs_debug.ProcessLocksList, &d2d_batch_cs_debug.ProcessLocksList},
++    0, 0, {(DWORD_PTR)(__FILE__ ": d2d_batch_cs")}
++};
++static CRITICAL_SECTION d2d_batch_cs = {&d2d_batch_cs_debug, -1, 0, 0, 0, 0};
++
++static struct
++{
++    ID3D11Device1 *device;
++    struct d2d_device_context *context;
++} d2d_batch_owners[16];
++
++static BOOL d2d_state_batching(void)
++{
++    static int enabled = -1;
++    char buf[8];
++
++    if (enabled < 0)
++        enabled = !(GetEnvironmentVariableA("WINE_D2D_NO_STATE_BATCHING", buf, sizeof(buf)) && atoi(buf));
++    return enabled;
++}
++
++/* Restore the application's state if this context still has ours bound. */
++static void d2d_device_context_end_batch(struct d2d_device_context *context)
++{
++    ID3D11DeviceContext1 *d3d_context;
++    unsigned int i;
++
++    EnterCriticalSection(&d2d_batch_cs);
++    if (context->batch_prev_state)
++    {
++        ID3D11Device1_GetImmediateContext1(context->d3d_device, &d3d_context);
++        ID3D11DeviceContext1_SwapDeviceContextState(d3d_context, context->batch_prev_state, NULL);
++        ID3DDeviceContextState_Release(context->batch_prev_state);
++        context->batch_prev_state = NULL;
++        ID3D11DeviceContext1_Release(d3d_context);
++    }
++    for (i = 0; i < ARRAY_SIZE(d2d_batch_owners); ++i)
++    {
++        if (d2d_batch_owners[i].context == context)
++            d2d_batch_owners[i].device = NULL, d2d_batch_owners[i].context = NULL;
++    }
++    LeaveCriticalSection(&d2d_batch_cs);
++}
++
++/* Bind our state for a draw. Returns the state to restore right after the draw,
++ * or NULL when it stays bound until the batch ends. */
++static ID3DDeviceContextState *d2d_device_context_begin_draw_state(struct d2d_device_context *context,
++        ID3D11DeviceContext1 *d3d_context)
++{
++    struct d2d_device_context *owner = NULL;
++    ID3DDeviceContextState *prev_state;
++    unsigned int i, slot = ~0u;
++
++    if (!d2d_state_batching())
++    {
++        ID3D11DeviceContext1_SwapDeviceContextState(d3d_context, context->d3d_state, &prev_state);
++        return prev_state;
++    }
++
++    EnterCriticalSection(&d2d_batch_cs);
++    if (context->batch_prev_state)
++    {
++        LeaveCriticalSection(&d2d_batch_cs);
++        return NULL;
++    }
++    for (i = 0; i < ARRAY_SIZE(d2d_batch_owners); ++i)
++    {
++        if (d2d_batch_owners[i].device == context->d3d_device)
++        {
++            owner = d2d_batch_owners[i].context;
++            slot = i;
++            break;
++        }
++        if (!d2d_batch_owners[i].device && slot == ~0u)
++            slot = i;
++    }
++    /* Another context on this device has its state bound: give the application
++     * its state back first, so that ours does not get saved as the
++     * application's. */
++    if (owner)
++        d2d_device_context_end_batch(owner);
++    if (slot == ~0u)
++    {
++        /* Too many devices; do not batch this draw. */
++        LeaveCriticalSection(&d2d_batch_cs);
++        ID3D11DeviceContext1_SwapDeviceContextState(d3d_context, context->d3d_state, &prev_state);
++        return prev_state;
++    }
++    ID3D11DeviceContext1_SwapDeviceContextState(d3d_context, context->d3d_state, &context->batch_prev_state);
++    d2d_batch_owners[slot].device = context->d3d_device;
++    d2d_batch_owners[slot].context = context;
++    LeaveCriticalSection(&d2d_batch_cs);
++    return NULL;
++}
++
+ static void d2d_device_context_draw(struct d2d_device_context *render_target, enum d2d_shape_type shape_type,
+         ID3D11Buffer *ib, unsigned int ib_offset, unsigned int index_count, ID3D11Buffer *vb, unsigned int vb_offset,
+         unsigned int vb_stride, struct d2d_brush *brush, struct d2d_brush *opacity_brush)
+@@ -140,7 +249,7 @@ static void d2d_device_context_draw(struct d2d_device_context *render_target, en
+         EnterCriticalSection(render_target->cs);
+ 
+     ID3D11Device1_GetImmediateContext1(device, &context);
+-    ID3D11DeviceContext1_SwapDeviceContextState(context, render_target->d3d_state, &prev_state);
++    prev_state = d2d_device_context_begin_draw_state(render_target, context);
+ 
+     ID3D11DeviceContext1_IASetInputLayout(context, shape_resources->il);
+     ID3D11DeviceContext1_IASetPrimitiveTopology(context, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+@@ -189,9 +298,12 @@ static void d2d_device_context_draw(struct d2d_device_context *render_target, en
+     else
+         ID3D11DeviceContext1_Draw(context, index_count, 0);
+ 
+-    ID3D11DeviceContext1_SwapDeviceContextState(context, prev_state, NULL);
++    if (prev_state)
++    {
++        ID3D11DeviceContext1_SwapDeviceContextState(context, prev_state, NULL);
++        ID3DDeviceContextState_Release(prev_state);
++    }
+     ID3D11DeviceContext1_Release(context);
+-    ID3DDeviceContextState_Release(prev_state);
+ 
+     if (render_target->cs)
+         LeaveCriticalSection(render_target->cs);
+@@ -356,6 +468,7 @@ static ULONG STDMETHODCALLTYPE d2d_device_context_inner_Release(IUnknown *iface)
+     {
+         unsigned int i, j, k;
+ 
++        d2d_device_context_end_batch(context);
+         d2d_clip_stack_cleanup(&context->clip_stack);
+         IDWriteRenderingParams_Release(context->default_text_rendering_params);
+         if (context->text_rendering_params)
+@@ -1811,6 +1924,8 @@ static HRESULT STDMETHODCALLTYPE d2d_device_context_Flush(ID2D1DeviceContext6 *i
+ {
+     struct d2d_device_context *context = impl_from_ID2D1DeviceContext(iface);
+ 
++    d2d_device_context_end_batch(context);
++
+     FIXME("iface %p, tag1 %p, tag2 %p stub!\n", iface, tag1, tag2);
+ 
+     if (context->ops && context->ops->device_context_present)
+@@ -2004,6 +2119,8 @@ static void STDMETHODCALLTYPE d2d_device_context_BeginDraw(ID2D1DeviceContext6 *
+ {
+     struct d2d_device_context *context = impl_from_ID2D1DeviceContext(iface);
+ 
++    d2d_device_context_end_batch(context);
++
+     TRACE("iface %p.\n", iface);
+ 
+     if (context->target.type == D2D_TARGET_COMMAND_LIST)
+@@ -2018,6 +2135,8 @@ static HRESULT STDMETHODCALLTYPE d2d_device_context_EndDraw(ID2D1DeviceContext6
+     struct d2d_device_context *context = impl_from_ID2D1DeviceContext(iface);
+     HRESULT hr;
+ 
++    d2d_device_context_end_batch(context);
++
+     TRACE("iface %p, tag1 %p, tag2 %p.\n", iface, tag1, tag2);
+ 
+     if (context->target.type == D2D_TARGET_COMMAND_LIST)
+@@ -2518,6 +2637,8 @@ static void STDMETHODCALLTYPE d2d_device_context_SetTarget(ID2D1DeviceContext6 *
+ 
+     TRACE("iface %p, target %p.\n", iface, target);
+ 
++    d2d_device_context_end_batch(context);
++
+     if (!target)
+     {
+         d2d_device_context_reset_target(context);

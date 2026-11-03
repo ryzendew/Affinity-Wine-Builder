@@ -1,0 +1,75 @@
+winex11: Keep the last XdndPosition inside the target window.
+
+XdndPosition goes to the window under the pointer, so a position
+outside that window is wrong. KWin's Xwayland bridge sends such
+positions during drags that start in a Wayland client: they are
+computed from the X pointer, which stays where it was while the
+compositor drives the drag, and are scaled a second time (for example
+10575,2250 at scale 1.5 for a pointer at 7050,1500). Dropping at one of
+them refused the drop, or made the source cancel it.
+
+Use the last position inside the window instead.
+---
+ dlls/winex11.drv/event.c | 32 +++++++++++++++++++++++++++++++-
+ 1 file changed, 31 insertions(+), 1 deletion(-)
+
+diff --git a/dlls/winex11.drv/event.c b/dlls/winex11.drv/event.c
+index fd95124..d66dc97 100644
+--- a/dlls/winex11.drv/event.c
++++ b/dlls/winex11.drv/event.c
+@@ -1481,6 +1481,10 @@ static void handle_dnd_protocol( HWND hwnd, XClientMessageEvent *event )
+ }
+ 
+ 
++/* the last XdndPosition point inside the target window, see handle_xdnd_position_event */
++static BOOL xdnd_have_pos;
++static int xdnd_last_x, xdnd_last_y;
++
+ /**************************************************************************
+  *           handle_xdnd_enter_event
+  *
+@@ -1541,6 +1545,7 @@ static void handle_xdnd_enter_event( HWND hWnd, XClientMessageEvent *event )
+         }
+     }
+ 
++    xdnd_have_pos = FALSE;
+     data = import_xdnd_selection( event->display, event->window, x11drv_atom(XdndSelection),
+                                   xdndtypes, count, &size );
+     if (data) drag_drop_enter( size, data );
+@@ -1590,10 +1595,35 @@ static long drop_effect_to_xdnd_action( UINT effect )
+ static void handle_xdnd_position_event( HWND hwnd, XClientMessageEvent *event )
+ {
+     XClientMessageEvent e;
++    int x = event->data.l[2] >> 16, y = event->data.l[2] & 0xFFFF, wx, wy, gx, gy;
++    unsigned int width, height, border, depth;
++    Window root, child;
+     POINT point;
+     UINT effect;
+ 
+-    point = root_to_virtual_screen( event->data.l[2] >> 16, event->data.l[2] & 0xFFFF );
++    /* XdndPosition goes to the window under the pointer, so a position outside it is
++     * wrong. KWin's Xwayland bridge sends such positions during drags that start in a
++     * Wayland client: computed from the X pointer, which stays where it was while the
++     * compositor drives the drag, and scaled a second time. Dropping at one of them
++     * refused the drop, or the source cancelled it. Keep the last position inside. */
++    if (XTranslateCoordinates( event->display, event->window, DefaultRootWindow( event->display ),
++                               0, 0, &wx, &wy, &child ) &&
++        XGetGeometry( event->display, event->window, &root, &gx, &gy, &width, &height, &border, &depth ))
++    {
++        if (x >= wx && y >= wy && x < wx + (int)width && y < wy + (int)height)
++        {
++            xdnd_last_x = x;
++            xdnd_last_y = y;
++            xdnd_have_pos = TRUE;
++        }
++        else if (xdnd_have_pos)
++        {
++            TRACE( "position %d,%d is outside the window, using %d,%d\n", x, y, xdnd_last_x, xdnd_last_y );
++            x = xdnd_last_x;
++            y = xdnd_last_y;
++        }
++    }
++    point = root_to_virtual_screen( x, y );
+     effect = xdnd_action_to_drop_effect( event->data.l[4] );
+     effect = drag_drop_drag( hwnd, point, effect );
+ 

@@ -1,0 +1,70 @@
+wintab32: Give the internal tablet window a thread of its own.
+
+The driver sends WT_PACKET and WT_PROXIMITY to the internal window, and
+its window proc moves each packet into the owning context's queue. The
+window lived on whichever thread first called into wintab, so packets
+only reached a context's queue while that thread pumped messages, and an
+application polling WTPacketsGet in a stroke loop got none until the
+stroke ended. A real driver queues packets whatever the application's
+threads are doing.
+---
+ dlls/wintab32/wintab32.c | 39 +++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 37 insertions(+), 2 deletions(-)
+
+diff --git a/dlls/wintab32/wintab32.c b/dlls/wintab32/wintab32.c
+index 1f1e720..5fc9899 100644
+--- a/dlls/wintab32/wintab32.c
++++ b/dlls/wintab32/wintab32.c
+@@ -66,15 +66,50 @@ static VOID TABLET_Unregister(void)
+     UnregisterClassW(L"WineTabletClass", NULL);
+ }
+ 
+-static BOOL WINAPI create_internal_window(INIT_ONCE *once, void *param, void **context)
++/* The driver sends WT_PACKET and WT_PROXIMITY to the internal window, whose
++ * window proc moves each packet into the owning context's queue. A window on
++ * the thread that first called into wintab only sees them while that thread
++ * pumps messages, so an application that polls WTPacketsGet in a loop got no
++ * packets until the stroke ended. A real driver queues packets whatever the
++ * application's threads are doing, so the window gets a thread of its own. */
++static DWORD WINAPI tablet_thread_proc(void *arg)
+ {
++    HANDLE ready = arg;
++    MSG msg;
++
+     TABLET_Register();
+     hwndTablet = CreateWindowW(L"WineTabletClass", L"Tablet", 0,
+                                 0, 0, 0, 0, HWND_MESSAGE, 0, wintab_instance, 0);
+-
+     if (!hwndTablet)
+         ERR("error creating internal window: %lu\n", GetLastError());
++    SetEvent(ready);
++    if (!hwndTablet) return 0;
++
++    while (GetMessageW(&msg, NULL, 0, 0) > 0) DispatchMessageW(&msg);
++    return 0;
++}
++
++static BOOL WINAPI create_internal_window(INIT_ONCE *once, void *param, void **context)
++{
++    HANDLE ready, thread;
++    HMODULE module;
+ 
++    if (!(ready = CreateEventW(NULL, TRUE, FALSE, NULL)))
++    {
++        ERR("error creating event: %lu\n", GetLastError());
++        return TRUE;
++    }
++    /* the thread runs our code until the process ends */
++    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
++                       (const WCHAR *)tablet_thread_proc, &module);
++    if ((thread = CreateThread(NULL, 0, tablet_thread_proc, ready, 0, NULL)))
++    {
++        SetThreadDescription(thread, L"wine_wintab32_tablet");
++        WaitForSingleObject(ready, INFINITE);
++        CloseHandle(thread);
++    }
++    else ERR("error creating tablet thread: %lu\n", GetLastError());
++    CloseHandle(ready);
+     return TRUE;
+ }
+ 
