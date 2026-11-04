@@ -1,0 +1,340 @@
+win32u: Copy presents to offscreen surfaces on a helper thread.
+
+0035 waits for each present to an offscreen surface to complete before
+copying it into the window, or the window shows the frame before. The wait
+happened on the presenting thread, and a present to a window that is not
+mapped completes late: under Xwayland, which signals completion on a timer
+for such windows, 26 ms on average, 33 ms at worst, measured on Affinity's
+canvas. With FIFO or IMMEDIATE alike, so it is not the vertical blank. Every
+canvas frame lost that time; while painting, the canvas updated about 20
+times a second and the brush trailed the cursor by about 200 ms.
+
+Hand the wait and the copy to a helper thread. winevulkan starts it once a
+device exists and gives it to win32u through a new vulkan_funcs entry,
+p_present_worker, which does not return; it is a Wine thread, so it can make
+the same copy client_surface_present() made before. vkQueuePresentKHR queues
+the copy, replacing a pending one for the same swapchain, and returns.
+vkDestroySwapchainKHR drops a pending copy and waits for one in progress.
+Until the helper runs, presents wait as before.
+
+The driver interface changes, so WINE_VULKAN_DRIVER_VERSION goes to 49 and
+every module that includes vulkan_driver.h must be rebuilt together.
+
+In Affinity under a nested KWin, the brush's lag on screen went from 193-253
+ms to 110-122 ms (median over a stroke, three strokes each). The test from
+0035 -- a child window presenting a new color once with a vsynced
+FLIP_SEQUENTIAL swapchain -- shows the new color on screen with this (3/3),
+as with the synchronous wait (2/2), and not without any wait (0/2).
+diff --git a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
+index a654794..d1c21bc 100644
+--- a/dlls/win32u/vulkan.c
++++ b/dlls/win32u/vulkan.c
+@@ -157,8 +157,13 @@ struct swapchain
+     VkExtent2D extents;
+     UINT64 present_id;              /* last present id given by win32u, see win32u_vkQueuePresentKHR */
+     UINT present_wait_timeouts;     /* consecutive timed out waits; three stop the waiting */
++    struct vulkan_device *device;
++    struct list worker_entry;       /* in present_worker_queue while a copy is pending */
++    UINT64 worker_id;               /* present the pending copy waits for */
+ };
+ 
++static void cancel_present_copies( struct swapchain *swapchain );
++
+ static struct swapchain *swapchain_from_handle( VkSwapchainKHR handle )
+ {
+     struct vulkan_swapchain *obj = vulkan_swapchain_from_handle( handle );
+@@ -1941,6 +1946,8 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
+ 
+     vulkan_object_init( &swapchain->obj.obj, host_swapchain );
+     swapchain->surface = surface;
++    swapchain->device = device;
++    list_init( &swapchain->worker_entry );
+     swapchain->extents = create_info->imageExtent;
+     instance->p_insert_object( instance, &swapchain->obj.obj );
+ 
+@@ -1958,6 +1965,7 @@ static void win32u_vkDestroySwapchainKHR( VkDevice client_device, VkSwapchainKHR
+     if (allocator) FIXME( "Support for allocation callbacks not implemented yet\n" );
+     if (!swapchain) return;
+ 
++    cancel_present_copies( swapchain );
+     device->p_vkDestroySwapchainKHR( device->host.device, swapchain->obj.host.swapchain, NULL );
+     instance->p_remove_object( instance, &swapchain->obj.obj );
+ 
+@@ -2018,6 +2026,88 @@ static VkResult win32u_vkAcquireNextImageKHR( VkDevice client_device, VkSwapchai
+     return res;
+ }
+ 
++/* Wait for a present to an offscreen surface to complete, so that copying it shows it. */
++static void swapchain_wait_for_present( struct swapchain *swapchain, UINT64 id )
++{
++    struct vulkan_device *device = swapchain->device;
++    VkResult res = device->p_vkWaitForPresentKHR( device->host.device, swapchain->obj.host.swapchain,
++                                                  id, 100000000 /* 100 ms */ );
++    if (res == VK_TIMEOUT)
++    {
++        WARN( "Timed out waiting for present %s on swapchain %p\n", wine_dbgstr_longlong( id ), swapchain );
++        swapchain->present_wait_timeouts++;
++    }
++    else if (res >= VK_SUCCESS) swapchain->present_wait_timeouts = 0;
++}
++
++/* Presents to offscreen surfaces are copied into their window once they have completed, which can take
++ * most of a frame (Xwayland signals completion on a timer for windows that are not mapped). Waiting on
++ * the presenting thread held it for that long every frame, so the copies are made by a thread that
++ * winevulkan starts and hands over with p_present_worker. Until it runs, presents wait as before. */
++static pthread_mutex_t present_worker_lock = PTHREAD_MUTEX_INITIALIZER;
++static pthread_cond_t present_worker_cond = PTHREAD_COND_INITIALIZER;
++static struct list present_worker_queue = LIST_INIT( present_worker_queue );
++static struct swapchain *present_worker_current;
++static BOOL present_worker_running;
++
++static void win32u_present_worker(void)
++{
++    pthread_mutex_lock( &present_worker_lock );
++    present_worker_running = TRUE;
++    for (;;)
++    {
++        struct swapchain *swapchain;
++        struct list *entry;
++        UINT64 id;
++
++        while (!(entry = list_head( &present_worker_queue )))
++            pthread_cond_wait( &present_worker_cond, &present_worker_lock );
++
++        swapchain = LIST_ENTRY( entry, struct swapchain, worker_entry );
++        list_remove( &swapchain->worker_entry );
++        list_init( &swapchain->worker_entry );
++        id = swapchain->worker_id;
++        present_worker_current = swapchain;
++        pthread_mutex_unlock( &present_worker_lock );
++
++        swapchain_wait_for_present( swapchain, id );
++        client_surface_present( swapchain->surface->client );
++
++        pthread_mutex_lock( &present_worker_lock );
++        present_worker_current = NULL;
++        pthread_cond_broadcast( &present_worker_cond );
++    }
++}
++
++/* Queue the copy of a present, replacing a pending one. Returns FALSE if there is no worker. */
++static BOOL queue_present_copy( struct swapchain *swapchain, UINT64 id )
++{
++    BOOL queued = FALSE;
++
++    pthread_mutex_lock( &present_worker_lock );
++    if (present_worker_running)
++    {
++        swapchain->worker_id = id;
++        if (list_empty( &swapchain->worker_entry ))
++            list_add_tail( &present_worker_queue, &swapchain->worker_entry );
++        pthread_cond_broadcast( &present_worker_cond );
++        queued = TRUE;
++    }
++    pthread_mutex_unlock( &present_worker_lock );
++    return queued;
++}
++
++/* Drop a pending copy, and wait for one in progress, before the swapchain goes away. */
++static void cancel_present_copies( struct swapchain *swapchain )
++{
++    pthread_mutex_lock( &present_worker_lock );
++    list_remove( &swapchain->worker_entry );
++    list_init( &swapchain->worker_entry );
++    while (present_worker_current == swapchain)
++        pthread_cond_wait( &present_worker_cond, &present_worker_lock );
++    pthread_mutex_unlock( &present_worker_lock );
++}
++
+ static BOOL swapchain_waits_for_present( struct swapchain *swapchain )
+ {
+     struct surface *surface = swapchain->surface;
+@@ -2093,24 +2183,17 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
+         struct swapchain *swapchain = swapchain_from_handle( client_swapchains[i] );
+         VkResult swapchain_res = present_info->pResults ? present_info->pResults[i] : res;
+         struct surface *surface = swapchain->surface;
++        BOOL deferred = FALSE;
+         RECT client_rect;
+         UINT64 id;
+ 
+         if (swapchain_res >= VK_SUCCESS && device->extensions.has_VK_KHR_present_wait && client_present_ids &&
+             client_present_ids->pPresentIds && i < client_present_ids->swapchainCount &&
+-            (id = client_present_ids->pPresentIds[i]) && swapchain_waits_for_present( swapchain ))
+-        {
+-            VkResult wait_res = device->p_vkWaitForPresentKHR( device->host.device, swapchain->obj.host.swapchain,
+-                                                               id, 100000000 /* 100 ms */ );
+-            if (wait_res == VK_TIMEOUT)
+-            {
+-                WARN( "Timed out waiting for present %s on swapchain %p\n", wine_dbgstr_longlong( id ), swapchain );
+-                swapchain->present_wait_timeouts++;
+-            }
+-            else if (wait_res >= VK_SUCCESS) swapchain->present_wait_timeouts = 0;
+-        }
++            (id = client_present_ids->pPresentIds[i]) && swapchain_waits_for_present( swapchain ) &&
++            !(deferred = queue_present_copy( swapchain, id )))
++            swapchain_wait_for_present( swapchain, id );
+ 
+-        client_surface_present( surface->client );
++        if (!deferred) client_surface_present( surface->client );
+ 
+         if (swapchain_res < VK_SUCCESS) continue;
+         if (!get_surface_rect( surface->hwnd, &client_rect, get_dpi_for_window( surface->hwnd ) ))
+@@ -3077,6 +3160,7 @@ static struct vulkan_funcs vulkan_funcs =
+     .p_vkMapMemory = win32u_vkMapMemory,
+     .p_vkMapMemory2KHR = win32u_vkMapMemory2KHR,
+     .p_vkQueuePresentKHR = win32u_vkQueuePresentKHR,
++    .p_present_worker = win32u_present_worker,
+     .p_vkQueueSubmit = win32u_vkQueueSubmit,
+     .p_vkQueueSubmit2 = win32u_vkQueueSubmit2,
+     .p_vkQueueSubmit2KHR = win32u_vkQueueSubmit2KHR,
+diff --git a/dlls/winevulkan/loader.c b/dlls/winevulkan/loader.c
+index 864328e..2c67e18 100644
+--- a/dlls/winevulkan/loader.c
++++ b/dlls/winevulkan/loader.c
+@@ -343,6 +343,25 @@ static BOOL WINAPI wine_vk_init(INIT_ONCE *once, void *param, void **context)
+     return !__wine_init_unix_call() && !UNIX_CALL(init, &params);
+ }
+ 
++static DWORD WINAPI present_worker_proc(void *arg)
++{
++    /* named from the thread itself: naming it from its creator is lost when it has not started yet */
++    SetThreadDescription(GetCurrentThread(), L"wine_vk_present");
++    UNIX_CALL(present_worker, NULL);
++    return 0;
++}
++
++/* win32u copies presents to offscreen surfaces into their windows once they have completed. This thread
++ * waits and copies for it, so that the presenting thread does not. */
++static INIT_ONCE present_worker_once = INIT_ONCE_STATIC_INIT;
++static BOOL WINAPI start_present_worker(INIT_ONCE *once, void *param, void **context)
++{
++    HANDLE thread;
++
++    if ((thread = CreateThread(NULL, 0, present_worker_proc, NULL, 0, NULL))) CloseHandle(thread);
++    return TRUE;
++}
++
+ static BOOL  wine_vk_init_once(void)
+ {
+     static INIT_ONCE init_once = INIT_ONCE_STATIC_INIT;
+@@ -651,6 +670,7 @@ VkResult WINAPI vkCreateDevice(VkPhysicalDevice physical_device, const VkDeviceC
+         free(device);
+         *ret = NULL;
+     }
++    else InitOnceExecuteOnce(&present_worker_once, start_present_worker, NULL, NULL);
+     return params.result;
+ }
+ 
+diff --git a/dlls/winevulkan/loader_thunks.h b/dlls/winevulkan/loader_thunks.h
+index cc58fdb..23c5c92 100644
+--- a/dlls/winevulkan/loader_thunks.h
++++ b/dlls/winevulkan/loader_thunks.h
+@@ -22,6 +22,7 @@ enum unix_call
+     unix_init,
+     unix_is_available_instance_function,
+     unix_is_available_device_function,
++    unix_present_worker,
+     unix_vkAcquireNextImage2KHR,
+     unix_vkAcquireNextImageKHR,
+     unix_vkAcquirePerformanceConfigurationINTEL,
+diff --git a/dlls/winevulkan/make_vulkan b/dlls/winevulkan/make_vulkan
+index 4b10dc5..a9e0888 100755
+--- a/dlls/winevulkan/make_vulkan
++++ b/dlls/winevulkan/make_vulkan
+@@ -2452,6 +2452,7 @@ class Generator(object):
+         f.write("    init_vulkan,\n")
+         f.write("    vk_is_available_instance_function,\n")
+         f.write("    vk_is_available_device_function,\n")
++        f.write("    vk_present_worker,\n")
+         for func in Type.all(Function, Function.needs_thunk):
+             f.write(f"    {func.unixlib_entry(64)},\n")
+         f.write("};\n")
+@@ -2467,6 +2468,7 @@ class Generator(object):
+         f.write("    wow64_init_vulkan,\n")
+         f.write("    vk_is_available_instance_function32,\n")
+         f.write("    vk_is_available_device_function32,\n")
++        f.write("    vk_present_worker,\n")
+         for func in Type.all(Function, Function.needs_thunk):
+             f.write(f"    {func.unixlib_entry(32)},\n")
+         f.write("};\n")
+@@ -2567,6 +2569,7 @@ class Generator(object):
+         f.write("    unix_init,\n")
+         f.write("    unix_is_available_instance_function,\n")
+         f.write("    unix_is_available_device_function,\n")
++        f.write("    unix_present_worker,\n")
+         for func in Type.all(Function, Function.needs_thunk):
+             f.write(f"    unix_{func.name},\n")
+         f.write("    unix_count,\n")
+diff --git a/dlls/winevulkan/vulkan.c b/dlls/winevulkan/vulkan.c
+index 2dac08a..3fe24fb 100644
+--- a/dlls/winevulkan/vulkan.c
++++ b/dlls/winevulkan/vulkan.c
+@@ -992,6 +992,13 @@ NTSTATUS vk_is_available_instance_function(void *arg)
+     return is_available_instance_function(params->instance, params->name);
+ }
+ 
++/* Runs on a thread the PE side creates for it, and does not return. */
++NTSTATUS vk_present_worker(void *arg)
++{
++    if (vk_funcs->p_present_worker) vk_funcs->p_present_worker();
++    return STATUS_SUCCESS;
++}
++
+ NTSTATUS vk_is_available_device_function(void *arg)
+ {
+     struct is_available_device_function_params *params = arg;
+diff --git a/dlls/winevulkan/vulkan_private.h b/dlls/winevulkan/vulkan_private.h
+index bc8fe30..2da2467 100644
+--- a/dlls/winevulkan/vulkan_private.h
++++ b/dlls/winevulkan/vulkan_private.h
+@@ -60,6 +60,7 @@ NTSTATUS vk_is_available_instance_function(void *arg);
+ NTSTATUS vk_is_available_device_function(void *arg);
+ NTSTATUS vk_is_available_instance_function32(void *arg);
+ NTSTATUS vk_is_available_device_function32(void *arg);
++NTSTATUS vk_present_worker(void *arg);
+ 
+ struct conversion_context
+ {
+diff --git a/dlls/winevulkan/vulkan_thunks.c b/dlls/winevulkan/vulkan_thunks.c
+index 065d575..764240a 100644
+--- a/dlls/winevulkan/vulkan_thunks.c
++++ b/dlls/winevulkan/vulkan_thunks.c
+@@ -72096,6 +72096,7 @@ const unixlib_entry_t __wine_unix_call_funcs[] =
+     init_vulkan,
+     vk_is_available_instance_function,
+     vk_is_available_device_function,
++    vk_present_worker,
+     thunk64_vkAcquireNextImage2KHR,
+     thunk64_vkAcquireNextImageKHR,
+     thunk64_vkAcquirePerformanceConfigurationINTEL,
+@@ -72853,6 +72854,7 @@ const unixlib_entry_t __wine_unix_call_funcs[] =
+     wow64_init_vulkan,
+     vk_is_available_instance_function32,
+     vk_is_available_device_function32,
++    vk_present_worker,
+     thunk32_vkAcquireNextImage2KHR,
+     thunk32_vkAcquireNextImageKHR,
+     thunk32_vkAcquirePerformanceConfigurationINTEL,
+diff --git a/include/wine/vulkan_driver.h b/include/wine/vulkan_driver.h
+index d2209a3..b8d2a0d 100644
+--- a/include/wine/vulkan_driver.h
++++ b/include/wine/vulkan_driver.h
+@@ -89,7 +89,7 @@ struct VkDevice_T
+ #include "wine/list.h"
+ 
+ /* Wine internal vulkan driver version, needs to be bumped upon vulkan_funcs changes. */
+-#define WINE_VULKAN_DRIVER_VERSION 48
++#define WINE_VULKAN_DRIVER_VERSION 49
+ 
+ struct vulkan_object
+ {
+@@ -352,6 +352,9 @@ struct vulkan_funcs
+     PFN_vkQueueSubmit2KHR p_vkQueueSubmit2KHR;
+     PFN_vkUnmapMemory p_vkUnmapMemory;
+     PFN_vkUnmapMemory2KHR p_vkUnmapMemory2KHR;
++
++    /* run the deferred copies of offscreen presents on the calling thread; does not return */
++    void (*p_present_worker)(void);
+ };
+ 
+ /* interface between win32u and the user drivers */

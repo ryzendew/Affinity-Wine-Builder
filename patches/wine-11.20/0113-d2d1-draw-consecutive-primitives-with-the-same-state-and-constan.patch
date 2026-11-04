@@ -1,0 +1,280 @@
+d2d1: Draw consecutive primitives with the same state and constants together.
+
+Each primitive was its own upload and draw call, and its own draw on
+wined3d's command thread. While Affinity drags a selection it draws
+about 540 primitives a frame, half of them with the same shape type,
+solid brush and constants as the one before.
+
+Collect such primitives, with their indices rebased, and upload and
+draw them together. Only solid brushes are batched (nothing to bind),
+and the constants are compared by their place in the constant ring,
+which is only reused while they are unchanged. The batch is drawn
+before anything that changes other state or uses the target: a
+constant ring map (which also covers a ring discard), any other draw,
+a clip change, GetDC, CopyFromRenderTarget, and
+d2d_device_context_end_batch(), which runs at BeginDraw, EndDraw,
+Flush, SetTarget and before another context draws on the device.
+WINE_D2D_NO_DRAW_BATCHING=1 turns it off.
+
+Affinity, three alternating rounds: dragging a selection, 4% more
+frames, wined3d's command thread -40% and the UI thread -5% per frame;
+node editing, 6% more frames, -43% and -11%; zooming, -29% and -10%.
+The d2d1 conformance tests give the same results, and the canvas is
+pixel identical with and without a selection.
+---
+ dlls/d2d1/bitmap.c       |   3 +
+ dlls/d2d1/d2d1_private.h |  15 +++++
+ dlls/d2d1/device.c       | 134 ++++++++++++++++++++++++++++++++++++++-
+ 3 files changed, 151 insertions(+), 1 deletion(-)
+
+diff --git a/dlls/d2d1/bitmap.c b/dlls/d2d1/bitmap.c
+index c6ab60c..2a20000 100644
+--- a/dlls/d2d1/bitmap.c
++++ b/dlls/d2d1/bitmap.c
+@@ -193,6 +193,9 @@ static HRESULT STDMETHODCALLTYPE d2d_bitmap_CopyFromRenderTarget(ID2D1Bitmap1 *i
+     TRACE("iface %p, dst_point %s, render_target %p, src_rect %s.\n", iface,
+             debug_d2d_point_2u(dst_point), render_target, debug_d2d_rect_u(src_rect));
+ 
++    /* Draw what the render target has collected but not drawn yet. */
++    ID2D1RenderTarget_Flush(render_target, NULL, NULL);
++
+     if (FAILED(hr = ID2D1RenderTarget_QueryInterface(render_target, &IID_ID2D1DeviceContext,
+             (void **)&device_context)))
+     {
+diff --git a/dlls/d2d1/d2d1_private.h b/dlls/d2d1/d2d1_private.h
+index 7117489..165af30 100644
+--- a/dlls/d2d1/d2d1_private.h
++++ b/dlls/d2d1/d2d1_private.h
+@@ -209,6 +209,19 @@ struct d2d_device_context
+     /* The constants at vs_cb_offset and ps_cb_offset are vs_cb_data and ps_cb_last. */
+     BOOL vs_cb_uploaded, ps_cb_uploaded;
+     struct d2d_ps_cb ps_cb_last;
++    /* Consecutive primitives with the same state and constants, drawn together. */
++    struct d2d_draw_batch
++    {
++        BOOL active, flushing;
++        enum d2d_shape_type shape_type;
++        struct d2d_brush *brush;
++        unsigned int vb_stride, vs_cb_offset, ps_cb_offset;
++        unsigned int index_count, vertex_count;
++        WORD *indices;
++        size_t indices_size;
++        BYTE *vertices;
++        size_t vertices_size;
++    } draw_batch;
+     ID3DDeviceContextState *batch_prev_state; /* the application's state, while ours stays bound */
+     struct d2d_bound_state
+     {
+@@ -1001,6 +1014,8 @@ void d2d_command_list_push_layer(struct d2d_command_list *command_list, const st
+         const D2D1_LAYER_PARAMETERS1 *params);
+ void d2d_command_list_pop_layer(struct d2d_command_list *command_list);
+ 
++void d2d_device_context_flush_draws(struct d2d_device_context *context);
++
+ static inline BOOL d2d_array_reserve(void **elements, size_t *capacity, size_t count, size_t size)
+ {
+     size_t new_capacity, max_capacity;
+diff --git a/dlls/d2d1/device.c b/dlls/d2d1/device.c
+index a9c3785..f153d46 100644
+--- a/dlls/d2d1/device.c
++++ b/dlls/d2d1/device.c
+@@ -157,6 +157,8 @@ static void d2d_device_context_end_batch(struct d2d_device_context *context)
+     ID3D11DeviceContext1 *d3d_context;
+     unsigned int i;
+ 
++    d2d_device_context_flush_draws(context);
++
+     EnterCriticalSection(&d2d_batch_cs);
+     context->bound.valid = FALSE;
+     if (context->batch_prev_state)
+@@ -255,6 +257,9 @@ static void d2d_device_context_draw(struct d2d_device_context *render_target, en
+     if (render_target->cs)
+         EnterCriticalSection(render_target->cs);
+ 
++    if (!render_target->draw_batch.flushing)
++        d2d_device_context_flush_draws(render_target);
++
+     ID3D11Device1_GetImmediateContext1(device, &context);
+     if (render_target->vs_cb_pending)
+         d2d_device_context_flush_vs_cb(render_target);
+@@ -458,6 +463,114 @@ static HRESULT d2d_upload_ring_write(struct d2d_device_context *context, const v
+ 
+ /* Draw primitives from data in memory: indices (16-bit, may be NULL for a
+  * non-indexed draw of "count" vertices) and vertices. */
++static BOOL d2d_draw_batching(void)
++{
++    static int enabled = -1;
++    char buf[8];
++
++    if (enabled < 0)
++        enabled = !(GetEnvironmentVariableA("WINE_D2D_NO_DRAW_BATCHING", buf, sizeof(buf)) && atoi(buf));
++    return enabled;
++}
++
++/* Draw the primitives collected in the batch, with the constants and the state they
++ * were collected with. */
++void d2d_device_context_flush_draws(struct d2d_device_context *render_target)
++{
++    struct d2d_draw_batch *batch = &render_target->draw_batch;
++    unsigned int ib_offset, vb_offset, vs_cb_offset, ps_cb_offset;
++    BOOL vs_cb_pending;
++    HRESULT hr;
++
++    if (!batch->active || batch->flushing)
++        return;
++    batch->flushing = TRUE;
++
++    /* The next primitive may already have new constants waiting; draw with ours. */
++    vs_cb_offset = render_target->vs_cb_offset;
++    ps_cb_offset = render_target->ps_cb_offset;
++    vs_cb_pending = render_target->vs_cb_pending;
++    render_target->vs_cb_offset = batch->vs_cb_offset;
++    render_target->ps_cb_offset = batch->ps_cb_offset;
++    render_target->vs_cb_pending = FALSE;
++
++    if (FAILED(hr = d2d_upload_ring_write(render_target, batch->indices, batch->index_count * sizeof(WORD),
++            batch->vertices, batch->vertex_count * batch->vb_stride, batch->vb_stride, &ib_offset, &vb_offset)))
++        WARN("Failed to upload geometry, hr %#lx.\n", hr);
++    else
++        d2d_device_context_draw(render_target, batch->shape_type, render_target->upload_ring.buffer, ib_offset,
++                batch->index_count, render_target->upload_ring.buffer, vb_offset, batch->vb_stride, batch->brush, NULL);
++
++    render_target->vs_cb_offset = vs_cb_offset;
++    render_target->ps_cb_offset = ps_cb_offset;
++    render_target->vs_cb_pending = vs_cb_pending;
++
++    ID2D1Brush_Release(&batch->brush->ID2D1Brush_iface);
++    batch->brush = NULL;
++    batch->active = FALSE;
++    batch->flushing = FALSE;
++}
++
++/* Add a primitive to the batch if it can be drawn together with the ones already in
++ * it: the same shape, a solid brush (no textures to bind), and the same constants,
++ * i.e. the same offsets in the constant ring, which are only reused while the
++ * constants are unchanged. Everything that changes other state, or uses the target,
++ * draws the batch first: a constant ring map (which also covers a ring discard), any
++ * other draw, a clip change, and d2d_device_context_end_batch(), which runs at
++ * EndDraw, Flush, SetTarget, and before another context draws on the device.
++ *
++ * Affinity draws about 540 primitives a frame while a selection is dragged, half of
++ * them with the same state and constants as the one before. */
++static BOOL d2d_device_context_batch_draw(struct d2d_device_context *render_target, enum d2d_shape_type shape_type,
++        const WORD *indices, unsigned int index_size, unsigned int count, const void *vertices,
++        unsigned int vertex_size, unsigned int vb_stride, struct d2d_brush *brush, struct d2d_brush *opacity_brush)
++{
++    struct d2d_draw_batch *batch = &render_target->draw_batch;
++    unsigned int vertex_count, i;
++
++    if (!d2d_draw_batching() || !indices || !brush || opacity_brush || brush->type != D2D_BRUSH_TYPE_SOLID
++            || render_target->vs_cb_pending || !vb_stride || vertex_size % vb_stride
++            || index_size != count * sizeof(WORD))
++        return FALSE;
++    if ((vertex_count = vertex_size / vb_stride) > 0x10000)
++        return FALSE;
++
++    if (batch->active && (batch->shape_type != shape_type || batch->brush != brush
++            || batch->vb_stride != vb_stride || batch->vs_cb_offset != render_target->vs_cb_offset
++            || batch->ps_cb_offset != render_target->ps_cb_offset
++            || batch->vertex_count + vertex_count > 0x10000))
++        d2d_device_context_flush_draws(render_target);
++
++    if (!d2d_array_reserve((void **)&batch->indices, &batch->indices_size,
++            (batch->active ? batch->index_count : 0) + count, sizeof(*batch->indices))
++            || !d2d_array_reserve((void **)&batch->vertices, &batch->vertices_size,
++            ((batch->active ? batch->vertex_count : 0) + vertex_count) * vb_stride, 1))
++    {
++        d2d_device_context_flush_draws(render_target);
++        return FALSE;
++    }
++
++    if (!batch->active)
++    {
++        batch->active = TRUE;
++        batch->shape_type = shape_type;
++        batch->brush = brush;
++        ID2D1Brush_AddRef(&brush->ID2D1Brush_iface);
++        batch->vb_stride = vb_stride;
++        batch->vs_cb_offset = render_target->vs_cb_offset;
++        batch->ps_cb_offset = render_target->ps_cb_offset;
++        batch->index_count = 0;
++        batch->vertex_count = 0;
++    }
++
++    for (i = 0; i < count; ++i)
++        batch->indices[batch->index_count + i] = indices[i] + batch->vertex_count;
++    memcpy(batch->vertices + batch->vertex_count * vb_stride, vertices, vertex_size);
++    batch->index_count += count;
++    batch->vertex_count += vertex_count;
++    return TRUE;
++}
++
+ static void d2d_device_context_draw_data(struct d2d_device_context *render_target, enum d2d_shape_type shape_type,
+         const void *indices, unsigned int index_size, unsigned int count, const void *vertices,
+         unsigned int vertex_size, unsigned int vb_stride, struct d2d_brush *brush, struct d2d_brush *opacity_brush)
+@@ -468,6 +581,15 @@ static void d2d_device_context_draw_data(struct d2d_device_context *render_targe
+     if (render_target->cs)
+         EnterCriticalSection(render_target->cs);
+ 
++    if (d2d_device_context_batch_draw(render_target, shape_type, indices, index_size, count,
++            vertices, vertex_size, vb_stride, brush, opacity_brush))
++    {
++        if (render_target->cs)
++            LeaveCriticalSection(render_target->cs);
++        return;
++    }
++    d2d_device_context_flush_draws(render_target);
++
+     if (FAILED(hr = d2d_upload_ring_write(render_target, indices, indices ? index_size : 0,
+             vertices, vertex_size, vb_stride, &ib_offset, &vb_offset)))
+         WARN("Failed to upload geometry, hr %#lx.\n", hr);
+@@ -553,6 +675,8 @@ static ULONG STDMETHODCALLTYPE d2d_device_context_inner_Release(IUnknown *iface)
+         unsigned int i, j, k;
+ 
+         d2d_device_context_end_batch(context);
++        free(context->draw_batch.indices);
++        free(context->draw_batch.vertices);
+         d2d_clip_stack_cleanup(&context->clip_stack);
+         IDWriteRenderingParams_Release(context->default_text_rendering_params);
+         if (context->text_rendering_params)
+@@ -1083,10 +1207,15 @@ static void *d2d_device_context_map_cb(struct d2d_device_context *context,
+ {
+     struct d2d_upload_ring *ring = &context->cb_ring;
+     D3D11_MAP map_type = D3D11_MAP_WRITE_NO_OVERWRITE;
+-    unsigned int pos = (ring->pos + 255) & ~255u;
++    unsigned int pos;
+     D3D11_MAPPED_SUBRESOURCE map;
+     HRESULT hr;
+ 
++    /* A batch is drawn with the constants it was collected with; draw it before
++     * they can be overwritten or discarded. */
++    d2d_device_context_flush_draws(context);
++    pos = (ring->pos + 255) & ~255u;
++
+     size = (size + 255) & ~255u;
+     if (!ring->buffer)
+     {
+@@ -2209,6 +2338,7 @@ static void STDMETHODCALLTYPE d2d_device_context_PushAxisAlignedClip(ID2D1Device
+             clip_rect->right * x_scale, clip_rect->bottom * y_scale);
+     d2d_rect_expand(&transformed_rect, &point);
+ 
++    d2d_device_context_flush_draws(context);
+     if (!d2d_clip_stack_push(&context->clip_stack, &transformed_rect))
+         WARN("Failed to push clip rect.\n");
+ }
+@@ -2222,6 +2352,7 @@ static void STDMETHODCALLTYPE d2d_device_context_PopAxisAlignedClip(ID2D1DeviceC
+     if (context->target.type == D2D_TARGET_COMMAND_LIST)
+         d2d_command_list_pop_clip(context->target.command_list);
+ 
++    d2d_device_context_flush_draws(context);
+     d2d_clip_stack_pop(&context->clip_stack);
+ }
+ 
+@@ -3953,6 +4084,7 @@ static HRESULT STDMETHODCALLTYPE d2d_gdi_interop_render_target_GetDC(ID2D1GdiInt
+     if (render_target->target.hdc)
+         return D2DERR_WRONG_STATE;
+ 
++    d2d_device_context_flush_draws(render_target);
+     if (FAILED(hr = d2d_gdi_interop_get_surface(render_target, &surface)))
+         return hr;
+ 

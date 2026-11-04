@@ -1,0 +1,24 @@
+From 408910a5de55cfbff9e2b32ac709ed6ba75791b9 Mon Sep 17 00:00:00 2001
+From: jfacemyer <1776340+jfacemyer@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 07:12:25 -0400
+Subject: [PATCH] opencl: Use _strnicmp() in PE code.
+
+Wine 11.20 no longer declares strcasecmp()/strncasecmp() for PE builds;
+the extension lookup added by the OpenCL patch then failed to compile.
+---
+ dlls/opencl/pe_thunks.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/dlls/opencl/pe_thunks.c b/dlls/opencl/pe_thunks.c
+index 6895bf4..7c742ae 100644
+--- a/dlls/opencl/pe_thunks.c
++++ b/dlls/opencl/pe_thunks.c
+@@ -1117,7 +1117,7 @@ BOOL extension_is_supported( const char *name, size_t len )
+ 
+     for (i = 0; i< ARRAY_SIZE(known_extensions); i++)
+     {
+-        if (known_extensions[i].get_function && !strncasecmp( name, known_extensions[i].name, len ))
++        if (known_extensions[i].get_function && !_strnicmp( name, known_extensions[i].name, len ))
+             return TRUE;
+     }
+ 

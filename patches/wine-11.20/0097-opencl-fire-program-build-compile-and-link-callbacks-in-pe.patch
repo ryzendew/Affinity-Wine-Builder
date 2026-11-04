@@ -1,0 +1,71 @@
+opencl: Fire program build, compile and link callbacks in PE.
+
+The host cannot call a PE function, so the unix wrappers dropped
+pfn_notify with a FIXME and an application that builds with a
+notification callback waited forever. clBuildProgram, clCompileProgram
+and clLinkProgram now build synchronously through the host and then
+call the callback, which per the specification fires when the operation
+completes. A NULL pfn_notify takes the old path unchanged.
+Context-creation error callbacks are left alone.
+
+From the Affinity-Wine-Builder 11.18 set (its 0064).
+---
+ dlls/opencl/pe_thunks.c | 30 ++++++++++++++++++++++++++++--
+ 1 file changed, 28 insertions(+), 2 deletions(-)
+
+diff --git a/dlls/opencl/pe_thunks.c b/dlls/opencl/pe_thunks.c
+index b0bc30a..3ac9b11 100644
+--- a/dlls/opencl/pe_thunks.c
++++ b/dlls/opencl/pe_thunks.c
+@@ -64,15 +64,32 @@ static void check_completed_callbacks(void)
+ cl_int WINAPI clBuildProgram( cl_program program, cl_uint num_devices, const cl_device_id* device_list, const char* options, void (WINAPI* pfn_notify)(cl_program program, void* user_data), void* user_data )
+ {
+     struct clBuildProgram_params params = { program, num_devices, device_list, options, pfn_notify, user_data };
++    cl_int ret;
+     TRACE( "(%p, %u, %p, %p, %p, %p)\n", program, num_devices, device_list, options, pfn_notify, user_data );
+-    return OPENCL_CALL( clBuildProgram, &params );
++    if (!pfn_notify) return OPENCL_CALL( clBuildProgram, &params );
++    /* The host cannot invoke PE callbacks. Build synchronously (the host
++     * wrapper already drops the notify) and report completion directly:
++     * per spec the callback fires when the build completes, which is
++     * exactly this point. */
++    params.pfn_notify = NULL;
++    params.user_data = NULL;
++    ret = OPENCL_CALL( clBuildProgram, &params );
++    pfn_notify( program, user_data );
++    return ret;
+ }
+ 
+ cl_int WINAPI clCompileProgram( cl_program program, cl_uint num_devices, const cl_device_id* device_list, const char* options, cl_uint num_input_headers, const cl_program* input_headers, const char** header_include_names, void (WINAPI* pfn_notify)(cl_program program, void* user_data), void* user_data )
+ {
+     struct clCompileProgram_params params = { program, num_devices, device_list, options, num_input_headers, input_headers, header_include_names, pfn_notify, user_data };
++    cl_int ret;
+     TRACE( "(%p, %u, %p, %p, %u, %p, %p, %p, %p)\n", program, num_devices, device_list, options, num_input_headers, input_headers, header_include_names, pfn_notify, user_data );
+-    return OPENCL_CALL( clCompileProgram, &params );
++    if (!pfn_notify) return OPENCL_CALL( clCompileProgram, &params );
++    /* Same synchronous completion as clBuildProgram above. */
++    params.pfn_notify = NULL;
++    params.user_data = NULL;
++    ret = OPENCL_CALL( clCompileProgram, &params );
++    pfn_notify( program, user_data );
++    return ret;
+ }
+ 
+ cl_mem WINAPI clCreateBuffer( cl_context context, cl_mem_flags flags, size_t size, void* host_ptr, cl_int* errcode_ret )
+@@ -603,7 +620,16 @@ cl_program WINAPI clLinkProgram( cl_context context, cl_uint num_devices, const
+     cl_program __retval;
+     struct clLinkProgram_params params = { &__retval, context, num_devices, device_list, options, num_input_programs, input_programs, pfn_notify, user_data, errcode_ret };
+     TRACE( "(%p, %u, %p, %p, %u, %p, %p, %p, %p)\n", context, num_devices, device_list, options, num_input_programs, input_programs, pfn_notify, user_data, errcode_ret );
++    if (!pfn_notify)
++    {
++        OPENCL_CALL( clLinkProgram, &params );
++        return __retval;
++    }
++    /* Same synchronous completion as clBuildProgram above. */
++    params.pfn_notify = NULL;
++    params.user_data = NULL;
+     OPENCL_CALL( clLinkProgram, &params );
++    pfn_notify( __retval, user_data );
+     return __retval;
+ }
+ 

@@ -1,0 +1,27 @@
+server: Scale negative coordinates with signed arithmetic.
+
+scale_dpi() multiplied an int coordinate by an unsigned factor, so a
+negative coordinate was promoted to unsigned and the division wrapped
+it to a huge value. Every maximized window has a negative origin, so a
+process at a different DPI awareness got a rect like 22369618,22369618-
+1923,1083 for a maximized window when the DPI ratio is not a whole
+number (192 to 96 dpi, for one).
+---
+ server/user.h | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/server/user.h b/server/user.h
+index f1a1f07..a83e163 100644
+--- a/server/user.h
++++ b/server/user.h
+@@ -234,7 +234,9 @@ static inline int point_in_rect( const struct rectangle *rect, int x, int y )
+ 
+ static inline int scale_dpi( int val, struct ratio dpi_from, struct ratio dpi_to )
+ {
+-    unsigned int num = dpi_to.num * dpi_from.den, den = dpi_from.num * dpi_to.den;
++    /* signed: an unsigned num promotes a negative val, such as a maximized
++     * window's origin, and the division then wraps it to a huge value */
++    long long num = (long long)dpi_to.num * dpi_from.den, den = (long long)dpi_from.num * dpi_to.den;
+     if (val >= 0) return (val * num + (den / 2)) / den;
+     return (val * num - (den / 2)) / den;
+ }

@@ -1,0 +1,36 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jfacemyer <1776340+jfacemyer@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 07:31:32 -0500
+Subject: [PATCH] wineboot: Don't show the wait window when
+ WINEBOOT_HIDE_DIALOG is set.
+
+Every prefix update (wineboot -u) and every prefix creation shows the
+"The Wine configuration is being updated" window. An installer or
+manager that runs the update itself and shows its own progress has no
+way to suppress it. With WINEBOOT_HIDE_DIALOG set to anything but "0"
+(the variable Proton uses) the window is not shown; unset, nothing
+changes.
+
+From neutron-wine (Nico-LaFoucate).
+---
+ programs/wineboot/wineboot.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/programs/wineboot/wineboot.c b/programs/wineboot/wineboot.c
+index 7dda9ec..3cfc7c9 100644
+--- a/programs/wineboot/wineboot.c
++++ b/programs/wineboot/wineboot.c
+@@ -1701,7 +1701,9 @@ static void update_wineprefix( BOOL force )
+ 
+         if ((process = start_rundll32( inf_path, L"PreInstall", IMAGE_FILE_MACHINE_TARGET_HOST )))
+         {
+-            HWND hwnd = show_wait_window();
++            /* as in Proton, WINEBOOT_HIDE_DIALOG set (and not "0") means no wait window */
++            const WCHAR *hide = _wgetenv( L"WINEBOOT_HIDE_DIALOG" );
++            HWND hwnd = (hide && *hide && wcscmp( hide, L"0" )) ? NULL : show_wait_window();
+             for (;;)
+             {
+                 if (process)
+-- 
+2.55.0
+

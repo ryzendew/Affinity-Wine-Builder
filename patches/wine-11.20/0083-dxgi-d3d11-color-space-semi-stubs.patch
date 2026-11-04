@@ -1,0 +1,52 @@
+dxgi: implement d3d11 CheckColorSpaceSupport/SetColorSpace1 semi-stubs
+
+Implement d3d11_swapchain_CheckColorSpaceSupport() and SetColorSpace1() as
+semi-stubs mirroring the d3d12 versions in the same file: report and accept
+the default sRGB color space. Both returned E_NOTIMPL, each logged by
+Affinity's DXRenderer.
+---
+ dlls/dxgi/swapchain.c | 23 +++++++++++++++++++----
+ 1 file changed, 19 insertions(+), 4 deletions(-)
+
+diff --git a/dlls/dxgi/swapchain.c b/dlls/dxgi/swapchain.c
+index 1186527..a8db9de 100644
+--- a/dlls/dxgi/swapchain.c
++++ b/dlls/dxgi/swapchain.c
+@@ -883,18 +883,33 @@ static UINT STDMETHODCALLTYPE d3d11_swapchain_GetCurrentBackBufferIndex(IDXGISwa
+ static HRESULT STDMETHODCALLTYPE d3d11_swapchain_CheckColorSpaceSupport(IDXGISwapChain4 *iface,
+         DXGI_COLOR_SPACE_TYPE colour_space, UINT *colour_space_support)
+ {
+-    FIXME("iface %p, colour_space %#x, colour_space_support %p stub!\n",
++    UINT support_flags = 0;
++
++    FIXME("iface %p, colour_space %#x, colour_space_support %p semi-stub!\n",
+             iface, colour_space, colour_space_support);
+ 
+-    return E_NOTIMPL;
++    if (!colour_space_support)
++        return E_INVALIDARG;
++
++    if (colour_space == DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709)
++        support_flags |= DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT;
++
++    *colour_space_support = support_flags;
++    return S_OK;
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE d3d11_swapchain_SetColorSpace1(IDXGISwapChain4 *iface,
+         DXGI_COLOR_SPACE_TYPE colour_space)
+ {
+-    FIXME("iface %p, colour_space %#x stub!\n", iface, colour_space);
++    FIXME("iface %p, colour_space %#x semi-stub!\n", iface, colour_space);
+ 
+-    return E_NOTIMPL;
++    if (colour_space != DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709)
++    {
++        WARN("Colour space %u not supported.\n", colour_space);
++        return E_INVALIDARG;
++    }
++
++    return S_OK;
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE d3d11_swapchain_ResizeBuffers1(IDXGISwapChain4 *iface,

@@ -1,0 +1,40 @@
+widl metadata: a parameterized interface without a contract (ported to 11.19)
+
+11.16's 0011 carried three fixes and 11.18's two. On 11.19 one is left:
+upstream d3ba7e40 ("widl: Set the memberref field for all ATTR_STATIC
+attributes on a type") fixes the static() MemberRef bug, and 8b963e98
+fixed the methodimpl one earlier.
+
+A parameterized interface with no contract of its own (IMap<K,V>,
+IIterable<T>) no longer dereferences NULL in add_method_contract_attrs:
+the class's contract is used for the attribute, as it is for the value.
+
+---
+diff --git a/tools/widl/metadata.c b/tools/widl/metadata.c
+index a5b854a..01650e9 100644
+--- a/tools/widl/metadata.c
++++ b/tools/widl/metadata.c
+@@ -2923,11 +2923,22 @@ static void add_method_contract_attrs( const type_t *class, const type_t *iface,
+ {
+     UINT parent, attr_type, value_size;
+     BYTE value[MAX_NAME + sizeof(UINT) + 5];
++    const attr_t *class_attr = class ? get_attr( class->attrs, ATTR_CONTRACT ) : NULL;
+     const attr_t *attr = get_attr( iface->attrs, ATTR_CONTRACT );
+ 
++    /* A parameterized interface such as IMap<K,V>, IMapView<K,V> or IIterable<T>
++     * carries no contract of its own -- those are versioned in Windows.Foundation,
++     * not in the file being compiled -- so get_attr() returns NULL and we would
++     * dereference it. The attribute is only needed for its ContractVersionAttribute
++     * .ctor MemberRef; the value stamped is the class's contract either way, so
++     * fall back to the class, whose contract is registered first (see
++     * add_runtimeclass_type_step2). */
++    if (!attr || !attr->md_member) attr = class_attr;
++    if (!attr || !attr->md_member || !class_attr) return;
++
+     parent = has_customattribute( TABLE_METHODDEF, method->md.def );
+     attr_type = customattribute_type( TABLE_MEMBERREF, attr->md_member );
+-    value_size = make_contract_value( get_attr(class->attrs, ATTR_CONTRACT), value );
++    value_size = make_contract_value( class_attr, value );
+     add_customattribute_row( parent, attr_type, add_blob(value, value_size) );
+ 
+     if (method->md.class_property)

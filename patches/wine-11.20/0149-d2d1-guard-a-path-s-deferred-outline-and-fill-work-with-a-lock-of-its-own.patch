@@ -1,0 +1,131 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jfacemyer <1776340+jfacemyer@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 07:41:58 -0500
+Subject: [PATCH] d2d1: Guard a path's deferred outline and fill work
+ with a lock of its own.
+
+One global lock covered the deferred outline and fill work of every path,
+so a path's fill, which takes up to a second on large art, held up the
+outlines of all others. Affinity also hung for good on opening a large
+EPS: its UI thread waited on that lock in DrawGeometry while no thread
+held it, so the work had left it held, most likely by an exception that
+Affinity caught further up. Each path now has its own lock, released on
+the way out of the work even when an exception leaves through it, and an
+exception there is logged.
+---
+ dlls/d2d1/d2d1_private.h |  3 +++
+ dlls/d2d1/geometry.c     | 48 +++++++++++++++++++++++++---------------
+ 2 files changed, 33 insertions(+), 18 deletions(-)
+
+diff --git a/dlls/d2d1/d2d1_private.h b/dlls/d2d1/d2d1_private.h
+index 82e8aef..0166f81 100644
+--- a/dlls/d2d1/d2d1_private.h
++++ b/dlls/d2d1/d2d1_private.h
+@@ -649,6 +649,9 @@ struct d2d_geometry
+     } outline;
+     LONG outline_pending;
+     LONG fill_pending;
++    /* Guards this path's deferred outline and fill work. Per path: the work
++     * takes up to a second, and other paths need not wait for it. */
++    SRWLOCK lazy_lock;
+     /* The shared outline this path's outline arrays belong to, if any. */
+     struct d2d_outline_cache_entry *outline_entry;
+ 
+diff --git a/dlls/d2d1/geometry.c b/dlls/d2d1/geometry.c
+index 2b1b733..879d557 100644
+--- a/dlls/d2d1/geometry.c
++++ b/dlls/d2d1/geometry.c
+@@ -18,6 +18,7 @@
+ 
+ #include "d2d1_private.h"
+ #include <float.h>
++#include "wine/exception.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(d2d);
+ 
+@@ -5436,8 +5437,6 @@ static void *d2d_memdup(const void *src, size_t size)
+  * Close() reworks the figures for the fill (self-intersections, overlapping
+  * beziers), so it first keeps them as they were ended: on a close-cache hit by
+  * taking the arrays the cached result replaces, otherwise as copies. */
+-static SRWLOCK d2d_outline_lock = SRWLOCK_INIT;
+-
+ static BOOL d2d_path_geometry_alloc_outline_figures(struct d2d_geometry *geometry)
+ {
+     if (geometry->u.path.outline_built >= geometry->u.path.figure_count)
+@@ -5760,17 +5759,31 @@ static void d2d_path_geometry_build_outline_now(struct d2d_geometry *geometry)
+     geometry->outline_pending = FALSE;
+ }
+ 
++static void CALLBACK d2d_geometry_lazy_unlock(BOOL normal, void *ctx)
++{
++    struct d2d_geometry *geometry = ctx;
++
++    if (!normal)
++        ERR("Exception in the deferred work of geometry %p.\n", geometry);
++    ReleaseSRWLockExclusive(&geometry->lazy_lock);
++}
++
+ static void d2d_geometry_ensure_outline(struct d2d_geometry *geometry)
+ {
+     if (!ReadAcquire(&geometry->outline_pending))
+         return;
+-    AcquireSRWLockExclusive(&d2d_outline_lock);
+-    if (geometry->outline_pending)
++    AcquireSRWLockExclusive(&geometry->lazy_lock);
++    /* Released even if an exception leaves through here: a lock left held
++     * hangs every later draw of this path. */
++    __TRY
+     {
+-        d2d_path_geometry_build_outline_shared(geometry);
+-        WriteRelease(&geometry->outline_pending, FALSE);
++        if (geometry->outline_pending)
++        {
++            d2d_path_geometry_build_outline_shared(geometry);
++            WriteRelease(&geometry->outline_pending, FALSE);
++        }
+     }
+-    ReleaseSRWLockExclusive(&d2d_outline_lock);
++    __FINALLY_CTX(d2d_geometry_lazy_unlock, geometry)
+ }
+ 
+ static unsigned char *d2d_close_cache_put(unsigned char *p, const void *data, size_t size)
+@@ -6107,8 +6120,6 @@ static BOOL d2d_path_geometry_defer_fill(const struct d2d_geometry *geometry)
+     return count >= D2D_DEFER_FILL_MIN_VERTICES;
+ }
+ 
+-static SRWLOCK d2d_fill_lock = SRWLOCK_INIT;
+-
+ /* Does Close()'s deferred fill work, if any, before anything reads the fill
+  * or the figures as Close() leaves them. */
+ void d2d_geometry_ensure_fill(const struct d2d_geometry *geometry)
+@@ -6118,17 +6129,18 @@ void d2d_geometry_ensure_fill(const struct d2d_geometry *geometry)
+     if (path->ID2D1Geometry_iface.lpVtbl != (const ID2D1GeometryVtbl *)&d2d_path_geometry_vtbl
+             || !ReadAcquire(&path->fill_pending))
+         return;
+-    AcquireSRWLockExclusive(&d2d_fill_lock);
+-    if (path->fill_pending)
++    /* A lazy outline reads the figures under this lock. The fill work
++     * changes them, after keeping a copy for the outline. */
++    AcquireSRWLockExclusive(&path->lazy_lock);
++    __TRY
+     {
+-        /* A lazy outline reads the figures under this lock. The fill work
+-         * changes them, after keeping a copy for the outline. */
+-        AcquireSRWLockExclusive(&d2d_outline_lock);
+-        d2d_path_geometry_compute_fill(path);
+-        ReleaseSRWLockExclusive(&d2d_outline_lock);
+-        WriteRelease(&path->fill_pending, FALSE);
++        if (path->fill_pending)
++        {
++            d2d_path_geometry_compute_fill(path);
++            WriteRelease(&path->fill_pending, FALSE);
++        }
+     }
+-    ReleaseSRWLockExclusive(&d2d_fill_lock);
++    __FINALLY_CTX(d2d_geometry_lazy_unlock, path)
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE d2d_geometry_sink_Close(ID2D1GeometrySink *iface)
+-- 
+2.55.0
+

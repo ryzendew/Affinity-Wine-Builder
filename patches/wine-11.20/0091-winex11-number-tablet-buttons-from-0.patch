@@ -1,0 +1,29 @@
+winex11: Number tablet buttons from 0.
+
+X numbers buttons from 1 and leaves bit 0 of a device's button state
+unused, so the tip came through as wintab button 1 (pkButtons 2), not
+button 0, and an application looking for the tip never saw the pen
+touch down.
+---
+ dlls/winex11.drv/wintab.c | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/dlls/winex11.drv/wintab.c b/dlls/winex11.drv/wintab.c
+index 10df1fb..1475ecc 100644
+--- a/dlls/winex11.drv/wintab.c
++++ b/dlls/winex11.drv/wintab.c
+@@ -840,11 +840,12 @@ static void set_button_state(int curnum, XID deviceid)
+             {
+                 int loop2;
+                 XButtonState *button_state =  (XButtonState*)class;
+-                for (loop2 = 0; loop2 < button_state->num_buttons; loop2++)
++                /* X numbers buttons from 1 and bit 0 is unused; wintab's tip is button 0 */
++                for (loop2 = 1; loop2 <= button_state->num_buttons; loop2++)
+                 {
+                     if (button_state->buttons[loop2 / 8] & (1 << (loop2 % 8)))
+                     {
+-                        rc |= (1<<loop2);
++                        rc |= (1 << (loop2 - 1));
+                     }
+                 }
+             }

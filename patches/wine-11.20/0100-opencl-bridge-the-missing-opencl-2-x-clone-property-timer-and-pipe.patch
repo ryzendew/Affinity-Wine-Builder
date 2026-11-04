@@ -1,0 +1,379 @@
+opencl: Bridge the missing OpenCL 2.x clone, property, timer and pipe functions.
+
+clCloneKernel, clCreateCommandQueueWithProperties,
+clCreateSamplerWithProperties, clCreateProgramWithIL, clCreatePipe,
+clGetPipeInfo, clGetKernelSubGroupInfo, clGetDeviceAndHostTimer,
+clGetHostTimer and clSetDefaultDeviceCommandQueue were not exported, so
+an application that imports them failed to load. All are host
+passthroughs without callbacks; their unix call slots are appended so
+nothing is renumbered. A function the driver does not support now
+reports the driver's error instead of a missing import.
+
+From the Affinity-Wine-Builder 11.18 set (its 0067).
+---
+ dlls/opencl/opencl.spec     | 10 +++++
+ dlls/opencl/pe_wrappers.c   | 87 +++++++++++++++++++++++++++++++++++++++++
+ dlls/opencl/unix_private.h  | 10 +++++
+ dlls/opencl/unix_thunks.c   | 10 +++++
+ dlls/opencl/unix_wrappers.c | 84 +++++++++++++++++++++++++++++++++++++++
+ dlls/opencl/unixlib.h       | 95 +++++++++++++++++++++++++++++++++++++++++++++
+ 6 files changed, 296 insertions(+)
+
+diff --git a/dlls/opencl/opencl.spec b/dlls/opencl/opencl.spec
+index 44fc670..3a9cdc8 100644
+--- a/dlls/opencl/opencl.spec
++++ b/dlls/opencl/opencl.spec
+@@ -98,3 +98,13 @@
+ @ stdcall clWaitForEvents(long ptr)
+ @ stdcall clSVMAlloc(ptr int64 long long)
+ @ stdcall clSVMFree(ptr ptr)
++@ stdcall clCloneKernel(ptr ptr)
++@ stdcall clCreateCommandQueueWithProperties(ptr ptr ptr ptr)
++@ stdcall clCreatePipe(ptr int64 long long ptr ptr)
++@ stdcall clCreateProgramWithIL(ptr ptr long ptr)
++@ stdcall clCreateSamplerWithProperties(ptr ptr ptr)
++@ stdcall clGetDeviceAndHostTimer(ptr ptr ptr)
++@ stdcall clGetHostTimer(ptr ptr)
++@ stdcall clGetKernelSubGroupInfo(ptr ptr long long ptr long ptr ptr)
++@ stdcall clGetPipeInfo(ptr long long ptr ptr)
++@ stdcall clSetDefaultDeviceCommandQueue(ptr ptr ptr)
+diff --git a/dlls/opencl/pe_wrappers.c b/dlls/opencl/pe_wrappers.c
+index b6593b6..340c421 100644
+--- a/dlls/opencl/pe_wrappers.c
++++ b/dlls/opencl/pe_wrappers.c
+@@ -411,6 +411,93 @@ cl_int WINAPI clGetGLTextureInfo( cl_mem memobj, cl_gl_texture_info param_name,
+ }
+ 
+ 
++cl_kernel WINAPI clCloneKernel( cl_kernel source, cl_int *errcode_ret )
++{
++    cl_kernel __retval;
++    struct clCloneKernel_params params = { &__retval, source, errcode_ret };
++    TRACE( "(%p, %p)\n", source, errcode_ret );
++    OPENCL_CALL( clCloneKernel, &params );
++    return __retval;
++}
++
++cl_command_queue WINAPI clCreateCommandQueueWithProperties( cl_context context, cl_device_id device,
++        const intptr_t *properties, cl_int *errcode_ret )
++{
++    cl_command_queue __retval;
++    struct clCreateCommandQueueWithProperties_params params = { &__retval, context, device, properties, errcode_ret };
++    TRACE( "(%p, %p, %p, %p)\n", context, device, properties, errcode_ret );
++    OPENCL_CALL( clCreateCommandQueueWithProperties, &params );
++    return __retval;
++}
++
++cl_mem WINAPI clCreatePipe( cl_context context, cl_bitfield flags, uint32_t packet_size,
++        uint32_t max_packets, const intptr_t *properties, cl_int *errcode_ret )
++{
++    cl_mem __retval;
++    struct clCreatePipe_params params = { &__retval, context, flags, packet_size, max_packets, properties, errcode_ret };
++    TRACE( "(%p, %s, %u, %u, %p, %p)\n", context, wine_dbgstr_longlong(flags), packet_size, max_packets, properties, errcode_ret );
++    OPENCL_CALL( clCreatePipe, &params );
++    return __retval;
++}
++
++cl_program WINAPI clCreateProgramWithIL( cl_context context, const void *il, size_t length, cl_int *errcode_ret )
++{
++    cl_program __retval;
++    struct clCreateProgramWithIL_params params = { &__retval, context, il, length, errcode_ret };
++    TRACE( "(%p, %p, %Iu, %p)\n", context, il, length, errcode_ret );
++    OPENCL_CALL( clCreateProgramWithIL, &params );
++    return __retval;
++}
++
++cl_sampler WINAPI clCreateSamplerWithProperties( cl_context context, const intptr_t *properties, cl_int *errcode_ret )
++{
++    cl_sampler __retval;
++    struct clCreateSamplerWithProperties_params params = { &__retval, context, properties, errcode_ret };
++    TRACE( "(%p, %p, %p)\n", context, properties, errcode_ret );
++    OPENCL_CALL( clCreateSamplerWithProperties, &params );
++    return __retval;
++}
++
++cl_int WINAPI clGetDeviceAndHostTimer( cl_device_id device, cl_ulong *device_timestamp, cl_ulong *host_timestamp )
++{
++    struct clGetDeviceAndHostTimer_params params = { device, device_timestamp, host_timestamp };
++    TRACE( "(%p, %p, %p)\n", device, device_timestamp, host_timestamp );
++    return OPENCL_CALL( clGetDeviceAndHostTimer, &params );
++}
++
++cl_int WINAPI clGetHostTimer( cl_device_id device, cl_ulong *host_timestamp )
++{
++    struct clGetHostTimer_params params = { device, host_timestamp };
++    TRACE( "(%p, %p)\n", device, host_timestamp );
++    return OPENCL_CALL( clGetHostTimer, &params );
++}
++
++cl_int WINAPI clGetKernelSubGroupInfo( cl_kernel kernel, cl_device_id device, uint32_t param_name,
++        size_t input_value_size, const void *input_value,
++        size_t param_value_size, void *param_value, size_t *param_value_size_ret )
++{
++    struct clGetKernelSubGroupInfo_params params = { kernel, device, param_name, input_value_size, input_value,
++            param_value_size, param_value, param_value_size_ret };
++    TRACE( "(%p, %p, %u, %Iu, %p, %Iu, %p, %p)\n", kernel, device, param_name,
++            input_value_size, input_value, param_value_size, param_value, param_value_size_ret );
++    return OPENCL_CALL( clGetKernelSubGroupInfo, &params );
++}
++
++cl_int WINAPI clGetPipeInfo( cl_mem pipe, uint32_t param_name, size_t param_value_size,
++        void *param_value, size_t *param_value_size_ret )
++{
++    struct clGetPipeInfo_params params = { pipe, param_name, param_value_size, param_value, param_value_size_ret };
++    TRACE( "(%p, %u, %Iu, %p, %p)\n", pipe, param_name, param_value_size, param_value, param_value_size_ret );
++    return OPENCL_CALL( clGetPipeInfo, &params );
++}
++
++cl_int WINAPI clSetDefaultDeviceCommandQueue( cl_context context, cl_device_id device, cl_command_queue command_queue )
++{
++    struct clSetDefaultDeviceCommandQueue_params params = { context, device, command_queue };
++    TRACE( "(%p, %p, %p)\n", context, device, command_queue );
++    return OPENCL_CALL( clSetDefaultDeviceCommandQueue, &params );
++}
++
+ BOOL WINAPI DllMain( HINSTANCE instance, DWORD reason, void *reserved )
+ {
+     if (reason == DLL_PROCESS_ATTACH)
+diff --git a/dlls/opencl/unix_private.h b/dlls/opencl/unix_private.h
+index 8a2e379..5c8ce9a 100644
+--- a/dlls/opencl/unix_private.h
++++ b/dlls/opencl/unix_private.h
+@@ -52,5 +52,15 @@ NTSTATUS wrap_clSetEventCallback( void *args );
+ NTSTATUS wrap_clSetMemObjectDestructorCallback( void *args );
+ NTSTATUS wrap_clCompileProgram( void *args );
+ NTSTATUS wrap_clLinkProgram( void *args );
++NTSTATUS wrap_clCloneKernel( void *args );
++NTSTATUS wrap_clCreateCommandQueueWithProperties( void *args );
++NTSTATUS wrap_clCreatePipe( void *args );
++NTSTATUS wrap_clCreateProgramWithIL( void *args );
++NTSTATUS wrap_clCreateSamplerWithProperties( void *args );
++NTSTATUS wrap_clGetDeviceAndHostTimer( void *args );
++NTSTATUS wrap_clGetHostTimer( void *args );
++NTSTATUS wrap_clGetKernelSubGroupInfo( void *args );
++NTSTATUS wrap_clGetPipeInfo( void *args );
++NTSTATUS wrap_clSetDefaultDeviceCommandQueue( void *args );
+ 
+ #endif
+diff --git a/dlls/opencl/unix_thunks.c b/dlls/opencl/unix_thunks.c
+index 087ada0..7bc9845 100644
+--- a/dlls/opencl/unix_thunks.c
++++ b/dlls/opencl/unix_thunks.c
+@@ -680,4 +680,14 @@ const unixlib_entry_t __wine_unix_call_funcs[] =
+     wait_event_callback,
+     wrap_clSVMAlloc,
+     wrap_clSVMFree,
++    wrap_clCloneKernel,
++    wrap_clCreateCommandQueueWithProperties,
++    wrap_clCreatePipe,
++    wrap_clCreateProgramWithIL,
++    wrap_clCreateSamplerWithProperties,
++    wrap_clGetDeviceAndHostTimer,
++    wrap_clGetHostTimer,
++    wrap_clGetKernelSubGroupInfo,
++    wrap_clGetPipeInfo,
++    wrap_clSetDefaultDeviceCommandQueue,
+ };
+diff --git a/dlls/opencl/unix_wrappers.c b/dlls/opencl/unix_wrappers.c
+index b311fa1..1538148 100644
+--- a/dlls/opencl/unix_wrappers.c
++++ b/dlls/opencl/unix_wrappers.c
+@@ -163,3 +163,87 @@ NTSTATUS wrap_clLinkProgram( void *args )
+                                        NULL, NULL, params->errcode_ret );
+     return STATUS_SUCCESS;
+ }
++
++NTSTATUS wrap_clCloneKernel( void *args )
++{
++    struct clCloneKernel_params *params = args;
++
++    *params->__retval = clCloneKernel( params->source, params->errcode_ret );
++    return STATUS_SUCCESS;
++}
++
++NTSTATUS wrap_clCreateCommandQueueWithProperties( void *args )
++{
++    struct clCreateCommandQueueWithProperties_params *params = args;
++
++    *params->__retval = clCreateCommandQueueWithProperties( params->context, params->device,
++            (const cl_queue_properties *)params->properties, params->errcode_ret );
++    return STATUS_SUCCESS;
++}
++
++NTSTATUS wrap_clCreatePipe( void *args )
++{
++    struct clCreatePipe_params *params = args;
++
++    *params->__retval = clCreatePipe( params->context, params->flags, params->packet_size,
++            params->max_packets, (const cl_pipe_properties *)params->properties, params->errcode_ret );
++    return STATUS_SUCCESS;
++}
++
++NTSTATUS wrap_clCreateProgramWithIL( void *args )
++{
++    struct clCreateProgramWithIL_params *params = args;
++
++    *params->__retval = clCreateProgramWithIL( params->context, params->il,
++            params->length, params->errcode_ret );
++    return STATUS_SUCCESS;
++}
++
++NTSTATUS wrap_clCreateSamplerWithProperties( void *args )
++{
++    struct clCreateSamplerWithProperties_params *params = args;
++
++    *params->__retval = clCreateSamplerWithProperties( params->context,
++            (const cl_sampler_properties *)params->properties, params->errcode_ret );
++    return STATUS_SUCCESS;
++}
++
++NTSTATUS wrap_clGetDeviceAndHostTimer( void *args )
++{
++    struct clGetDeviceAndHostTimer_params *params = args;
++
++    return clGetDeviceAndHostTimer( params->device,
++            params->device_timestamp, params->host_timestamp );
++}
++
++NTSTATUS wrap_clGetHostTimer( void *args )
++{
++    struct clGetHostTimer_params *params = args;
++
++    return clGetHostTimer( params->device, params->host_timestamp );
++}
++
++NTSTATUS wrap_clGetKernelSubGroupInfo( void *args )
++{
++    struct clGetKernelSubGroupInfo_params *params = args;
++
++    return clGetKernelSubGroupInfo( params->kernel, params->device, params->param_name,
++            params->input_value_size, params->input_value,
++            params->param_value_size, params->param_value, params->param_value_size_ret );
++}
++
++NTSTATUS wrap_clGetPipeInfo( void *args )
++{
++    struct clGetPipeInfo_params *params = args;
++
++    return clGetPipeInfo( params->pipe, params->param_name,
++            params->param_value_size, params->param_value, params->param_value_size_ret );
++}
++
++NTSTATUS wrap_clSetDefaultDeviceCommandQueue( void *args )
++{
++    struct clSetDefaultDeviceCommandQueue_params *params = args;
++
++    return clSetDefaultDeviceCommandQueue( params->context, params->device, params->command_queue );
++}
++
+diff --git a/dlls/opencl/unixlib.h b/dlls/opencl/unixlib.h
+index 08bcbf6..de7bfe7 100644
+--- a/dlls/opencl/unixlib.h
++++ b/dlls/opencl/unixlib.h
+@@ -823,6 +823,91 @@ struct clWaitForEvents_params
+     const cl_event* event_list;
+ };
+ 
++struct clCloneKernel_params
++{
++    cl_kernel* __retval;
++    cl_kernel source;
++    cl_int* errcode_ret;
++};
++
++struct clCreateCommandQueueWithProperties_params
++{
++    cl_command_queue* __retval;
++    cl_context context;
++    cl_device_id device;
++    const intptr_t* properties;
++    cl_int* errcode_ret;
++};
++
++struct clCreatePipe_params
++{
++    cl_mem* __retval;
++    cl_context context;
++    cl_bitfield flags;
++    uint32_t packet_size;
++    uint32_t max_packets;
++    const intptr_t* properties;
++    cl_int* errcode_ret;
++};
++
++struct clCreateProgramWithIL_params
++{
++    cl_program* __retval;
++    cl_context context;
++    const void* il;
++    size_t length;
++    cl_int* errcode_ret;
++};
++
++struct clCreateSamplerWithProperties_params
++{
++    cl_sampler* __retval;
++    cl_context context;
++    const intptr_t* properties;
++    cl_int* errcode_ret;
++};
++
++struct clGetDeviceAndHostTimer_params
++{
++    cl_device_id device;
++    cl_ulong* device_timestamp;
++    cl_ulong* host_timestamp;
++};
++
++struct clGetHostTimer_params
++{
++    cl_device_id device;
++    cl_ulong* host_timestamp;
++};
++
++struct clGetKernelSubGroupInfo_params
++{
++    cl_kernel kernel;
++    cl_device_id device;
++    uint32_t param_name;
++    size_t input_value_size;
++    const void* input_value;
++    size_t param_value_size;
++    void* param_value;
++    size_t* param_value_size_ret;
++};
++
++struct clGetPipeInfo_params
++{
++    cl_mem pipe;
++    uint32_t param_name;
++    SIZE_T param_value_size;
++    void* param_value;
++    size_t* param_value_size_ret;
++};
++
++struct clSetDefaultDeviceCommandQueue_params
++{
++    cl_context context;
++    cl_device_id device;
++    cl_command_queue command_queue;
++};
++
+ enum opencl_funcs
+ {
+     unix_clBuildProgram,
+@@ -914,4 +999,14 @@ enum opencl_funcs
+     unix_wait_event_callback,
+     unix_clSVMAlloc,
+     unix_clSVMFree,
++    unix_clCloneKernel,
++    unix_clCreateCommandQueueWithProperties,
++    unix_clCreatePipe,
++    unix_clCreateProgramWithIL,
++    unix_clCreateSamplerWithProperties,
++    unix_clGetDeviceAndHostTimer,
++    unix_clGetHostTimer,
++    unix_clGetKernelSubGroupInfo,
++    unix_clGetPipeInfo,
++    unix_clSetDefaultDeviceCommandQueue,
+ };

@@ -1,0 +1,29 @@
+wined3d: Spin less before the command stream thread sleeps.
+
+When its queue runs empty, wined3d's command stream thread spins 2000
+times, re-reading the queue head, before it waits. While an application
+draws, the queue empties and refills many times a frame, so the spinning
+became a large part of the thread's CPU: sampled on the thread of
+Affinity's canvas device during a drag, about half its busy time was
+wined3d_cs_run()'s loop rather than commands or the Vulkan driver.
+
+Spin 200 times instead. Measured under a nested KWin on a Ryzen 9 3950X
+with an Arc A750, three rounds each, the command stream thread's CPU per
+presented frame: drag 3.5 -> 2.9 ms, node edit 3.4 -> 2.8 ms, zoom 5.1 ->
+4.0 ms, typing 1.8 -> 1.5 ms; frame rates, the application thread's time
+and key-to-frame latency unchanged; brush lag 28 -> 27 ms. Spinning 20
+times saved only another 7%.
+
+diff --git a/dlls/wined3d/wined3d_private.h b/dlls/wined3d/wined3d_private.h
+index d51c91f..1923809 100644
+--- a/dlls/wined3d/wined3d_private.h
++++ b/dlls/wined3d/wined3d_private.h
+@@ -3662,7 +3662,7 @@ enum wined3d_cs_queue_id
+ #else
+ #define WINED3D_CS_QUEUE_SIZE           0x400000u
+ #endif
+-#define WINED3D_CS_SPIN_COUNT           2000u
++#define WINED3D_CS_SPIN_COUNT           200u
+ /* How long to wait for commands when there are active queries, in µs. */
+ #define WINED3D_CS_COMMAND_WAIT_WITH_QUERIES_TIMEOUT 100
+ /* How long to wait for the CS from the client thread, in µs. */

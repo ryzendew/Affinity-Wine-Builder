@@ -1,0 +1,245 @@
+wbemprox: Add proxies for the WMI interfaces.
+
+Wine had no proxy/stub for IWbemServices, IEnumWbemClassObject,
+IWbemCallResult and IWbemObjectSink, so none of them could be used from
+another apartment (E_NOINTERFACE from RemQueryInterface). Generate them
+from wbemcli.idl and register them under the proxy CLSID Windows uses.
+
+The class objects, contexts and qualifier sets are local interfaces,
+marshaled on Windows by fastprox's own IMarshal; aggregate the
+free-threaded marshaler so that they pass through the proxies within the
+process.
+
+Affinity's installer asks WMI for Win32_Processor.Architecture from its
+WPF thread; it got nothing, took that for an ARM64 machine, and warned
+that the x64 installer is not recommended.
+---
+ dlls/wbemprox/Makefile.in        |  5 ++++-
+ dlls/wbemprox/class.c            |  6 +++++-
+ dlls/wbemprox/main.c             | 22 +++++++++++++++++++++-
+ dlls/wbemprox/qualifier.c        |  6 +++++-
+ dlls/wbemprox/services.c         |  6 +++++-
+ dlls/wbemprox/wbemprox_private.h |  1 +
+ dlls/wbemprox/wbemprox_ps.idl    | 29 +++++++++++++++++++++++++++++
+ 7 files changed, 70 insertions(+), 5 deletions(-)
+ create mode 100644 dlls/wbemprox/wbemprox_ps.idl
+
+diff --git a/dlls/wbemprox/Makefile.in b/dlls/wbemprox/Makefile.in
+index 3abfac8..dcf0b2d 100644
+--- a/dlls/wbemprox/Makefile.in
++++ b/dlls/wbemprox/Makefile.in
+@@ -1,5 +1,5 @@
+ MODULE    = wbemprox.dll
+-IMPORTS   = winspool version iphlpapi setupapi oleaut32 ole32 advapi32 user32 gdi32 ws2_32
++IMPORTS   = uuid winspool version iphlpapi setupapi oleaut32 ole32 rpcrt4 advapi32 user32 gdi32 ws2_32
+ 
+ SOURCES = \
+ 	builtin.c \
+@@ -16,4 +16,7 @@ SOURCES = \
+ 	table.c \
+ 	wbemlocator.c \
+ 	wbemprox.idl \
++	wbemprox_ps.idl \
+ 	wql.y
++
++dlldata_EXTRADEFS = -DENTRY_PREFIX=wbemprox_
+diff --git a/dlls/wbemprox/class.c b/dlls/wbemprox/class.c
+index b1e5794..b35effc 100644
+--- a/dlls/wbemprox/class.c
++++ b/dlls/wbemprox/class.c
+@@ -274,6 +274,7 @@ struct class_object
+ {
+     IWbemClassObject IWbemClassObject_iface;
+     LONG refs;
++    IUnknown *marshal;
+     WCHAR *name;
+     IEnumWbemClassObject *iter;
+     LONG flags;
+@@ -305,6 +306,7 @@ static ULONG WINAPI class_object_Release(
+     if (!refs)
+     {
+         TRACE("destroying %p\n", co);
++        if (co->marshal) IUnknown_Release( co->marshal );
+         if (co->iter) IEnumWbemClassObject_Release( co->iter );
+         destroy_record( co->record );
+         free( co->name );
+@@ -332,6 +334,8 @@ static HRESULT WINAPI class_object_QueryInterface(
+         *ppvObject = &client_security;
+         return S_OK;
+     }
++    else if ( IsEqualGUID( riid, &IID_IMarshal ) )
++        return get_free_threaded_marshaler( (IUnknown *)iface, &co->marshal, riid, ppvObject );
+     else
+     {
+         FIXME("interface %s not implemented\n", debugstr_guid(riid));
+@@ -1091,7 +1095,7 @@ HRESULT create_class_object( enum wbm_namespace ns, const WCHAR *name, IEnumWbem
+ 
+     TRACE("%s, %p\n", debugstr_w(name), obj);
+ 
+-    if (!(co = malloc( sizeof(*co) ))) return E_OUTOFMEMORY;
++    if (!(co = calloc( 1, sizeof(*co) ))) return E_OUTOFMEMORY;
+ 
+     co->IWbemClassObject_iface.lpVtbl = &class_object_vtbl;
+     co->refs  = 1;
+diff --git a/dlls/wbemprox/main.c b/dlls/wbemprox/main.c
+index 97f859b..384565c 100644
+--- a/dlls/wbemprox/main.c
++++ b/dlls/wbemprox/main.c
+@@ -122,6 +122,25 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
+     return TRUE;
+ }
+ 
++/* The class objects, contexts and qualifier sets here live in the process
++ * that uses them and are local interfaces, marshaled on Windows by fastprox's
++ * own IMarshal. Hand the same object to every apartment, as the free-threaded
++ * marshaler does, so that they can be passed through the WMI proxies. */
++HRESULT get_free_threaded_marshaler( IUnknown *outer, IUnknown **marshal, REFIID riid, void **obj )
++{
++    IUnknown *ftm;
++    HRESULT hr;
++
++    if (!*marshal)
++    {
++        if (FAILED(hr = CoCreateFreeThreadedMarshaler( outer, &ftm ))) return hr;
++        if (InterlockedCompareExchangePointer( (void **)marshal, ftm, NULL )) IUnknown_Release( ftm );
++    }
++    return IUnknown_QueryInterface( *marshal, riid, obj );
++}
++
++HRESULT WINAPI wbemprox_DllGetClassObject( REFCLSID rclsid, REFIID iid, LPVOID *ppv );
++
+ HRESULT WINAPI DllGetClassObject( REFCLSID rclsid, REFIID iid, LPVOID *ppv )
+ {
+     IClassFactory *cf = NULL;
+@@ -137,6 +156,7 @@ HRESULT WINAPI DllGetClassObject( REFCLSID rclsid, REFIID iid, LPVOID *ppv )
+     {
+        cf = &wbem_context_cf.IClassFactory_iface;
+     }
+-    if (!cf) return CLASS_E_CLASSNOTAVAILABLE;
++    /* the proxies and stubs of the WMI interfaces */
++    if (!cf) return wbemprox_DllGetClassObject( rclsid, iid, ppv );
+     return IClassFactory_QueryInterface( cf, iid, ppv );
+ }
+diff --git a/dlls/wbemprox/qualifier.c b/dlls/wbemprox/qualifier.c
+index 167a814..b386f70 100644
+--- a/dlls/wbemprox/qualifier.c
++++ b/dlls/wbemprox/qualifier.c
+@@ -34,6 +34,7 @@ struct qualifier_set
+ {
+     IWbemQualifierSet IWbemQualifierSet_iface;
+     LONG refs;
++    IUnknown *marshal;
+     enum wbm_namespace ns;
+     WCHAR *class;
+     WCHAR *member;
+@@ -60,6 +61,7 @@ static ULONG WINAPI qualifier_set_Release(
+     if (!refs)
+     {
+         TRACE("destroying %p\n", set);
++        if (set->marshal) IUnknown_Release( set->marshal );
+         free( set->class );
+         free( set->member );
+         free( set );
+@@ -81,6 +83,8 @@ static HRESULT WINAPI qualifier_set_QueryInterface(
+     {
+         *ppvObject = &set->IWbemQualifierSet_iface;
+     }
++    else if ( IsEqualGUID( riid, &IID_IMarshal ) )
++        return get_free_threaded_marshaler( (IUnknown *)iface, &set->marshal, riid, ppvObject );
+     else
+     {
+         FIXME("interface %s not implemented\n", debugstr_guid(riid));
+@@ -279,7 +283,7 @@ HRESULT WbemQualifierSet_create( enum wbm_namespace ns, const WCHAR *class, cons
+ 
+     TRACE("%p\n", ppObj);
+ 
+-    if (!(set = malloc( sizeof(*set) ))) return E_OUTOFMEMORY;
++    if (!(set = calloc( 1, sizeof(*set) ))) return E_OUTOFMEMORY;
+ 
+     set->IWbemQualifierSet_iface.lpVtbl = &qualifier_set_vtbl;
+     if (!(set->class = wcsdup( class )))
+diff --git a/dlls/wbemprox/services.c b/dlls/wbemprox/services.c
+index 7ca8979..bfe2815 100644
+--- a/dlls/wbemprox/services.c
++++ b/dlls/wbemprox/services.c
+@@ -1015,6 +1015,7 @@ struct wbem_context
+ {
+     IWbemContext IWbemContext_iface;
+     LONG refs;
++    IUnknown *marshal;
+     struct list values;
+ };
+ 
+@@ -1048,6 +1049,8 @@ static HRESULT WINAPI wbem_context_QueryInterface(
+     {
+         *obj = iface;
+     }
++    else if ( IsEqualGUID( riid, &IID_IMarshal ) )
++        return get_free_threaded_marshaler( (IUnknown *)iface, &impl_from_IWbemContext( iface )->marshal, riid, obj );
+     else
+     {
+         FIXME("interface %s not implemented\n", debugstr_guid(riid));
+@@ -1074,6 +1077,7 @@ static ULONG WINAPI wbem_context_Release(
+     if (!refs)
+     {
+         TRACE("destroying %p\n", context);
++        if (context->marshal) IUnknown_Release( context->marshal );
+         wbem_context_delete_values( context );
+         free( context );
+     }
+@@ -1268,7 +1272,7 @@ HRESULT WbemContext_create( void **obj, REFIID riid )
+          !IsEqualGUID( riid, &IID_IUnknown ) )
+         return E_NOINTERFACE;
+ 
+-    if (!(context = malloc( sizeof(*context) ))) return E_OUTOFMEMORY;
++    if (!(context = calloc( 1, sizeof(*context) ))) return E_OUTOFMEMORY;
+ 
+     context->IWbemContext_iface.lpVtbl = &wbem_context_vtbl;
+     context->refs = 1;
+diff --git a/dlls/wbemprox/wbemprox_private.h b/dlls/wbemprox/wbemprox_private.h
+index 1da85a1..19216c9 100644
+--- a/dlls/wbemprox/wbemprox_private.h
++++ b/dlls/wbemprox/wbemprox_private.h
+@@ -248,6 +248,7 @@ HRESULT create_signature( enum wbm_namespace ns, const WCHAR *, const WCHAR *, e
+                           IWbemClassObject ** );
+ 
+ HRESULT WbemLocator_create(LPVOID *, REFIID);
++HRESULT get_free_threaded_marshaler(IUnknown *, IUnknown **, REFIID, void **);
+ HRESULT WbemServices_create(const WCHAR *, IWbemContext *, LPVOID *);
+ HRESULT WbemContext_create(void **, REFIID);
+ HRESULT create_class_object(enum wbm_namespace ns, const WCHAR *, IEnumWbemClassObject *, UINT,
+diff --git a/dlls/wbemprox/wbemprox_ps.idl b/dlls/wbemprox/wbemprox_ps.idl
+new file mode 100644
+index 0000000..38fb2e6
+--- /dev/null
++++ b/dlls/wbemprox/wbemprox_ps.idl
+@@ -0,0 +1,29 @@
++/*
++ * Proxies and stubs of the WMI interfaces
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#pragma makedep proxy
++#pragma makedep register
++
++#include "wbemcli.idl"
++
++[
++    helpstring("WMI interfaces proxy"),
++    threading(both),
++    uuid(7c857801-7381-11cf-884d-00aa004b2e24)
++]
++coclass PSFactoryBuffer { interface IPSFactoryBuffer; }

@@ -1,0 +1,90 @@
+ntdll: Skip the queue lock when no thread waits on the address.
+
+RtlWakeAddressSingle() and RtlWakeAddressAll() took the queue's spinlock
+on every call, and most calls find nobody waiting: condition variables
+and SRW locks wake on every release. With a large thread pool the lock
+is fought over; in Affinity, re-rendering an effect while zooming took
+the queue locks 1.1 million times in two seconds for 98,000 waits, and
+spun 2 million times waiting for them (7% of the process's CPU).
+
+Count the waiters in each queue before they compare the value, and let
+a waker that finds the count at zero after its barrier return at once:
+any waiter it misses has not compared yet and will see the new value.
+Also give each queue its own cache line and spin on a plain read.
+
+Synthetic wait/wake stress: 7.1-7.6 s to 6.5-6.7 s. In Affinity with an
+effect on the page, canvas frames +3-9%. ntdll and kernel32 sync tests
+unchanged.
+---
+ dlls/ntdll/sync.c | 16 ++++++++++++++--
+ 1 file changed, 14 insertions(+), 2 deletions(-)
+
+diff --git a/dlls/ntdll/sync.c b/dlls/ntdll/sync.c
+index e2dc3fc..6cc50af 100644
+--- a/dlls/ntdll/sync.c
++++ b/dlls/ntdll/sync.c
+@@ -835,7 +835,8 @@ struct futex_queue
+ {
+     struct list queue;
+     LONG lock;
+-};
++    LONG waiters;  /* threads in RtlWaitOnAddress() on this queue, counted before they compare */
++} DECLSPEC_ALIGN(64);
+ 
+ static struct futex_queue futex_queues[256];
+ 
+@@ -849,7 +850,7 @@ static struct futex_queue *get_futex_queue( const void *addr )
+ static void spin_lock( LONG *lock )
+ {
+     while (InterlockedCompareExchange( lock, -1, 0 ))
+-        YieldProcessor();
++        while (ReadNoFence( lock )) YieldProcessor();
+ }
+ 
+ static void spin_unlock( LONG *lock )
+@@ -892,6 +893,9 @@ NTSTATUS WINAPI RtlWaitOnAddress( const void *addr, const void *cmp, SIZE_T size
+     entry.addr = addr;
+     entry.tid = GetCurrentThreadId();
+ 
++    /* Count ourselves before comparing; a waker that sees no waiters after
++     * changing the value then knows we will see the new value. */
++    InterlockedIncrement( &queue->waiters );
+     spin_lock( &queue->lock );
+ 
+     /* Do the comparison inside of the spinlock, to reduce spurious wakeups. */
+@@ -899,6 +903,7 @@ NTSTATUS WINAPI RtlWaitOnAddress( const void *addr, const void *cmp, SIZE_T size
+     if (!compare_addr( addr, cmp, size ))
+     {
+         spin_unlock( &queue->lock );
++        InterlockedDecrement( &queue->waiters );
+         return STATUS_SUCCESS;
+     }
+ 
+@@ -918,6 +923,7 @@ NTSTATUS WINAPI RtlWaitOnAddress( const void *addr, const void *cmp, SIZE_T size
+             list_remove( &entry.entry );
+         spin_unlock( &queue->lock );
+     }
++    InterlockedDecrement( &queue->waiters );
+ 
+     TRACE("returning %#lx\n", ret);
+ 
+@@ -939,6 +945,9 @@ void WINAPI RtlWakeAddressAll( const void *addr )
+ 
+     if (!addr) return;
+ 
++    MemoryBarrier();
++    if (!ReadNoFence( &queue->waiters )) return;
++
+     spin_lock( &queue->lock );
+ 
+     if (!queue->queue.next)
+@@ -979,6 +988,9 @@ void WINAPI RtlWakeAddressSingle( const void *addr )
+ 
+     if (!addr) return;
+ 
++    MemoryBarrier();
++    if (!ReadNoFence( &queue->waiters )) return;
++
+     spin_lock( &queue->lock );
+ 
+     if (!queue->queue.next)

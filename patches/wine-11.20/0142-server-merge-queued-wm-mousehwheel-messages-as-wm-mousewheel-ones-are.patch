@@ -1,0 +1,55 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jfacemyer <1776340+jfacemyer@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 07:29:54 -0500
+Subject: [PATCH] server: Merge queued WM_MOUSEHWHEEL messages as
+ WM_MOUSEWHEEL ones are.
+
+merge_message() merged a queued wheel message into the previous one
+(same window, same pointer position) only for WM_MOUSEWHEEL. Windows
+merges WM_MOUSEHWHEEL the same way, so here an application that fell
+behind a fast sideways touchpad swipe got every queued message as a
+step of its own and kept scrolling after the swipe ended.
+
+Also stop check_hw_message_filter() from matching WM_MOUSEHWHEEL against
+a non-client message range, since win32u no longer turns it into one.
+
+Merging from neutron-wine (Nico-LaFoucate); the filter change is ours.
+---
+ server/queue.c | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/server/queue.c b/server/queue.c
+index d4d2800..a926447 100644
+--- a/server/queue.c
++++ b/server/queue.c
+@@ -843,7 +843,7 @@ static struct message *find_mouse_message( struct thread_input *input, const str
+     return prev;
+ }
+ 
+-/* try to merge a WM_MOUSEWHEEL message with the last in the list; return 1 if successful */
++/* try to merge a WM_MOUSEWHEEL or WM_MOUSEHWHEEL message with the last in the list; return 1 if successful */
+ static int merge_mousewheel( struct thread_input *input, const struct message *msg )
+ {
+     struct message *prev;
+@@ -925,7 +925,7 @@ static int merge_unique_message( struct thread_input *input, unsigned int messag
+ /* try to merge a message with the messages in the list; return 1 if successful */
+ static int merge_message( struct thread_input *input, const struct message *msg )
+ {
+-    if (msg->msg == WM_MOUSEWHEEL) return merge_mousewheel( input, msg );
++    if (msg->msg == WM_MOUSEWHEEL || msg->msg == WM_MOUSEHWHEEL) return merge_mousewheel( input, msg );
+     if (msg->msg == WM_MOUSEMOVE) return merge_mousemove( input, msg );
+     if (msg->msg == WM_WINE_CLIPCURSOR) return merge_unique_message( input, WM_WINE_CLIPCURSOR, msg );
+     if (msg->msg == WM_WINE_SETCURSOR) return merge_unique_message( input, WM_WINE_SETCURSOR, msg );
+@@ -2674,7 +2674,8 @@ static int check_hw_message_filter( user_handle_t win, unsigned int msg_code,
+     case QS_MOUSEBUTTON:
+         /* we need to check all possible values that the message can have in the end */
+         if (check_msg_filter( msg_code, first, last )) return 1;
+-        if (msg_code == WM_MOUSEWHEEL) return 0;  /* no other possible value for this one */
++        /* no other possible value for the wheel messages */
++        if (msg_code == WM_MOUSEWHEEL || msg_code == WM_MOUSEHWHEEL) return 0;
+ 
+         /* all other messages can become non-client messages */
+         if (check_msg_filter( msg_code + (WM_NCMOUSEFIRST - WM_MOUSEFIRST), first, last )) return 1;
+-- 
+2.55.0
+

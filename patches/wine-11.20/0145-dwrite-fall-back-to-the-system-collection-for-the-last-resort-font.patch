@@ -1,0 +1,39 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jfacemyer <1776340+jfacemyer@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 07:30:50 -0500
+Subject: [PATCH] dwrite: Fall back to the system collection for the
+ last resort font.
+
+A layout range without its own font collection means the system
+collection, and layout_map_run_characters() already falls back to
+layout->system_collection for it. layout_run_get_last_resort_font()
+passed range->collection to create_matching_font() as is, which called
+FindFamilyName() on NULL whenever a run found no font through fallback.
+Upstream Wine has the same code.
+
+From neutron-wine (Nico-LaFoucate).
+---
+ dlls/dwrite/layout.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/dlls/dwrite/layout.c b/dlls/dwrite/layout.c
+index 4d3a6a2..59d9f76 100644
+--- a/dlls/dwrite/layout.c
++++ b/dlls/dwrite/layout.c
+@@ -908,10 +908,12 @@ static HRESULT layout_map_run_characters(struct dwrite_textlayout *layout, struc
+ static HRESULT layout_run_get_last_resort_font(const struct dwrite_textlayout *layout, const struct layout_range *range,
+         IDWriteFontFace **fontface, float *size)
+ {
++    IDWriteFontCollection *collection;
+     IDWriteFont *font;
+     HRESULT hr;
+ 
+-    if (FAILED(create_matching_font(range->collection, range->fontfamily, range->weight, range->style,
++    collection = range->collection ? range->collection : layout->system_collection;
++    if (FAILED(create_matching_font(collection, range->fontfamily, range->weight, range->style,
+             range->stretch, &IID_IDWriteFont3, (void **)&font)))
+     {
+         if (FAILED(hr = create_matching_font(layout->system_collection, L"Tahoma", range->weight, range->style,
+-- 
+2.55.0
+

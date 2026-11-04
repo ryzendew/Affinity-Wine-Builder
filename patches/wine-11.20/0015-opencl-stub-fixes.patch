@@ -1,0 +1,49 @@
+From: ryzendew
+Date: 2026-06-23
+Subject: opencl: implement stubs for clCompileProgram, clLinkProgram,
+ clSetMemObjectDestructorCallback
+
+Instead of returning CL_INVALID_OPERATION (which forces Affinity to
+fall back to software rendering), delegate to the real OpenCL
+implementation or return CL_SUCCESS where delegation isn't feasible.
+
+- wrap_clSetMemObjectDestructorCallback: return CL_SUCCESS
+- wrap_clCompileProgram: call through to real clCompileProgram
+- wrap_clLinkProgram: call through to real clLinkProgram
+
+diff --git a/dlls/opencl/unix_wrappers.c b/dlls/opencl/unix_wrappers.c
+index 2ea9b85..d7fe5c8 100644
+--- a/dlls/opencl/unix_wrappers.c
++++ b/dlls/opencl/unix_wrappers.c
+@@ -73,13 +73,18 @@ NTSTATUS wrap_clSetEventCallback( void *args )
+ NTSTATUS wrap_clSetMemObjectDestructorCallback( void *args )
+ {
+     FIXME( "not yet implemented\n" );
+-    return CL_INVALID_OPERATION;
++    return CL_SUCCESS;
+ }
+ 
+ NTSTATUS wrap_clCompileProgram( void *args )
+ {
++    struct clCompileProgram_params *params = args;
++
+     FIXME( "not yet implemented\n" );
+-    return CL_INVALID_OPERATION;
++    if (params->pfn_notify) FIXME( "notify callback not supported\n" );
++    return clCompileProgram( params->program, params->num_devices, params->device_list,
++                             params->options, params->num_input_headers, params->input_headers,
++                             params->header_include_names, NULL, NULL );
+ }
+ 
+ NTSTATUS wrap_clLinkProgram( void *args )
+@@ -87,6 +92,9 @@ NTSTATUS wrap_clLinkProgram( void *args )
+     struct clLinkProgram_params *params = args;
+ 
+     FIXME( "not yet implemented\n" );
+-    *params->errcode_ret = CL_INVALID_OPERATION;
++    if (params->pfn_notify) FIXME( "notify callback not supported\n" );
++    *params->__retval = clLinkProgram( params->context, params->num_devices, params->device_list,
++                                       params->options, params->num_input_programs, params->input_programs,
++                                       NULL, NULL, params->errcode_ret );
+     return STATUS_SUCCESS;
+ }

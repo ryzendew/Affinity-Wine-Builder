@@ -1,0 +1,108 @@
+wined3d: Attach GL swapchains to their window on the first present.
+
+Render through the device's backup window until the swapchain first
+presents, and move its contexts onto the window then. Setting a pixel
+format on the window attaches a GL drawable to it, a client window on
+top of it under winex11, even if nothing is ever presented through it.
+WPF renders layered windows (popups, flyouts) into a lockable back
+buffer, reads them back and hands the pixels to UpdateLayeredWindow(),
+so the unused drawable covered what the window showed: on the GL
+renderer, Affinity's tool flyouts and tooltips came up as black boxes.
+The Vulkan renderer creates its swapchain on first use for the same
+reason.
+
+Presents made while a context is still on the backup window go through
+the GDI path, as they do when a context falls back to it.
+---
+ dlls/wined3d/context_gl.c | 36 ++++++++++++++++++++++++++++--------
+ dlls/wined3d/swapchain.c  |  3 +++
+ dlls/wined3d/wined3d_gl.h |  3 +++
+ 3 files changed, 34 insertions(+), 8 deletions(-)
+
+diff --git a/dlls/wined3d/context_gl.c b/dlls/wined3d/context_gl.c
+index e5b41ff..fe7d222 100644
+--- a/dlls/wined3d/context_gl.c
++++ b/dlls/wined3d/context_gl.c
+@@ -1293,19 +1293,26 @@ static void context_restore_gl_context(const struct wined3d_gl_info *gl_info, HD
+ 
+ static void wined3d_context_gl_update_window(struct wined3d_context_gl *context_gl)
+ {
+-    if (!context_gl->c.swapchain)
++    struct wined3d_swapchain *swapchain = context_gl->c.swapchain;
++    HDC dc;
++
++    if (!swapchain)
++        return;
++
++    if (wined3d_swapchain_gl(swapchain)->attached)
++        dc = swapchain->dc;
++    else if (!(dc = wined3d_device_gl_get_backup_dc(wined3d_device_gl(swapchain->device))))
+         return;
+ 
+-    if (context_gl->window == context_gl->c.swapchain->win_handle &&
+-        context_gl->dc == context_gl->c.swapchain->dc)
++    if (context_gl->window == swapchain->win_handle && context_gl->dc == dc)
+         return;
+ 
+-    TRACE("Updating context %p window from %p to %p.\n",
+-            context_gl, context_gl->window, context_gl->c.swapchain->win_handle);
++    TRACE("Updating context %p window from %p to %p, device context %p.\n",
++            context_gl, context_gl->window, swapchain->win_handle, dc);
+ 
+-    context_gl->window = context_gl->c.swapchain->win_handle;
+-    context_gl->dc = context_gl->c.swapchain->dc;
+-    context_gl->dc_is_private = FALSE;
++    context_gl->window = swapchain->win_handle;
++    context_gl->dc = dc;
++    context_gl->dc_is_private = dc != swapchain->dc;
+     context_gl->dc_has_format = FALSE;
+     context_gl->needs_set = 1;
+     context_gl->valid = 1;
+@@ -2002,6 +2009,19 @@ HRESULT wined3d_context_gl_init(struct wined3d_context_gl *context_gl, struct wi
+         TRACE("Swapchain is created on the desktop window, trying backup device context.\n");
+         context_gl->dc = NULL;
+     }
++    else if (!swapchain_gl->attached)
++    {
++        /* Setting a pixel format on the window attaches a GL drawable to it,
++         * a client window on top of it under winex11, even if nothing is
++         * ever presented through it. WPF renders layered windows (popups,
++         * flyouts) into a lockable back buffer, reads them back and hands
++         * the pixels to UpdateLayeredWindow(), so the unused drawable
++         * covered what the window showed: Affinity's tool flyouts came up
++         * as black boxes. Render through the backup window until the first
++         * present. */
++        TRACE("Swapchain has not presented yet, using the backup device context.\n");
++        context_gl->dc = NULL;
++    }
+     else if (!(context_gl->dc = swapchain_gl->s.dc))
+         WARN("Failed to retrieve device context, trying swapchain backup.\n");
+ 
+diff --git a/dlls/wined3d/swapchain.c b/dlls/wined3d/swapchain.c
+index 2b99395..3d0b842 100644
+--- a/dlls/wined3d/swapchain.c
++++ b/dlls/wined3d/swapchain.c
+@@ -674,6 +674,9 @@ static void swapchain_gl_present(struct wined3d_swapchain *swapchain,
+     struct wined3d_context_gl *context_gl;
+     struct wined3d_context *context;
+ 
++    /* The first present moves the swapchain's contexts onto the window. */
++    wined3d_swapchain_gl(swapchain)->attached = true;
++
+     context = context_acquire(swapchain->device, swapchain->front_buffer, 0);
+     context_gl = wined3d_context_gl(context);
+     if (!context_gl->valid)
+diff --git a/dlls/wined3d/wined3d_gl.h b/dlls/wined3d/wined3d_gl.h
+index c9c7118..a49eef9 100644
+--- a/dlls/wined3d/wined3d_gl.h
++++ b/dlls/wined3d/wined3d_gl.h
+@@ -1142,6 +1142,9 @@ void wined3d_unordered_access_view_gl_update(struct wined3d_unordered_access_vie
+ struct wined3d_swapchain_gl
+ {
+     struct wined3d_swapchain s;
++    /* Contexts render through the window's device context only once the
++     * swapchain has presented; until then they use the backup window. */
++    bool attached;
+ };
+ 
+ static inline struct wined3d_swapchain_gl *wined3d_swapchain_gl(struct wined3d_swapchain *swapchain)

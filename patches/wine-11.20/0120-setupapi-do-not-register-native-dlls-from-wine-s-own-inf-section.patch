@@ -1,0 +1,105 @@
+setupapi: Do not register native dlls from Wine's own inf sections.
+
+wine.inf registers Wine's builtins on every prefix update, mscoree.dll
+among them. In a prefix with the .NET Framework installed, that file is
+the native mscoree, which its installer registered already; registering
+it again loads the 32-bit .NET shim, which shows "This application could
+not be started. Do you want to view information about this issue?" for
+each update, holding up wineboot until the user answers.
+
+Skip dlls that are native files when the section also installs fake
+dlls, which only Wine's own sections do. Other infs register native dlls
+as before.
+---
+ dlls/setupapi/fakedll.c          | 14 ++++++++++++++
+ dlls/setupapi/install.c          | 17 ++++++++++++++++-
+ dlls/setupapi/setupapi_private.h |  1 +
+ 3 files changed, 31 insertions(+), 1 deletion(-)
+
+diff --git a/dlls/setupapi/fakedll.c b/dlls/setupapi/fakedll.c
+index 4dce22b..caf54d6 100644
+--- a/dlls/setupapi/fakedll.c
++++ b/dlls/setupapi/fakedll.c
+@@ -379,6 +379,20 @@ static BOOL is_fake_dll( HANDLE h )
+             !memcmp( dos + 1, fakedll_signature, sizeof(fakedll_signature) ));
+ }
+ 
++/* check if a file was replaced by a native dll, as opposed to a builtin, a fake dll or no file */
++BOOL is_native_dll_file( const WCHAR *name )
++{
++    HANDLE h;
++    BOOL ret;
++
++    h = CreateFileW( name, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
++                     NULL, OPEN_EXISTING, 0, NULL );
++    if (h == INVALID_HANDLE_VALUE) return FALSE;
++    ret = !is_fake_dll( h );
++    CloseHandle( h );
++    return ret;
++}
++
+ /* create directories leading to a given file */
+ static void create_directories( const WCHAR *name )
+ {
+diff --git a/dlls/setupapi/install.c b/dlls/setupapi/install.c
+index 0321ff6..4887f9f 100644
+--- a/dlls/setupapi/install.c
++++ b/dlls/setupapi/install.c
+@@ -64,6 +64,7 @@ struct register_dll_info
+     PSP_FILE_CALLBACK_W callback;
+     PVOID               callback_context;
+     BOOL                unregister;
++    BOOL                builtins_only;
+     int                 modules_size;
+     int                 modules_count;
+     HMODULE            *modules;
+@@ -554,7 +555,7 @@ static BOOL registry_callback( HINF hinf, PCWSTR field, void *arg )
+ static BOOL do_register_dll( struct register_dll_info *info, const WCHAR *path,
+                              INT flags, INT timeout, const WCHAR *args )
+ {
+-    HMODULE module;
++    HMODULE module = NULL;
+     HRESULT res;
+     SP_REGISTER_CONTROL_STATUSW status;
+     IMAGE_NT_HEADERS *nt;
+@@ -579,6 +580,16 @@ static BOOL do_register_dll( struct register_dll_info *info, const WCHAR *path,
+         }
+     }
+ 
++    /* Wine's own sections register its builtins. A native dll installed over one was
++     * registered by its own installer, and registering it again can run code that
++     * expects a full Windows setup: the .NET Framework's 32-bit mscoree shows "This
++     * application could not be started" on every prefix update. */
++    if (info->builtins_only && is_native_dll_file( path ))
++    {
++        TRACE( "%s is a native dll, not registering it\n", debugstr_w(path) );
++        goto done;
++    }
++
+     if (!(module = LoadLibraryExW( path, 0, LOAD_WITH_ALTERED_SEARCH_PATH )))
+     {
+         WARN( "could not load %s\n", debugstr_w(path) );
+@@ -1183,8 +1194,12 @@ BOOL WINAPI SetupInstallFromInfSectionW( HWND owner, HINF hinf, PCWSTR section,
+     if (flags & SPINST_REGSVR)
+     {
+         struct register_dll_info info = { .unregister = FALSE };
++        INFCONTEXT fake_dlls;
+         HRESULT hr;
+ 
++        /* only Wine's own sections install fake dlls */
++        info.builtins_only = SetupFindFirstLineW( hinf, section, L"WineFakeDlls", &fake_dlls );
++
+         if (flags & SPINST_REGISTERCALLBACKAWARE)
+         {
+             info.callback         = callback;
+diff --git a/dlls/setupapi/setupapi_private.h b/dlls/setupapi/setupapi_private.h
+index d902272..2f309ff 100644
+--- a/dlls/setupapi/setupapi_private.h
++++ b/dlls/setupapi/setupapi_private.h
+@@ -103,5 +103,6 @@ extern OSVERSIONINFOW OsVersionInfo;
+ 
+ extern BOOL create_fake_dll( const WCHAR *name, const WCHAR *source );
+ extern void cleanup_fake_dlls(void);
++extern BOOL is_native_dll_file( const WCHAR *name );
+ 
+ #endif /* __SETUPAPI_PRIVATE_H */

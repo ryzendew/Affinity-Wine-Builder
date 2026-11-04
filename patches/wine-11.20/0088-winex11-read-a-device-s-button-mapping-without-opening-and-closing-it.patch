@@ -1,0 +1,51 @@
+winex11: Read a device's button mapping without opening and closing it.
+
+update_device_mapping() runs whenever the pointer switches between
+devices, such as between a mouse and a pen. Closing the device it had
+opened removed every XInput event this client had selected for it, so
+wintab's tablet events stopped arriving as soon as the pen came near.
+XGetDeviceButtonMapping only sends the device id.
+---
+ dlls/winex11.drv/mouse.c | 17 +++++++----------
+ 1 file changed, 7 insertions(+), 10 deletions(-)
+
+diff --git a/dlls/winex11.drv/mouse.c b/dlls/winex11.drv/mouse.c
+index f717be7..fa6ec1d 100644
+--- a/dlls/winex11.drv/mouse.c
++++ b/dlls/winex11.drv/mouse.c
+@@ -266,28 +266,25 @@ void x11drv_init_mouse( Display *display )
+ static void update_device_mapping( Display *display, int deviceid )
+ {
+     struct mouse_button_mapping *tmp;
+-    XDevice *device;
++    /* XGetDeviceButtonMapping only sends the device id. Opening and closing
++     * the device instead would drop every XInput event this client selected
++     * for it, such as a tablet's events selected by wintab, and this runs
++     * each time the pointer switches between a mouse and a pen. */
++    XDevice device = { .device_id = deviceid };
+ 
+-    if (!deviceid || !(device = pXOpenDevice( display, deviceid )))
+-    {
+-        WARN( "Unable to open cursor device %d\n", deviceid );
+-        return;
+-    }
++    if (!deviceid) return;
+ 
+     if (!(tmp = malloc( sizeof(*tmp) )))
+     {
+         WARN( "Unable to allocate device mapping.\n" );
+-        pXCloseDevice( display, device );
+         return;
+     }
+ 
+     tmp->deviceid = deviceid;
+     tmp->button_count = ARRAY_SIZE( tmp->buttons );
+-    tmp->button_count = pXGetDeviceButtonMapping( display, device, tmp->buttons, tmp->button_count );
++    tmp->button_count = pXGetDeviceButtonMapping( display, &device, tmp->buttons, tmp->button_count );
+ 
+     free( InterlockedExchangePointer( (void**)&device_mapping, tmp ) );
+-
+-    pXCloseDevice( display, device );
+ }
+ 
+ /***********************************************************************

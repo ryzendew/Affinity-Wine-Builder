@@ -1,0 +1,48 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Nikolay Sivov <nsivov@codeweavers.com>
+Date: Mon, 2 Nov 2026 00:18:30 +0100
+Subject: [PATCH] dwrite: Ignore unsupported font files when creating
+ custom collections.
+
+Wine-Bug: https://bugs.winehq.org/show_bug.cgi?id=60626
+Signed-off-by: Nikolay Sivov <nsivov@codeweavers.com>
+
+Backport of upstream commit bcd4a666e4408983b963cc7317c3c4eb6361817a.
+---
+ dlls/dwrite/font.c | 20 +++++++++++++-------
+ 1 file changed, 13 insertions(+), 7 deletions(-)
+
+diff --git a/dlls/dwrite/font.c b/dlls/dwrite/font.c
+index 74d3309..5e4a601 100644
+--- a/dlls/dwrite/font.c
++++ b/dlls/dwrite/font.c
+@@ -4698,13 +4698,19 @@ HRESULT create_font_collection(IDWriteFactory7 *factory, IDWriteFontFileEnumerat
+             continue;
+         }
+ 
+-        /* add to scanned list */
+-        fileenum = malloc(sizeof(*fileenum));
+-        fileenum->file = file;
+-        list_add_tail(&scannedfiles, &fileenum->entry);
+-
+-        if (FAILED(hr = IDWriteFontSetBuilder1_AddFontFile(builder, file)))
+-            break;
++        if ((hr = IDWriteFontSetBuilder1_AddFontFile(builder, file)) == S_OK)
++        {
++            /* add to scanned list */
++            fileenum = malloc(sizeof(*fileenum));
++            fileenum->file = file;
++            list_add_tail(&scannedfiles, &fileenum->entry);
++        }
++        else
++        {
++            WARN("Set builder failed to add a file.\n");
++            IDWriteFontFile_Release(file);
++            hr = S_OK;
++        }
+     }
+ 
+     if (SUCCEEDED(hr))
+-- 
+2.55.0
+

@@ -1,0 +1,41 @@
+widl metadata: the assembly name is the file's name, not its path (ported to 11.18)
+
+Upstream 09eba117 ("widl: Keep a list of winmd specific data") moved the
+global assembly_name into struct winmd as winmd->name; the bug moved with
+it. Same fix, new home.
+
+---
+diff --git a/tools/widl/metadata.c b/tools/widl/metadata.c
+index 52e80e8..8f10d80 100644
+--- a/tools/widl/metadata.c
++++ b/tools/widl/metadata.c
+@@ -3790,7 +3790,6 @@ static void init_winmd( struct winmd *winmd )
+ {
+     static const GUID guid = { 0x9ddc04c6, 0x04ca, 0x04cc, { 0x52, 0x85, 0x4b, 0x50, 0xb2, 0x60, 0x1d, 0xa8 } };
+     static const USHORT space = 0x20;
+-    char *ptr;
+ 
+     memset( winmd, 0, sizeof(*winmd) );
+ 
+@@ -3799,12 +3798,18 @@ static void init_winmd( struct winmd *winmd )
+     add_userstring( &space, sizeof(space) );
+     add_blob( NULL, 0 );
+ 
+-    winmd->name = xstrdup( metadata_name );
+-    if ((ptr = strrchr( winmd->name, '.' ))) *ptr = 0;
++    /* The assembly and module names are the metadata file's own name, not the
++     * path it is written to. widl is normally invoked with an output path
++     * ("-o include/windows.storage.winmd"), and embedding that verbatim yields
++     * an assembly named "include/windows.storage". A name containing a path
++     * separator is not a valid assembly name, so any .NET code that walks the
++     * loaded assemblies -- AssemblyName..ctor by way of Assembly.FullName --
++     * throws FileLoadException 0x80131047 the moment such a winmd is loaded. */
++    winmd->name = get_basename_noext( metadata_name );
+ 
+     add_typedef_row( 0, add_string("<Module>"), 0, 0, 1, 1 );
+     add_assembly_row( add_string(winmd->name) );
+-    add_module_row( add_string(metadata_name), add_guid(&guid) );
++    add_module_row( add_string(get_basename(metadata_name)), add_guid(&guid) );
+     add_assemblyref_row( 0, add_blob(mscorlib_token, sizeof(mscorlib_token)), add_string("mscorlib") );
+ }
+ 

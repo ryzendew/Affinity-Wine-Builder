@@ -1,0 +1,77 @@
+win32u: Flush a window's surface when another thread releases its DC.
+
+Window surfaces are flushed when a thread goes idle in a message wait.
+Drawing into a window from another thread that does not wait for
+messages stayed off screen until the window's own thread got a message.
+WPF's software renderer presents from its render thread with GetDC,
+StretchBlt and ReleaseDC, once per change: the first frame of
+Affinity's setup window, drawn after its UI thread had gone idle, never
+reached the screen, and the window stayed white until hovered or
+refocused. Flush the window's (toplevel's) surface when a DC of a
+window of another thread is released; a surface with nothing to flush
+returns at once.
+---
+ dlls/win32u/dce.c            | 10 +++++++++-
+ dlls/win32u/win32u_private.h |  1 +
+ dlls/win32u/window.c         | 15 +++++++++++++++
+ 3 files changed, 25 insertions(+), 1 deletion(-)
+
+diff --git a/dlls/win32u/dce.c b/dlls/win32u/dce.c
+index 62989a4..27b4d69 100644
+--- a/dlls/win32u/dce.c
++++ b/dlls/win32u/dce.c
+@@ -1407,7 +1407,15 @@ HDC WINAPI NtUserGetDCEx( HWND hwnd, HRGN clip_rgn, DWORD flags )
+  */
+ INT WINAPI NtUserReleaseDC( HWND hwnd, HDC hdc )
+ {
+-    return release_dc( hwnd, hdc, FALSE );
++    INT ret = release_dc( hwnd, hdc, FALSE );
++
++    /* Window surfaces are flushed when a thread goes idle in a message wait.
++     * Drawing into a window from another thread, one that does not wait for
++     * messages, stayed off screen until the window's own thread got one: WPF's
++     * software renderer presents from its render thread with GetDC, BitBlt
++     * and ReleaseDC, and Affinity's setup window stayed white until hovered. */
++    if (ret && hwnd && !is_current_thread_window( hwnd )) flush_window_surface( hwnd );
++    return ret;
+ }
+ 
+ /***********************************************************************
+diff --git a/dlls/win32u/win32u_private.h b/dlls/win32u/win32u_private.h
+index 30e4f28..f71ef38 100644
+--- a/dlls/win32u/win32u_private.h
++++ b/dlls/win32u/win32u_private.h
+@@ -295,6 +295,7 @@ extern HWND get_window_relative( HWND hwnd, UINT rel );
+ extern DWORD get_window_thread( HWND hwnd, DWORD *process );
+ extern HWND is_current_process_window( HWND hwnd );
+ extern HWND is_current_thread_window( HWND hwnd );
++extern void flush_window_surface( HWND hwnd );
+ extern BOOL is_desktop_window( HWND hwnd );
+ extern BOOL is_iconic( HWND hwnd );
+ extern BOOL is_window_drawable( HWND hwnd, BOOL icon );
+diff --git a/dlls/win32u/window.c b/dlls/win32u/window.c
+index 6b07ceb..a92ba69 100644
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -2514,6 +2514,21 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
+     return ret;
+ }
+ 
++/* flush the surface that a window's drawing goes into: its toplevel's */
++void flush_window_surface( HWND hwnd )
++{
++    struct window_surface *surface;
++    WND *win;
++
++    hwnd = NtUserGetAncestor( hwnd, GA_ROOT );
++    if (!(win = get_win_ptr( hwnd )) || win == WND_DESKTOP || win == WND_OTHER_PROCESS) return;
++    if ((surface = win->surface)) window_surface_add_ref( surface );
++    release_win_ptr( win );
++    if (!surface) return;
++    window_surface_flush( surface );
++    window_surface_release( surface );
++}
++
+ static BOOL expose_window_surface( HWND hwnd, UINT flags, const RECT *rect )
+ {
+     struct window_surface *surface;

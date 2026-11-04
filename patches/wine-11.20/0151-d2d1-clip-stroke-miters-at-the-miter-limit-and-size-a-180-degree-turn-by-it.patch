@@ -1,0 +1,197 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jfacemyer <1776340+jfacemyer@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 07:44:41 -0500
+Subject: [PATCH] d2d1: Clip stroke miters at the miter limit, and size
+ a 180 degree turn by it.
+
+The outline shader placed a miter join's corner wherever the offset edges
+met, without D2D's miter limit, so a sharp corner grew a spike that got
+longer as the angle closed. A 180 degree turn instead had its far end
+fixed 25 geometry units out, which matches D2D only at width 5 with the
+default limit: at a 1 or 2 unit stroke it was a spur five or ten times too
+long.
+
+The vertex shader constants now carry the miter limit and, for miter
+joins, how far a stroke carries on past a 180 degree turn; the shader
+clips the miter at the limit and places the turn's far end from the
+actual width. The turn's outline vertices no longer depend on the width.
+
+Adapted from neutron-wine (Nico-LaFoucate): stroke-join-bound-miter-limit
+and stroke-turn-miter-extension.
+---
+ dlls/d2d1/d2d1_private.h |  3 +++
+ dlls/d2d1/device.c       | 48 ++++++++++++++++++++++++++++++++++------
+ dlls/d2d1/geometry.c     | 14 +++++++-----
+ 3 files changed, 52 insertions(+), 13 deletions(-)
+
+diff --git a/dlls/d2d1/d2d1_private.h b/dlls/d2d1/d2d1_private.h
+index 0166f81..d943940 100644
+--- a/dlls/d2d1/d2d1_private.h
++++ b/dlls/d2d1/d2d1_private.h
+@@ -139,6 +139,9 @@ struct d2d_vs_cb
+     } transform_geometry;
+     struct d2d_vec4 transform_rtx;
+     struct d2d_vec4 transform_rty;
++    /* x: the miter limit; y: how far, in half stroke widths, a stroke carries
++     * on past a 180 degree turn (0 for none). Read by the outline shader. */
++    struct d2d_vec4 misc;
+ };
+ 
+ struct d2d_device_context_ops
+diff --git a/dlls/d2d1/device.c b/dlls/d2d1/device.c
+index d75c528..b928945 100644
+--- a/dlls/d2d1/device.c
++++ b/dlls/d2d1/device.c
+@@ -1008,8 +1008,11 @@ static HRESULT STDMETHODCALLTYPE d2d_device_context_CreateMesh(ID2D1DeviceContex
+     return hr;
+ }
+ 
++/* D2D's miter limit when no stroke style is given. */
++#define D2D_DEFAULT_MITER_LIMIT 10.0f
++
+ static HRESULT d2d_device_context_update_vs_cb(struct d2d_device_context *context,
+-        const D2D_MATRIX_3X2_F *geometry_transform, float stroke_width);
++        const D2D_MATRIX_3X2_F *geometry_transform, float stroke_width, float miter_limit, float turn_extension);
+ static HRESULT d2d_device_context_update_ps_cb(struct d2d_device_context *context,
+         struct d2d_brush *brush, struct d2d_brush *opacity_brush, BOOL outline, BOOL is_arc);
+ 
+@@ -1056,7 +1059,8 @@ static void STDMETHODCALLTYPE d2d_device_context_DrawLine(ID2D1DeviceContext6 *i
+      * Affinity draws its ruler ticks this way, tens of thousands a second. */
+     d2d_line_outline(vertices, faces, &p0, &p1);
+ 
+-    if (FAILED(hr = d2d_device_context_update_vs_cb(context, &identity, stroke_width)))
++    if (FAILED(hr = d2d_device_context_update_vs_cb(context, &identity, stroke_width,
++            D2D_DEFAULT_MITER_LIMIT, 0.0f)))
+     {
+         WARN("Failed to update vs constant buffer, hr %#lx.\n", hr);
+         return;
+@@ -1357,7 +1361,7 @@ static HRESULT d2d_device_context_update_ps_cb(struct d2d_device_context *contex
+ }
+ 
+ static HRESULT d2d_device_context_update_vs_cb(struct d2d_device_context *context,
+-        const D2D_MATRIX_3X2_F *geometry_transform, float stroke_width)
++        const D2D_MATRIX_3X2_F *geometry_transform, float stroke_width, float miter_limit, float turn_extension)
+ {
+     struct d2d_vs_cb new_data, *cb_data = &new_data;
+     const D2D1_MATRIX_3X2_F *w;
+@@ -1386,6 +1390,10 @@ static HRESULT d2d_device_context_update_vs_cb(struct d2d_device_context *contex
+     cb_data->transform_rty.z = w->_32 * tmp_y;
+     cb_data->transform_rty.w = -2.0f / context->pixel_size.height;
+ 
++    cb_data->misc.x = miter_limit;
++    cb_data->misc.y = turn_extension;
++    cb_data->misc.z = cb_data->misc.w = 0.0f;
++
+     /* Unchanged and already in the ring: nothing to write. */
+     if (!context->vs_cb_pending && context->vs_cb_uploaded
+             && !memcmp(&new_data, &context->vs_cb_data, sizeof(new_data)))
+@@ -1473,12 +1481,14 @@ static BOOL d2d_device_context_draw_shared_outline(struct d2d_device_context *re
+ }
+ 
+ static void d2d_device_context_draw_geometry(struct d2d_device_context *render_target,
+-        const struct d2d_geometry *geometry, struct d2d_brush *brush, float stroke_width)
++        const struct d2d_geometry *geometry, struct d2d_brush *brush, float stroke_width,
++        float miter_limit, float turn_extension)
+ {
+     const struct d2d_geometry *outline = d2d_geometry_get_outline(geometry);
+     HRESULT hr;
+ 
+-    if (FAILED(hr = d2d_device_context_update_vs_cb(render_target, &geometry->transform, stroke_width)))
++    if (FAILED(hr = d2d_device_context_update_vs_cb(render_target, &geometry->transform, stroke_width,
++            miter_limit, turn_extension)))
+     {
+         WARN("Failed to update vs constant buffer, hr %#lx.\n", hr);
+         return;
+@@ -1553,7 +1563,16 @@ static void STDMETHODCALLTYPE d2d_device_context_DrawGeometry(ID2D1DeviceContext
+             stroke_width /= context->drawing_state.transform.m11;
+     }
+ 
+-    d2d_device_context_draw_geometry(context, geometry_impl, brush_impl, stroke_width);
++    /* A miter join carries the stroke on past a 180 degree turn, clipped
++     * at the miter limit; a bevel or round one does not. */
++    if (!stroke_style_impl)
++        d2d_device_context_draw_geometry(context, geometry_impl, brush_impl, stroke_width,
++                D2D_DEFAULT_MITER_LIMIT, D2D_DEFAULT_MITER_LIMIT);
++    else
++        d2d_device_context_draw_geometry(context, geometry_impl, brush_impl, stroke_width,
++                max(stroke_style_impl->desc.miterLimit, 1.0f),
++                stroke_style_impl->desc.lineJoin == D2D1_LINE_JOIN_MITER
++                ? max(stroke_style_impl->desc.miterLimit, 1.0f) : 0.0f);
+ }
+ 
+ static void d2d_device_context_fill_geometry(struct d2d_device_context *render_target,
+@@ -1563,7 +1582,8 @@ static void d2d_device_context_fill_geometry(struct d2d_device_context *render_t
+ 
+     d2d_geometry_ensure_fill(geometry);
+ 
+-    if (FAILED(hr = d2d_device_context_update_vs_cb(render_target, &geometry->transform, 0.0f)))
++    if (FAILED(hr = d2d_device_context_update_vs_cb(render_target, &geometry->transform, 0.0f,
++            D2D_DEFAULT_MITER_LIMIT, 0.0f)))
+     {
+         WARN("Failed to update vs constant buffer, hr %#lx.\n", hr);
+         return;
+@@ -2510,6 +2530,8 @@ static void STDMETHODCALLTYPE d2d_device_context_Clear(ID2D1DeviceContext6 *ifac
+     vs_cb_data->transform_rty.y = 1.0f;
+     vs_cb_data->transform_rty.z = 1.0f;
+     vs_cb_data->transform_rty.w = -1.0f;
++    vs_cb_data->misc.x = D2D_DEFAULT_MITER_LIMIT;
++    vs_cb_data->misc.y = vs_cb_data->misc.z = vs_cb_data->misc.w = 0.0f;
+ 
+     ID3D11DeviceContext_Unmap(d3d_context, (ID3D11Resource *)context->cb_ring.buffer, 0);
+ 
+@@ -4263,6 +4285,7 @@ static const char shape_vs_code_outline[] =
+     "float stroke_width;\n"
+     "float4 transform_rtx;\n"
+     "float4 transform_rty;\n"
++    "float4 misc;\n"
+     "\n"
+     "struct output\n"
+     "{\n"
+@@ -4299,6 +4322,17 @@ static const char shape_vs_code_outline[] =
+     "    l = -dot(v_p, q_next) / (1.0f + dot(q_prev, q_next));\n"
+     "    q_i = l * q_prev + v_p;\n"
+     "\n"
++    "    /* |q⃑ᵢ| is the miter ratio, which grows without bound as the corner\n"
++    "     * closes. D2D clips the miter at the miter limit. */\n"
++    "    l = length(q_i);\n"
++    "    if (l > misc.x)\n"
++    "        q_i *= misc.x / l;\n"
++    "\n"
++    "    /* The far end of a 180 degree turn, marked by a NEXT of length 2: the\n"
++    "     * stroke carries on past the turn by the miter limit, or not at all. */\n"
++    "    if (dot(next, next) > 2.0f)\n"
++    "        q_i = v_p + misc.y * q_next;\n"
++    "\n"
+     "    o.b = float4(0.0, 0.0, 0.0, 0.0);\n"
+     "\n"
+     "    o.p = mul(float3(position, 1.0f), transform_geometry) + stroke_width * 0.5f * q_i;\n"
+diff --git a/dlls/d2d1/geometry.c b/dlls/d2d1/geometry.c
+index a5fe40a..4d5674e 100644
+--- a/dlls/d2d1/geometry.c
++++ b/dlls/d2d1/geometry.c
+@@ -4027,14 +4027,16 @@ static BOOL d2d_geometry_outline_add_join(struct d2d_geometry *geometry,
+ 
+         if (dot >= 0.0f)
+         {
+-            /* Hairpin: prev and next point in the same direction (reversal).
+-             * Place cap vertices 25 units away. */
++            /* A 180 degree turn: a corner with an infinite miter, which D2D
++             * clips at the miter limit, so the stroke carries on past P0 by
++             * limit * width / 2 with a flat end. That used to be a fixed 25
++             * units, right only at width 5 with the default limit. Width and
++             * limit are known when drawing, so the shader places the far
++             * end: a NEXT of length 2 marks it, along NEXT. */
+             d2d_outline_vertex_set(&v[0], p0->x, p0->y, -prev->x, -prev->y, -prev->x, -prev->y);
+             d2d_outline_vertex_set(&v[1], p0->x, p0->y,  prev->x,  prev->y,  prev->x,  prev->y);
+-            d2d_outline_vertex_set(&v[2], p0->x + 25.0f * -prev->x, p0->y + 25.0f * -prev->y,
+-                     prev->x,  prev->y,  prev->x,  prev->y);
+-            d2d_outline_vertex_set(&v[3], p0->x + 25.0f * -prev->x, p0->y + 25.0f * -prev->y,
+-                    -prev->x, -prev->y, -prev->x, -prev->y);
++            d2d_outline_vertex_set(&v[2], p0->x, p0->y,  prev->x,  prev->y, -2.0f * prev->x, -2.0f * prev->y);
++            d2d_outline_vertex_set(&v[3], p0->x, p0->y, -prev->x, -prev->y, -2.0f * prev->x, -2.0f * prev->y);
+         }
+         else
+         {
+-- 
+2.55.0
+

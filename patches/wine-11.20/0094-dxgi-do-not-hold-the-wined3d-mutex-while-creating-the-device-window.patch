@@ -1,0 +1,102 @@
+dxgi: Do not hold the wined3d mutex while creating the device window.
+
+CreateWindowA() and SetWindowPos() dispatch messages to window
+procedures, and this path is re-entered from WM_CREATE handling. Holding
+the global wined3d mutex across them lets an exception raised in an
+application callback unwind past the unlock, leaking the mutex and
+stalling every thread that needs wined3d, the present thread among them
+(seen blocked for over 90 seconds). Create the window unlocked and
+publish it under the lock; a thread that loses the race destroys its own
+window and uses the published one. The device is still private while
+dxgi_device_init() drops the lock.
+
+From the Affinity-Wine-Builder 11.18 set (its 0058).
+---
+ dlls/dxgi/device.c  |  9 +++++++++
+ dlls/dxgi/factory.c | 47 ++++++++++++++++++++++++++++++++++++-----------
+ 2 files changed, 45 insertions(+), 11 deletions(-)
+
+diff --git a/dlls/dxgi/device.c b/dlls/dxgi/device.c
+index 4f6d621..2ed17bc 100644
+--- a/dlls/dxgi/device.c
++++ b/dlls/dxgi/device.c
+@@ -552,7 +552,16 @@ HRESULT dxgi_device_init(struct dxgi_device *device, struct dxgi_device_layer *l
+         return hr;
+     }
+ 
++    /* CreateWindowA() dispatches messages, which runs arbitrary application window
++       code. Do not hold the global wined3d mutex across it: if a fault is raised in
++       such a callback the mutex is never released, and every other thread that needs
++       wined3d -- notably the present thread -- stalls behind it. This is safe here
++       because the device is still private (refcount 1, not yet published), the
++       factory is kept alive by the caller's reference, and
++       dxgi_factory_get_device_window() locks wined3d itself. */
++    wined3d_mutex_unlock();
+     window = dxgi_factory_get_device_window(dxgi_factory);
++    wined3d_mutex_lock();
+     if (FAILED(hr = dxgi_get_output_from_window(&dxgi_factory->IWineDXGIFactory_iface, window, &output)))
+     {
+         ERR("Failed to get output from window %p.\n", window);
+diff --git a/dlls/dxgi/factory.c b/dlls/dxgi/factory.c
+index c6bb47f..70cbd55 100644
+--- a/dlls/dxgi/factory.c
++++ b/dlls/dxgi/factory.c
+@@ -627,22 +627,47 @@ HRESULT dxgi_factory_create(REFIID riid, void **factory, BOOL extended)
+ 
+ HWND dxgi_factory_get_device_window(struct dxgi_factory *factory)
+ {
++    HWND window;
++
++    /* Fast path: a device window is per-factory, so once published it never
++       changes. Take the lock only long enough to read it, so repeat calls do
++       not needlessly create and destroy a window. */
+     wined3d_mutex_lock();
++    if ((window = factory->device_window))
++    {
++        wined3d_mutex_unlock();
++        return window;
++    }
++    wined3d_mutex_unlock();
+ 
+-    if (!factory->device_window)
++    /* Create the window before taking the global wined3d mutex. CreateWindowA()
++       and SetWindowPos() dispatch messages to window procedures, and this path
++       is re-entered from WM_CREATE handling (WTSRegisterSessionNotification,
++       ChangeWindowMessageFilterEx). Holding wined3d_cs across those calls lets
++       an exception raised in an application callback unwind past the matching
++       unlock, leaking the mutex and stalling every other thread that needs it -
++       observed as a present thread blocked for over 90 seconds. */
++    if (!(window = CreateWindowA("static", "DXGI device window",
++            WS_DISABLED, 0, 0, 0, 0, NULL, NULL, NULL, NULL)))
+     {
+-        if (!(factory->device_window = CreateWindowA("static", "DXGI device window",
+-                WS_DISABLED, 0, 0, 0, 0, NULL, NULL, NULL, NULL)))
+-        {
+-            wined3d_mutex_unlock();
+-            ERR("Failed to create a window.\n");
+-            return NULL;
+-        }
+-        SetWindowPos(factory->device_window, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+-        TRACE("Created device window %p for factory %p.\n", factory->device_window, factory);
++        ERR("Failed to create a window.\n");
++        return NULL;
+     }
++    SetWindowPos(window, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+ 
++    wined3d_mutex_lock();
++    if (factory->device_window)
++    {
++        /* Another thread published a window first; keep theirs. */
++        HWND theirs = factory->device_window;
++        wined3d_mutex_unlock();
++        DestroyWindow(window);
++        return theirs;
++    }
++    factory->device_window = window;
+     wined3d_mutex_unlock();
+ 
+-    return factory->device_window;
++    TRACE("Created device window %p for factory %p.\n", window, factory);
++
++    return window;
+ }

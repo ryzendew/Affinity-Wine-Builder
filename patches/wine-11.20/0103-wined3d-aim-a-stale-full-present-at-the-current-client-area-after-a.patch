@@ -1,0 +1,118 @@
+wined3d: Aim a stale full present at the current client area after a resize.
+
+The command stream queues a present's rects on the application thread
+and runs it later; a fast resize or maximize can grow the window in
+between. Presenting the stale rects leaves the new area undefined: the
+Vulkan blit clips dst to the old swapchain size, the GDI blit refreshes
+only the old region, and a stale full present even takes the GDI path,
+because dst no longer matches the client rect. An application that
+presents only on changes keeps the black area until its next repaint.
+
+Before presenting, recreate the Vulkan swapchain if the client area no
+longer matches it, and aim a 1:1 full present from the origin at the
+client area (and at the live back buffer if ResizeBuffers already ran),
+for swap effects whose back buffer holds the whole frame. After a
+recreate, present the frame again for VK_SUBOPTIMAL_KHR as well as
+VK_ERROR_OUT_OF_DATE_KHR, and treat only negative results as errors.
+
+From the Affinity-Wine-Builder 11.18 set (its 0069), placed before this
+set's partial-present expansion. Its black area did not reproduce on
+11.19 (external X resizes and SetWindowPos resizes draw fully with and
+without it); Affinity's document view draws correctly through repeated
+resizes with it.
+---
+ dlls/wined3d/swapchain.c | 68 +++++++++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 65 insertions(+), 3 deletions(-)
+
+diff --git a/dlls/wined3d/swapchain.c b/dlls/wined3d/swapchain.c
+index 41fd48d..e02c94b 100644
+--- a/dlls/wined3d/swapchain.c
++++ b/dlls/wined3d/swapchain.c
+@@ -1324,13 +1324,71 @@ static void swapchain_vk_present(struct wined3d_swapchain *swapchain, const RECT
+     struct wined3d_swapchain_vk *swapchain_vk = wined3d_swapchain_vk(swapchain);
+     struct wined3d_texture *back_buffer = swapchain->back_buffers[0];
+     struct wined3d_context_vk *context_vk;
+-    RECT full_rect;
++    RECT full_rect, stale_src, stale_dst;
+     bool partial;
+     VkResult vr;
+     HRESULT hr;
+ 
+     context_vk = wined3d_context_vk(context_acquire(swapchain->device, back_buffer, 0));
+ 
++    /* The command stream queues src/dst rects on the application thread but
++     * executes them later, and a fast resize (or maximize) can grow the
++     * window in between. Presenting the stale rects leaves the new area
++     * undefined (black): the Vulkan blit clips dst to the old swapchain size,
++     * the GDI blit only refreshes the old region, and a stale full present
++     * even takes the GDI path, because dst no longer matches the client rect.
++     * With an application that presents only on changes, it stays black
++     * until the next repaint. */
++    if (swapchain->state.desc.windowed && swapchain->win_handle
++            && swapchain->win_handle != GetDesktopWindow() && swapchain_vk->vk_swapchain)
++    {
++        RECT client_rect;
++
++        if (GetClientRect(swapchain->win_handle, &client_rect)
++                && client_rect.right > 0 && client_rect.bottom > 0)
++        {
++            enum wined3d_swap_effect swap_effect = swapchain->state.desc.swap_effect;
++            unsigned int bb_width = back_buffer->resource.width;
++            unsigned int bb_height = back_buffer->resource.height;
++
++            if ((unsigned int)client_rect.right != swapchain_vk->width
++                    || (unsigned int)client_rect.bottom != swapchain_vk->height)
++            {
++                TRACE("Recreating Vulkan swapchain %p for resize %ux%u -> %ldx%ld before present.\n",
++                        swapchain_vk, swapchain_vk->width, swapchain_vk->height,
++                        client_rect.right, client_rect.bottom);
++                if (FAILED(hr = wined3d_swapchain_vk_recreate(swapchain_vk)))
++                    ERR("Failed to recreate swapchain for resize, hr %#lx.\n", hr);
++            }
++
++            /* A 1:1 full-buffer present queued before the resize: aim it at
++             * the current client area. Only for swap effects whose back
++             * buffer holds the whole frame (copy) or that present whole
++             * frames (flip); a discard back buffer may hold garbage outside
++             * a dirty rect. If ResizeBuffers already ran, the live back
++             * buffer is the new size while src still describes the old one;
++             * a stale smaller back buffer scales up for one frame. */
++            if ((swap_effect == WINED3D_SWAP_EFFECT_COPY
++                    || swap_effect == WINED3D_SWAP_EFFECT_COPY_VSYNC
++                    || swap_effect == WINED3D_SWAP_EFFECT_FLIP_SEQUENTIAL
++                    || swap_effect == WINED3D_SWAP_EFFECT_FLIP_DISCARD)
++                    && !src_rect->left && !src_rect->top && !dst_rect->left && !dst_rect->top
++                    && src_rect->right == dst_rect->right && src_rect->bottom == dst_rect->bottom
++                    && (dst_rect->right != client_rect.right || dst_rect->bottom != client_rect.bottom))
++            {
++                TRACE("Expanding stale full present %s to client %s (back buffer %ux%u).\n",
++                        wine_dbgstr_rect(dst_rect), wine_dbgstr_rect(&client_rect), bb_width, bb_height);
++                if ((unsigned int)src_rect->right != bb_width || (unsigned int)src_rect->bottom != bb_height)
++                {
++                    SetRect(&stale_src, 0, 0, bb_width, bb_height);
++                    src_rect = &stale_src;
++                }
++                stale_dst = client_rect;
++                dst_rect = &stale_dst;
++            }
++        }
++    }
++
+     if ((partial = swapchain_present_is_partial_copy(swapchain, dst_rect))
+             && swapchain_present_can_expand(swapchain, src_rect, dst_rect, &full_rect))
+     {
+@@ -1364,8 +1422,12 @@ static void swapchain_vk_present(struct wined3d_swapchain *swapchain, const RECT
+             {
+                 if (FAILED(hr = wined3d_swapchain_vk_recreate(swapchain_vk)))
+                     ERR("Failed to recreate swapchain, hr %#lx.\n", hr);
+-                else if (vr == VK_ERROR_OUT_OF_DATE_KHR && (vr = wined3d_swapchain_vk_blit(
+-                        swapchain_vk, context_vk, src_rect, dst_rect, swap_interval)))
++                /* Present the frame again on the new swapchain; a suboptimal
++                 * frame dropped during a resize stays until the next repaint.
++                 * A second VK_SUBOPTIMAL_KHR still presented the frame (the
++                 * window moved again), so only failures are errors. */
++                else if ((vr = wined3d_swapchain_vk_blit(swapchain_vk, context_vk,
++                        src_rect, dst_rect, swap_interval)) < 0)
+                     ERR("Failed to blit image, vr %s.\n", wined3d_debug_vkresult(vr));
+             }
+             else

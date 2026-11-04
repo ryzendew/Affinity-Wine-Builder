@@ -1,0 +1,133 @@
+winex11: Keep each tablet axis until an event carries it.
+
+An XInput event carries the axes from first_axis on, and evdev or
+libinput send only the axes that changed, so a pen-down that changed
+only the pressure reported the pressure as x and 0 as y. The first
+packet of every stroke jumped to the screen's edge.
+---
+ dlls/winex11.drv/wintab.c | 67 +++++++++++++++++++++++++++++------------------
+ 1 file changed, 41 insertions(+), 26 deletions(-)
+
+diff --git a/dlls/winex11.drv/wintab.c b/dlls/winex11.drv/wintab.c
+index 87d5c1a..10df1fb 100644
+--- a/dlls/winex11.drv/wintab.c
++++ b/dlls/winex11.drv/wintab.c
+@@ -313,6 +313,22 @@ static WTPACKET      last_packet;
+ #define             CURSORMAX 12
+ static INT           button_state[CURSORMAX];
+ 
++/* An XInput event carries the axes from first_axis to first_axis + axes_count,
++ * and a driver that only reports what changed (evdev, libinput) sends just the
++ * pressure when only the pressure changed. Keep each cursor's last value of
++ * every axis and update it from the axes an event carries. */
++#define AXIS_COUNT 6
++static int axis_state[CURSORMAX][AXIS_COUNT];
++
++static const int *update_axes( int curnum, int first_axis, int axes_count, const int *axis_data )
++{
++    int i;
++
++    for (i = 0; i < axes_count && first_axis + i < AXIS_COUNT; i++)
++        axis_state[curnum][first_axis + i] = axis_data[i];
++    return axis_state[curnum];
++}
++
+ static LOGCONTEXTW      gSysContext;
+ static WTI_DEVICES_INFO gSysDevice;
+ static WTI_CURSORS_INFO gSysCursor[CURSORMAX];
+@@ -891,6 +907,7 @@ static BOOL motion_event( HWND hwnd, XEvent *event )
+ {
+     XDeviceMotionEvent *motion = (XDeviceMotionEvent *)event;
+     LPWTI_CURSORS_INFO cursor;
++    const int *axes;
+     int curnum = cursor_from_device(motion->deviceid, &cursor);
+     if (curnum < 0)
+         return FALSE;
+@@ -904,14 +921,15 @@ static BOOL motion_event( HWND hwnd, XEvent *event )
+     gMsgPacket.pkTime = EVENT_x11_time_to_win32_time(motion->time);
+     gMsgPacket.pkSerialNumber = gSerial++;
+     gMsgPacket.pkCursor = curnum;
+-    gMsgPacket.pkX = motion->axis_data[0];
+-    gMsgPacket.pkY = motion->axis_data[1];
+-    gMsgPacket.pkOrientation.orAzimuth = figure_deg(motion->axis_data[3],motion->axis_data[4]);
++    axes = update_axes(curnum, motion->first_axis, motion->axes_count, motion->axis_data);
++    gMsgPacket.pkX = axes[0];
++    gMsgPacket.pkY = axes[1];
++    gMsgPacket.pkOrientation.orAzimuth = figure_deg(axes[3],axes[4]);
+     gMsgPacket.pkOrientation.orAltitude = ((1000 - 15 * max
+-                                            (abs(motion->axis_data[3]),
+-                                             abs(motion->axis_data[4])))
++                                            (abs(axes[3]),
++                                             abs(axes[4])))
+                                            * (gMsgPacket.pkStatus & TPS_INVERT?-1:1));
+-    gMsgPacket.pkNormalPressure = motion->axis_data[2];
++    gMsgPacket.pkNormalPressure = axes[2];
+     gMsgPacket.pkButtons = get_button_state(curnum);
+     gMsgPacket.pkChanged = get_changed_state(&gMsgPacket);
+     send_message( hwndTabletDefault, WT_PACKET, gMsgPacket.pkSerialNumber, (LPARAM)hwnd );
+@@ -923,6 +941,7 @@ static BOOL button_event( HWND hwnd, XEvent *event )
+ {
+     XDeviceButtonEvent *button = (XDeviceButtonEvent *) event;
+     LPWTI_CURSORS_INFO cursor;
++    const int *axes;
+     int curnum = cursor_from_device(button->deviceid, &cursor);
+     if (curnum < 0)
+         return FALSE;
+@@ -937,20 +956,14 @@ static BOOL button_event( HWND hwnd, XEvent *event )
+     gMsgPacket.pkTime = EVENT_x11_time_to_win32_time(button->time);
+     gMsgPacket.pkSerialNumber = gSerial++;
+     gMsgPacket.pkCursor = curnum;
+-    if (button->axes_count > 0) {
+-        gMsgPacket.pkX = button->axis_data[0];
+-        gMsgPacket.pkY = button->axis_data[1];
+-        gMsgPacket.pkOrientation.orAzimuth = figure_deg(button->axis_data[3],button->axis_data[4]);
+-        gMsgPacket.pkOrientation.orAltitude = ((1000 - 15 * max(abs(button->axis_data[3]),
+-                                                                abs(button->axis_data[4])))
+-                                               * (gMsgPacket.pkStatus & TPS_INVERT?-1:1));
+-        gMsgPacket.pkNormalPressure = button->axis_data[2];
+-    } else {
+-        gMsgPacket.pkX = last_packet.pkX;
+-        gMsgPacket.pkY = last_packet.pkY;
+-        gMsgPacket.pkOrientation = last_packet.pkOrientation;
+-        gMsgPacket.pkNormalPressure = last_packet.pkNormalPressure;
+-    }
++    axes = update_axes(curnum, button->first_axis, button->axes_count, button->axis_data);
++    gMsgPacket.pkX = axes[0];
++    gMsgPacket.pkY = axes[1];
++    gMsgPacket.pkOrientation.orAzimuth = figure_deg(axes[3],axes[4]);
++    gMsgPacket.pkOrientation.orAltitude = ((1000 - 15 * max(abs(axes[3]),
++                                                            abs(axes[4])))
++                                           * (gMsgPacket.pkStatus & TPS_INVERT?-1:1));
++    gMsgPacket.pkNormalPressure = axes[2];
+     gMsgPacket.pkButtons = get_button_state(curnum);
+     gMsgPacket.pkChanged = get_changed_state(&gMsgPacket);
+     send_message( hwndTabletDefault, WT_PACKET, gMsgPacket.pkSerialNumber, (LPARAM)hwnd );
+@@ -971,6 +984,7 @@ static BOOL proximity_event( HWND hwnd, XEvent *event )
+ {
+     XProximityNotifyEvent *proximity = (XProximityNotifyEvent *) event;
+     LPWTI_CURSORS_INFO cursor;
++    const int *axes;
+     int curnum = cursor_from_device(proximity->deviceid, &cursor);
+     LPARAM proximity_info;
+ 
+@@ -987,13 +1001,14 @@ static BOOL proximity_event( HWND hwnd, XEvent *event )
+     gMsgPacket.pkTime = EVENT_x11_time_to_win32_time(proximity->time);
+     gMsgPacket.pkSerialNumber = gSerial++;
+     gMsgPacket.pkCursor = curnum;
+-    gMsgPacket.pkX = proximity->axis_data[0];
+-    gMsgPacket.pkY = proximity->axis_data[1];
+-    gMsgPacket.pkOrientation.orAzimuth = figure_deg(proximity->axis_data[3],proximity->axis_data[4]);
+-    gMsgPacket.pkOrientation.orAltitude = ((1000 - 15 * max(abs(proximity->axis_data[3]),
+-                                                            abs(proximity->axis_data[4])))
++    axes = update_axes(curnum, proximity->first_axis, proximity->axes_count, proximity->axis_data);
++    gMsgPacket.pkX = axes[0];
++    gMsgPacket.pkY = axes[1];
++    gMsgPacket.pkOrientation.orAzimuth = figure_deg(axes[3],axes[4]);
++    gMsgPacket.pkOrientation.orAltitude = ((1000 - 15 * max(abs(axes[3]),
++                                                            abs(axes[4])))
+                                            * (gMsgPacket.pkStatus & TPS_INVERT?-1:1));
+-    gMsgPacket.pkNormalPressure = proximity->axis_data[2];
++    gMsgPacket.pkNormalPressure = axes[2];
+     gMsgPacket.pkButtons = get_button_state(curnum);
+ 
+     /* FIXME: LPARAM loword is true when cursor entering context, false when leaving context

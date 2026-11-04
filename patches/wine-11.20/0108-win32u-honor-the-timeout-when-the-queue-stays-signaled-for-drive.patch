@@ -1,0 +1,53 @@
+win32u: Honor the timeout when the queue stays signaled for driver events.
+
+wait_message loops while the queue handle is signaled and
+process_driver_events reports nothing to return for. The server keeps
+the queue signaled while internal bits such as QS_DRIVER are set, but
+the driver cannot process its events when it is called from inside its
+own event processing, so the bits stay set and the loop spins without
+end, whatever the timeout.
+
+That happens with WPF: drag and drop calls reach the drop target from
+inside the X11 driver's event processing, and WPF asks whether input
+is pending with MsgWaitForMultipleObjectsEx(0, NULL, 0, QS_INPUT,
+MWMO_INPUTAVAILABLE). With more X events queued, Affinity's UI thread
+spun at full CPU inside DragOver or Drop until another thread happened
+to wake the queue, for example on a focus change, and a file dropped on
+its toolbar opened only then.
+
+Return WAIT_TIMEOUT once the timeout has passed.
+---
+ dlls/win32u/message.c | 20 ++++++++++++++++++--
+ 1 file changed, 18 insertions(+), 2 deletions(-)
+
+diff --git a/dlls/win32u/message.c b/dlls/win32u/message.c
+index 8c9a2aa..1a2882c 100644
+--- a/dlls/win32u/message.c
++++ b/dlls/win32u/message.c
+@@ -3429,8 +3429,24 @@ static DWORD wait_message( DWORD count, const HANDLE *handles, DWORD timeout, DW
+     process_driver_events( QS_ALLINPUT, wake_mask, changed_mask );
+     if (!(changed_mask & QS_SMRESULT) && (event = get_user_thread_info()->idle_event)) NtSetEvent( event, NULL );
+ 
+-    do ret = NtWaitForMultipleObjects( count, handles, type, !!(flags & MWMO_ALERTABLE), abs );
+-    while (ret == count - 1 && !process_driver_events( QS_ALLINPUT, wake_mask, changed_mask ));
++    for (;;)
++    {
++        ret = NtWaitForMultipleObjects( count, handles, type, !!(flags & MWMO_ALERTABLE), abs );
++        if (ret != count - 1 || process_driver_events( QS_ALLINPUT, wake_mask, changed_mask )) break;
++        /* The queue stays signaled for driver events that cannot be processed here when we are
++         * called from inside the driver's own event processing, such as a drop target's DragOver
++         * calling MsgWaitForMultipleObjectsEx, which WPF does. Honor the timeout instead of
++         * spinning until another thread happens to wake the queue. */
++        if (abs)
++        {
++            NtQuerySystemTime( &now );
++            if (now.QuadPart >= abs->QuadPart)
++            {
++                ret = WAIT_TIMEOUT;
++                break;
++            }
++        }
++    }
+ 
+     if (HIWORD(ret)) /* is it an error code? */
+     {

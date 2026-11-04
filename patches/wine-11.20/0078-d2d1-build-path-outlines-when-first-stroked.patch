@@ -1,0 +1,327 @@
+d2d1: Build path geometry outlines when the geometry is first stroked.
+
+EndFigure() built each figure's stroke outline at once, whether or not
+the geometry would ever be stroked. Affinity rebuilds thousands of filled
+paths a second (glyph and ruler outlines), and while painting a brush
+stroke Direct2D grew its arrays about 650,000 times a second, moving
+300 MB/s; the outline arrays were nearly half of that, plus the work of
+the outline itself.
+
+Build the outline when something first draws it instead: DrawGeometry(),
+directly or through a transformed geometry or a geometry group, which
+now take their source's outline. Close() reworks the figures for the fill
+(self-intersections, overlapping beziers), so it first keeps them as they
+were ended: on a close-cache hit by taking the arrays the cached result
+replaces, otherwise as copies. If they cannot be kept the outline is
+built at once, as before. A lock serialises the build between threads.
+
+The d2d1 conformance tests give the same result before and after (17491
+tests, 0 failures). Affinity's interface, selection outlines and handles
+render identically. Brush tip behind the cursor, nested KWin, Arc A750,
+OpenCL on, 18 strokes each: median 39 -> 28 ms; UI thread CPU per stroke
+down 8%.
+
+diff --git a/dlls/d2d1/d2d1_private.h b/dlls/d2d1/d2d1_private.h
+index 2df34b7..39a4121 100644
+--- a/dlls/d2d1/d2d1_private.h
++++ b/dlls/d2d1/d2d1_private.h
+@@ -603,6 +603,7 @@ struct d2d_geometry
+         size_t arc_faces_size;
+         size_t arc_face_count;
+     } outline;
++    LONG outline_pending;
+ 
+     union
+     {
+@@ -625,6 +626,12 @@ struct d2d_geometry
+             UINT32 segment_count;
+ 
+             D2D1_RECT_F bounds;
++
++            /* The outline is built when something first strokes the geometry, not in EndFigure();
++             * Close() keeps the figures as they were ended, before it reworks them for the fill. */
++            struct d2d_figure *outline_figures;
++            size_t outline_figure_count;
++            size_t outline_built;
+         } path;
+         struct
+         {
+@@ -656,6 +663,7 @@ HRESULT d2d_rectangle_geometry_init(struct d2d_geometry *geometry,
+         ID2D1Factory *factory, const D2D1_RECT_F *rect);
+ HRESULT d2d_rounded_rectangle_geometry_init(struct d2d_geometry *geometry,
+         ID2D1Factory *factory, const D2D1_ROUNDED_RECT *rounded_rect);
++const struct d2d_geometry *d2d_geometry_get_outline(const struct d2d_geometry *geometry);
+ void d2d_transformed_geometry_init(struct d2d_geometry *geometry, ID2D1Factory *factory,
+         ID2D1Geometry *src_geometry, const D2D_MATRIX_3X2_F *transform);
+ HRESULT d2d_geometry_group_init(struct d2d_geometry *geometry, ID2D1Factory *factory,
+diff --git a/dlls/d2d1/device.c b/dlls/d2d1/device.c
+index e81a408..f9ac978 100644
+--- a/dlls/d2d1/device.c
++++ b/dlls/d2d1/device.c
+@@ -1101,6 +1101,7 @@ static HRESULT d2d_device_context_update_vs_cb(struct d2d_device_context *contex
+ static void d2d_device_context_draw_geometry(struct d2d_device_context *render_target,
+         const struct d2d_geometry *geometry, struct d2d_brush *brush, float stroke_width)
+ {
++    const struct d2d_geometry *outline = d2d_geometry_get_outline(geometry);
+     HRESULT hr;
+ 
+     if (FAILED(hr = d2d_device_context_update_vs_cb(render_target, &geometry->transform, stroke_width)))
+@@ -1115,27 +1116,27 @@ static void d2d_device_context_draw_geometry(struct d2d_device_context *render_t
+         return;
+     }
+ 
+-    if (geometry->outline.face_count)
++    if (outline->outline.face_count)
+         d2d_device_context_draw_data(render_target, D2D_SHAPE_TYPE_OUTLINE,
+-                geometry->outline.faces, geometry->outline.face_count * sizeof(*geometry->outline.faces),
+-                3 * geometry->outline.face_count, geometry->outline.vertices,
+-                geometry->outline.vertex_count * sizeof(*geometry->outline.vertices),
+-                sizeof(*geometry->outline.vertices), brush, NULL);
++                outline->outline.faces, outline->outline.face_count * sizeof(*outline->outline.faces),
++                3 * outline->outline.face_count, outline->outline.vertices,
++                outline->outline.vertex_count * sizeof(*outline->outline.vertices),
++                sizeof(*outline->outline.vertices), brush, NULL);
+ 
+-    if (geometry->outline.bezier_face_count)
++    if (outline->outline.bezier_face_count)
+         d2d_device_context_draw_data(render_target, D2D_SHAPE_TYPE_BEZIER_OUTLINE,
+-                geometry->outline.bezier_faces, geometry->outline.bezier_face_count * sizeof(*geometry->outline.bezier_faces),
+-                3 * geometry->outline.bezier_face_count, geometry->outline.beziers,
+-                geometry->outline.bezier_count * sizeof(*geometry->outline.beziers),
+-                sizeof(*geometry->outline.beziers), brush, NULL);
++                outline->outline.bezier_faces, outline->outline.bezier_face_count * sizeof(*outline->outline.bezier_faces),
++                3 * outline->outline.bezier_face_count, outline->outline.beziers,
++                outline->outline.bezier_count * sizeof(*outline->outline.beziers),
++                sizeof(*outline->outline.beziers), brush, NULL);
+ 
+-    if (geometry->outline.arc_face_count
++    if (outline->outline.arc_face_count
+             && SUCCEEDED(d2d_device_context_update_ps_cb(render_target, brush, NULL, TRUE, TRUE)))
+         d2d_device_context_draw_data(render_target, D2D_SHAPE_TYPE_ARC_OUTLINE,
+-                geometry->outline.arc_faces, geometry->outline.arc_face_count * sizeof(*geometry->outline.arc_faces),
+-                3 * geometry->outline.arc_face_count, geometry->outline.arcs,
+-                geometry->outline.arc_count * sizeof(*geometry->outline.arcs),
+-                sizeof(*geometry->outline.arcs), brush, NULL);
++                outline->outline.arc_faces, outline->outline.arc_face_count * sizeof(*outline->outline.arc_faces),
++                3 * outline->outline.arc_face_count, outline->outline.arcs,
++                outline->outline.arc_count * sizeof(*outline->outline.arcs),
++                sizeof(*outline->outline.arcs), brush, NULL);
+ }
+ 
+ static void STDMETHODCALLTYPE d2d_device_context_DrawGeometry(ID2D1DeviceContext6 *iface,
+diff --git a/dlls/d2d1/geometry.c b/dlls/d2d1/geometry.c
+index 9f4e1ef..05deb08 100644
+--- a/dlls/d2d1/geometry.c
++++ b/dlls/d2d1/geometry.c
+@@ -3873,20 +3873,26 @@ static void STDMETHODCALLTYPE d2d_geometry_sink_EndFigure(ID2D1GeometrySink *ifa
+     if (figure_end == D2D1_FIGURE_END_CLOSED)
+         ++geometry->u.path.segment_count;
+ 
+-    if (!d2d_geometry_add_figure_outline(geometry, figure, figure_end))
+-    {
+-        ERR("Failed to add figure outline.\n");
+-        d2d_geometry_set_error(geometry, E_OUTOFMEMORY);
+-        return;
+-    }
+-
++    geometry->outline_pending = TRUE;
+     geometry->u.path.state = D2D_GEOMETRY_STATE_OPEN;
+ }
+ 
++static void d2d_path_geometry_free_outline_figures(struct d2d_geometry *geometry)
++{
++    size_t i;
++
++    for (i = 0; i < geometry->u.path.outline_figure_count; ++i)
++        d2d_figure_cleanup(&geometry->u.path.outline_figures[i]);
++    free(geometry->u.path.outline_figures);
++    geometry->u.path.outline_figures = NULL;
++    geometry->u.path.outline_figure_count = 0;
++}
++
+ static void d2d_path_geometry_free_figures(struct d2d_geometry *geometry)
+ {
+     size_t i;
+ 
++    d2d_path_geometry_free_outline_figures(geometry);
+     if (!geometry->u.path.figures)
+         return;
+ 
+@@ -4315,6 +4321,113 @@ static void *d2d_memdup(const void *src, size_t size)
+     return dst;
+ }
+ 
++/* Outlines are built when the geometry is first stroked. EndFigure() used to
++ * build each figure's outline at once, and most path geometries are only ever
++ * filled: Affinity rebuilds thousands of filled glyph and ruler paths a second.
++ * Close() reworks the figures for the fill (self-intersections, overlapping
++ * beziers), so it first keeps them as they were ended: on a close-cache hit by
++ * taking the arrays the cached result replaces, otherwise as copies. */
++static SRWLOCK d2d_outline_lock = SRWLOCK_INIT;
++
++static BOOL d2d_path_geometry_alloc_outline_figures(struct d2d_geometry *geometry)
++{
++    if (geometry->u.path.outline_built >= geometry->u.path.figure_count)
++        return TRUE;
++    if (!(geometry->u.path.outline_figures = calloc(geometry->u.path.figure_count,
++            sizeof(*geometry->u.path.outline_figures))))
++        return FALSE;
++    geometry->u.path.outline_figure_count = geometry->u.path.figure_count;
++    return TRUE;
++}
++
++static void d2d_path_geometry_keep_outline_figure(struct d2d_geometry *geometry, size_t i,
++        struct d2d_figure *figure)
++{
++    struct d2d_figure *kept = &geometry->u.path.outline_figures[i];
++
++    kept->vertices = figure->vertices;
++    kept->vertex_types = figure->vertex_types;
++    kept->vertex_count = figure->vertex_count;
++    kept->bezier_controls = figure->bezier_controls;
++    kept->bezier_control_count = figure->bezier_control_count;
++    kept->flags = figure->flags;
++}
++
++static BOOL d2d_path_geometry_copy_outline_figures(struct d2d_geometry *geometry)
++{
++    const struct d2d_figure *figure;
++    struct d2d_figure *kept;
++    size_t i;
++
++    for (i = geometry->u.path.outline_built; i < geometry->u.path.outline_figure_count; ++i)
++    {
++        figure = &geometry->u.path.figures[i];
++        kept = &geometry->u.path.outline_figures[i];
++        kept->flags = figure->flags;
++        if (!figure->vertex_count)
++            continue;
++        kept->vertices = d2d_memdup(figure->vertices, figure->vertex_count * sizeof(*figure->vertices));
++        kept->vertex_types = d2d_memdup(figure->vertex_types, figure->vertex_count * sizeof(*figure->vertex_types));
++        kept->bezier_controls = d2d_memdup(figure->bezier_controls,
++                figure->bezier_control_count * sizeof(*figure->bezier_controls));
++        if (!kept->vertices || !kept->vertex_types || (figure->bezier_control_count && !kept->bezier_controls))
++            return FALSE;
++        kept->vertex_count = figure->vertex_count;
++        kept->bezier_control_count = figure->bezier_control_count;
++    }
++    return TRUE;
++}
++
++static void d2d_path_geometry_build_outline(struct d2d_geometry *geometry)
++{
++    struct d2d_figure *figures = geometry->u.path.figures;
++    size_t i, end = geometry->u.path.figure_count;
++
++    if (geometry->u.path.outline_figures)
++    {
++        figures = geometry->u.path.outline_figures;
++        end = geometry->u.path.outline_figure_count;
++    }
++    else if (geometry->u.path.state == D2D_GEOMETRY_STATE_FIGURE && end)
++    {
++        --end;
++    }
++
++    for (i = geometry->u.path.outline_built; figures && i < end; ++i)
++    {
++        if (!d2d_geometry_add_figure_outline(geometry, &figures[i], (figures[i].flags & D2D_FIGURE_FLAG_CLOSED)
++                ? D2D1_FIGURE_END_CLOSED : D2D1_FIGURE_END_OPEN))
++        {
++            ERR("Failed to add figure outline.\n");
++            break;
++        }
++    }
++    if (end > geometry->u.path.outline_built)
++        geometry->u.path.outline_built = end;
++    d2d_path_geometry_free_outline_figures(geometry);
++}
++
++/* Builds the outline at once, from the figures as they are now; when the figures cannot be kept. */
++static void d2d_path_geometry_build_outline_now(struct d2d_geometry *geometry)
++{
++    d2d_path_geometry_free_outline_figures(geometry);
++    d2d_path_geometry_build_outline(geometry);
++    geometry->outline_pending = FALSE;
++}
++
++static void d2d_geometry_ensure_outline(struct d2d_geometry *geometry)
++{
++    if (!ReadAcquire(&geometry->outline_pending))
++        return;
++    AcquireSRWLockExclusive(&d2d_outline_lock);
++    if (geometry->outline_pending)
++    {
++        d2d_path_geometry_build_outline(geometry);
++        WriteRelease(&geometry->outline_pending, FALSE);
++    }
++    ReleaseSRWLockExclusive(&d2d_outline_lock);
++}
++
+ static unsigned char *d2d_close_cache_put(unsigned char *p, const void *data, size_t size)
+ {
+     if (size)
+@@ -4459,9 +4572,16 @@ static BOOL d2d_geometry_close_cache_apply(struct d2d_geometry *geometry,
+     for (i = 0; i < entry->figure_count; ++i)
+     {
+         figure = &geometry->u.path.figures[i];
+-        free(figure->vertices);
+-        free(figure->vertex_types);
+-        free(figure->bezier_controls);
++        if (i >= geometry->u.path.outline_built && i < geometry->u.path.outline_figure_count)
++        {
++            d2d_path_geometry_keep_outline_figure(geometry, i, figure);
++        }
++        else
++        {
++            free(figure->vertices);
++            free(figure->vertex_types);
++            free(figure->bezier_controls);
++        }
+         figure->vertices = copies[i].vertices;
+         figure->vertices_size = copies[i].vertex_count;
+         figure->vertex_types = copies[i].vertex_types;
+@@ -4627,6 +4747,9 @@ static HRESULT STDMETHODCALLTYPE d2d_geometry_sink_Close(ID2D1GeometrySink *ifac
+ 
+     geometry->u.path.state = D2D_GEOMETRY_STATE_CLOSED;
+ 
++    if (!d2d_path_geometry_alloc_outline_figures(geometry))
++        d2d_path_geometry_build_outline_now(geometry);
++
+     if (d2d_geometry_close_cache_eligible(geometry)
+             && (key = d2d_close_cache_make_key(geometry, &key_size)))
+     {
+@@ -4638,6 +4761,9 @@ static HRESULT STDMETHODCALLTYPE d2d_geometry_sink_Close(ID2D1GeometrySink *ifac
+         }
+     }
+ 
++    if (!d2d_path_geometry_copy_outline_figures(geometry))
++        d2d_path_geometry_build_outline_now(geometry);
++
+     if (!d2d_geometry_intersect_self(geometry))
+         goto done;
+     if (FAILED(hr = d2d_geometry_resolve_beziers(geometry)))
+@@ -7683,3 +7809,23 @@ struct d2d_geometry_realization *unsafe_impl_from_ID2D1GeometryRealization(ID2D1
+     assert(iface->lpVtbl == &d2d_geometry_realization_vtbl);
+     return CONTAINING_RECORD(iface, struct d2d_geometry_realization, ID2D1GeometryRealization_iface);
+ }
++
++/* The geometry whose outline a stroke of this one draws: transformed geometries and
++ * groups share their source's. Builds a path geometry's outline when first needed. */
++const struct d2d_geometry *d2d_geometry_get_outline(const struct d2d_geometry *geometry)
++{
++    for (;;)
++    {
++        const ID2D1GeometryVtbl *vtbl = geometry->ID2D1Geometry_iface.lpVtbl;
++
++        if (vtbl == (const ID2D1GeometryVtbl *)&d2d_transformed_geometry_vtbl)
++            geometry = unsafe_impl_from_ID2D1Geometry(geometry->u.transformed.src_geometry);
++        else if (vtbl == (const ID2D1GeometryVtbl *)&d2d_geometry_group_vtbl)
++            geometry = unsafe_impl_from_ID2D1Geometry((ID2D1Geometry *)geometry->u.group.path);
++        else
++            break;
++    }
++    if (geometry->ID2D1Geometry_iface.lpVtbl == (const ID2D1GeometryVtbl *)&d2d_path_geometry_vtbl)
++        d2d_geometry_ensure_outline((struct d2d_geometry *)geometry);
++    return geometry;
++}
