@@ -1,0 +1,280 @@
+opencl: Bridge the rest of the OpenCL 2.0 SVM functions.
+
+clSetKernelArgSVMPointer, clEnqueueSVMMemcpy, clEnqueueSVMMemFill,
+clEnqueueSVMMap, clEnqueueSVMUnmap and clEnqueueSVMMigrateMem join
+clSVMAlloc and clSVMFree, which this set already bridges. SVM pointers
+are in the address space Wine shares with the host, so they cross the
+bridge unchanged. Slots appended as for the 2.x functions.
+
+From the Affinity-Wine-Builder 11.18 set (its 0068), without its own
+clSVMAlloc and clSVMFree, which match the ones already here.
+---
+ dlls/opencl/opencl.spec     |  6 ++++
+ dlls/opencl/pe_wrappers.c   | 61 +++++++++++++++++++++++++++++++++++++++
+ dlls/opencl/unix_private.h  |  6 ++++
+ dlls/opencl/unix_thunks.c   |  6 ++++
+ dlls/opencl/unix_wrappers.c | 50 ++++++++++++++++++++++++++++++++
+ dlls/opencl/unixlib.h       | 70 +++++++++++++++++++++++++++++++++++++++++++++
+ 6 files changed, 199 insertions(+)
+
+diff --git a/dlls/opencl/opencl.spec b/dlls/opencl/opencl.spec
+index 3a9cdc8..769b9a2 100644
+--- a/dlls/opencl/opencl.spec
++++ b/dlls/opencl/opencl.spec
+@@ -108,3 +108,9 @@
+ @ stdcall clGetKernelSubGroupInfo(ptr ptr long long ptr long ptr ptr)
+ @ stdcall clGetPipeInfo(ptr long long ptr ptr)
+ @ stdcall clSetDefaultDeviceCommandQueue(ptr ptr ptr)
++@ stdcall clEnqueueSVMMemFill(ptr ptr ptr long long long ptr ptr)
++@ stdcall clEnqueueSVMMemcpy(ptr long ptr ptr long long ptr ptr)
++@ stdcall clEnqueueSVMMigrateMem(ptr long ptr ptr int64 long ptr ptr)
++@ stdcall clEnqueueSVMMap(ptr long int64 ptr long long ptr ptr)
++@ stdcall clEnqueueSVMUnmap(ptr ptr long ptr ptr)
++@ stdcall clSetKernelArgSVMPointer(ptr long ptr)
+diff --git a/dlls/opencl/pe_wrappers.c b/dlls/opencl/pe_wrappers.c
+index 340c421..5322890 100644
+--- a/dlls/opencl/pe_wrappers.c
++++ b/dlls/opencl/pe_wrappers.c
+@@ -498,6 +498,67 @@ cl_int WINAPI clSetDefaultDeviceCommandQueue( cl_context context, cl_device_id d
+     return OPENCL_CALL( clSetDefaultDeviceCommandQueue, &params );
+ }
+ 
++cl_int WINAPI clSetKernelArgSVMPointer( cl_kernel kernel, uint32_t arg_index, const void *arg_value )
++{
++    struct clSetKernelArgSVMPointer_params params = { kernel, arg_index, arg_value };
++    TRACE( "(%p, %u, %p)\n", kernel, arg_index, arg_value );
++    return OPENCL_CALL( clSetKernelArgSVMPointer, &params );
++}
++
++cl_int WINAPI clEnqueueSVMMemcpy( cl_command_queue command_queue, uint32_t blocking_copy,
++        void *dst_ptr, const void *src_ptr, size_t size,
++        uint32_t num_events_in_wait_list, const cl_event *event_wait_list, cl_event *event )
++{
++    struct clEnqueueSVMMemcpy_params params = { command_queue, blocking_copy, dst_ptr, src_ptr, size,
++            num_events_in_wait_list, event_wait_list, event };
++    TRACE( "(%p, %u, %p, %p, %Iu, %u, %p, %p)\n", command_queue, blocking_copy, dst_ptr, src_ptr,
++            size, num_events_in_wait_list, event_wait_list, event );
++    return OPENCL_CALL( clEnqueueSVMMemcpy, &params );
++}
++
++cl_int WINAPI clEnqueueSVMMemFill( cl_command_queue command_queue, void *svm_ptr,
++        const void *pattern, size_t pattern_size, size_t size,
++        uint32_t num_events_in_wait_list, const cl_event *event_wait_list, cl_event *event )
++{
++    struct clEnqueueSVMMemFill_params params = { command_queue, svm_ptr, pattern, pattern_size, size,
++            num_events_in_wait_list, event_wait_list, event };
++    TRACE( "(%p, %p, %p, %Iu, %Iu, %u, %p, %p)\n", command_queue, svm_ptr, pattern,
++            pattern_size, size, num_events_in_wait_list, event_wait_list, event );
++    return OPENCL_CALL( clEnqueueSVMMemFill, &params );
++}
++
++cl_int WINAPI clEnqueueSVMMap( cl_command_queue command_queue, uint32_t blocking_map, cl_bitfield flags,
++        void *svm_ptr, size_t size,
++        uint32_t num_events_in_wait_list, const cl_event *event_wait_list, cl_event *event )
++{
++    struct clEnqueueSVMMap_params params = { command_queue, blocking_map, flags, svm_ptr, size,
++            num_events_in_wait_list, event_wait_list, event };
++    TRACE( "(%p, %u, %s, %p, %Iu, %u, %p, %p)\n", command_queue, blocking_map,
++            wine_dbgstr_longlong(flags), svm_ptr, size, num_events_in_wait_list, event_wait_list, event );
++    return OPENCL_CALL( clEnqueueSVMMap, &params );
++}
++
++cl_int WINAPI clEnqueueSVMUnmap( cl_command_queue command_queue, void *svm_ptr,
++        uint32_t num_events_in_wait_list, const cl_event *event_wait_list, cl_event *event )
++{
++    struct clEnqueueSVMUnmap_params params = { command_queue, svm_ptr,
++            num_events_in_wait_list, event_wait_list, event };
++    TRACE( "(%p, %p, %u, %p, %p)\n", command_queue, svm_ptr,
++            num_events_in_wait_list, event_wait_list, event );
++    return OPENCL_CALL( clEnqueueSVMUnmap, &params );
++}
++
++cl_int WINAPI clEnqueueSVMMigrateMem( cl_command_queue command_queue, uint32_t num_svm_pointers,
++        const void **svm_pointers, const size_t *sizes, cl_bitfield flags,
++        uint32_t num_events_in_wait_list, const cl_event *event_wait_list, cl_event *event )
++{
++    struct clEnqueueSVMMigrateMem_params params = { command_queue, num_svm_pointers, svm_pointers, sizes, flags,
++            num_events_in_wait_list, event_wait_list, event };
++    TRACE( "(%p, %u, %p, %p, %s, %u, %p, %p)\n", command_queue, num_svm_pointers, svm_pointers, sizes,
++            wine_dbgstr_longlong(flags), num_events_in_wait_list, event_wait_list, event );
++    return OPENCL_CALL( clEnqueueSVMMigrateMem, &params );
++}
++
+ BOOL WINAPI DllMain( HINSTANCE instance, DWORD reason, void *reserved )
+ {
+     if (reason == DLL_PROCESS_ATTACH)
+diff --git a/dlls/opencl/unix_private.h b/dlls/opencl/unix_private.h
+index 5c8ce9a..14d08bf 100644
+--- a/dlls/opencl/unix_private.h
++++ b/dlls/opencl/unix_private.h
+@@ -62,5 +62,11 @@ NTSTATUS wrap_clGetHostTimer( void *args );
+ NTSTATUS wrap_clGetKernelSubGroupInfo( void *args );
+ NTSTATUS wrap_clGetPipeInfo( void *args );
+ NTSTATUS wrap_clSetDefaultDeviceCommandQueue( void *args );
++NTSTATUS wrap_clEnqueueSVMMemFill( void *args );
++NTSTATUS wrap_clEnqueueSVMMemcpy( void *args );
++NTSTATUS wrap_clEnqueueSVMMigrateMem( void *args );
++NTSTATUS wrap_clEnqueueSVMMap( void *args );
++NTSTATUS wrap_clEnqueueSVMUnmap( void *args );
++NTSTATUS wrap_clSetKernelArgSVMPointer( void *args );
+ 
+ #endif
+diff --git a/dlls/opencl/unix_thunks.c b/dlls/opencl/unix_thunks.c
+index 7bc9845..0962c3b 100644
+--- a/dlls/opencl/unix_thunks.c
++++ b/dlls/opencl/unix_thunks.c
+@@ -690,4 +690,10 @@ const unixlib_entry_t __wine_unix_call_funcs[] =
+     wrap_clGetKernelSubGroupInfo,
+     wrap_clGetPipeInfo,
+     wrap_clSetDefaultDeviceCommandQueue,
++    wrap_clEnqueueSVMMemFill,
++    wrap_clEnqueueSVMMemcpy,
++    wrap_clEnqueueSVMMigrateMem,
++    wrap_clEnqueueSVMMap,
++    wrap_clEnqueueSVMUnmap,
++    wrap_clSetKernelArgSVMPointer,
+ };
+diff --git a/dlls/opencl/unix_wrappers.c b/dlls/opencl/unix_wrappers.c
+index 1538148..5cdb4e2 100644
+--- a/dlls/opencl/unix_wrappers.c
++++ b/dlls/opencl/unix_wrappers.c
+@@ -247,3 +247,53 @@ NTSTATUS wrap_clSetDefaultDeviceCommandQueue( void *args )
+     return clSetDefaultDeviceCommandQueue( params->context, params->device, params->command_queue );
+ }
+ 
++NTSTATUS wrap_clEnqueueSVMMemFill( void *args )
++{
++    struct clEnqueueSVMMemFill_params *params = args;
++
++    return clEnqueueSVMMemFill( params->command_queue, params->svm_ptr, params->pattern,
++            params->pattern_size, params->size,
++            params->num_events_in_wait_list, params->event_wait_list, params->event );
++}
++
++NTSTATUS wrap_clEnqueueSVMMemcpy( void *args )
++{
++    struct clEnqueueSVMMemcpy_params *params = args;
++
++    return clEnqueueSVMMemcpy( params->command_queue, params->blocking_copy,
++            params->dst_ptr, params->src_ptr, params->size,
++            params->num_events_in_wait_list, params->event_wait_list, params->event );
++}
++
++NTSTATUS wrap_clEnqueueSVMMigrateMem( void *args )
++{
++    struct clEnqueueSVMMigrateMem_params *params = args;
++
++    return clEnqueueSVMMigrateMem( params->command_queue, params->num_svm_pointers,
++            params->svm_pointers, params->sizes, params->flags,
++            params->num_events_in_wait_list, params->event_wait_list, params->event );
++}
++
++NTSTATUS wrap_clEnqueueSVMMap( void *args )
++{
++    struct clEnqueueSVMMap_params *params = args;
++
++    return clEnqueueSVMMap( params->command_queue, params->blocking_map, params->flags,
++            params->svm_ptr, params->size,
++            params->num_events_in_wait_list, params->event_wait_list, params->event );
++}
++
++NTSTATUS wrap_clEnqueueSVMUnmap( void *args )
++{
++    struct clEnqueueSVMUnmap_params *params = args;
++
++    return clEnqueueSVMUnmap( params->command_queue, params->svm_ptr,
++            params->num_events_in_wait_list, params->event_wait_list, params->event );
++}
++
++NTSTATUS wrap_clSetKernelArgSVMPointer( void *args )
++{
++    struct clSetKernelArgSVMPointer_params *params = args;
++
++    return clSetKernelArgSVMPointer( params->kernel, params->arg_index, params->arg_value );
++}
+diff --git a/dlls/opencl/unixlib.h b/dlls/opencl/unixlib.h
+index de7bfe7..cc45305 100644
+--- a/dlls/opencl/unixlib.h
++++ b/dlls/opencl/unixlib.h
+@@ -908,6 +908,70 @@ struct clSetDefaultDeviceCommandQueue_params
+     cl_command_queue command_queue;
+ };
+ 
++struct clEnqueueSVMMemFill_params
++{
++    cl_command_queue command_queue;
++    void* svm_ptr;
++    const void* pattern;
++    size_t pattern_size;
++    size_t size;
++    uint32_t num_events_in_wait_list;
++    const cl_event* event_wait_list;
++    cl_event* event;
++};
++
++struct clEnqueueSVMMemcpy_params
++{
++    cl_command_queue command_queue;
++    uint32_t blocking_copy;
++    void* dst_ptr;
++    const void* src_ptr;
++    size_t size;
++    uint32_t num_events_in_wait_list;
++    const cl_event* event_wait_list;
++    cl_event* event;
++};
++
++struct clEnqueueSVMMigrateMem_params
++{
++    cl_command_queue command_queue;
++    uint32_t num_svm_pointers;
++    const void** svm_pointers;
++    const size_t* sizes;
++    cl_bitfield flags;
++    uint32_t num_events_in_wait_list;
++    const cl_event* event_wait_list;
++    cl_event* event;
++};
++
++struct clEnqueueSVMMap_params
++{
++    cl_command_queue command_queue;
++    uint32_t blocking_map;
++    cl_bitfield flags;
++    void* svm_ptr;
++    size_t size;
++    uint32_t num_events_in_wait_list;
++    const cl_event* event_wait_list;
++    cl_event* event;
++};
++
++struct clEnqueueSVMUnmap_params
++{
++    cl_command_queue command_queue;
++    void* svm_ptr;
++    uint32_t num_events_in_wait_list;
++    const cl_event* event_wait_list;
++    cl_event* event;
++};
++
++struct clSetKernelArgSVMPointer_params
++{
++    cl_kernel kernel;
++    uint32_t arg_index;
++    const void* arg_value;
++};
++
+ enum opencl_funcs
+ {
+     unix_clBuildProgram,
+@@ -1009,4 +1073,10 @@ enum opencl_funcs
+     unix_clGetKernelSubGroupInfo,
+     unix_clGetPipeInfo,
+     unix_clSetDefaultDeviceCommandQueue,
++    unix_clEnqueueSVMMemFill,
++    unix_clEnqueueSVMMemcpy,
++    unix_clEnqueueSVMMigrateMem,
++    unix_clEnqueueSVMMap,
++    unix_clEnqueueSVMUnmap,
++    unix_clSetKernelArgSVMPointer,
+ };

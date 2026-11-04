@@ -1,0 +1,158 @@
+From c9a9938f66892ef5fe7a99d701cc301e5e6d29ae Mon Sep 17 00:00:00 2001
+From: jfacemyer <1776340+jfacemyer@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 14:26:48 -0500
+Subject: [PATCH] d2d1: Keep triangle vertex indices in 32 bits.
+
+struct d2d_face held 16-bit indices, so a fill or stroke with more than
+65,535 vertices drew the wrong triangles, and Tessellate() returned
+them. An engraving of 138,242 curves has 246,087 fill vertices, and a
+stroke reaches the limit at about 8,000 line segments.
+
+Faces are now 32-bit. Batched draws stay within 65,536 vertices and
+narrow the indices to 16 bits while copying them into the batch, as
+before; other draws use a 32-bit index buffer.
+---
+ dlls/d2d1/d2d1_private.h |  3 ++-
+ dlls/d2d1/device.c       | 30 +++++++++++++++++-------------
+ dlls/d2d1/geometry.c     |  2 +-
+ 3 files changed, 20 insertions(+), 15 deletions(-)
+
+diff --git a/dlls/d2d1/d2d1_private.h b/dlls/d2d1/d2d1_private.h
+index 165af30..22ecfe8 100644
+--- a/dlls/d2d1/d2d1_private.h
++++ b/dlls/d2d1/d2d1_private.h
+@@ -229,6 +229,7 @@ struct d2d_device_context
+         ID3D11InputLayout *il;
+         ID3D11Buffer *ib, *vb, *vs_cb, *ps_cb;
+         unsigned int ib_offset, vb_offset, vb_stride, vs_first, ps_first;
++        DXGI_FORMAT ib_format;
+         ID3D11VertexShader *vs;
+         ID3D11PixelShader *ps;
+         D3D11_VIEWPORT vp;
+@@ -555,7 +556,7 @@ struct d2d_curve_vertex
+ 
+ struct d2d_face
+ {
+-    UINT16 v[3];
++    UINT32 v[3];
+ };
+ 
+ struct d2d_outline_vertex
+diff --git a/dlls/d2d1/device.c b/dlls/d2d1/device.c
+index f153d46..2cc7655 100644
+--- a/dlls/d2d1/device.c
++++ b/dlls/d2d1/device.c
+@@ -231,9 +231,10 @@ static ID3DDeviceContextState *d2d_device_context_begin_draw_state(struct d2d_de
+ static void d2d_device_context_flush_vs_cb(struct d2d_device_context *context);
+ 
+ static void d2d_device_context_draw(struct d2d_device_context *render_target, enum d2d_shape_type shape_type,
+-        ID3D11Buffer *ib, unsigned int ib_offset, unsigned int index_count, ID3D11Buffer *vb, unsigned int vb_offset,
+-        unsigned int vb_stride, struct d2d_brush *brush, struct d2d_brush *opacity_brush)
++        ID3D11Buffer *ib, DXGI_FORMAT ib_format, unsigned int ib_offset, unsigned int index_count, ID3D11Buffer *vb,
++        unsigned int vb_offset, unsigned int vb_stride, struct d2d_brush *brush, struct d2d_brush *opacity_brush)
+ {
++    unsigned int index_size = ib_format == DXGI_FORMAT_R32_UINT ? sizeof(UINT32) : sizeof(WORD);
+     struct d2d_shape_resources *shape_resources = &render_target->shape_resources[shape_type];
+     struct d2d_bound_state *bound = &render_target->bound;
+     ID3DDeviceContextState *prev_state;
+@@ -269,9 +270,9 @@ static void d2d_device_context_draw(struct d2d_device_context *render_target, en
+     /* Bind the buffers at offset 0 and address the draw's data with a start index
+      * and a base vertex, so that consecutive draws from the upload ring bind the
+      * same buffers and wined3d skips the rebinding. */
+-    if (!(ib_offset % sizeof(WORD)) && !(vb_offset % vb_stride))
++    if (!(ib_offset % index_size) && !(vb_offset % vb_stride))
+     {
+-        start_index = ib_offset / sizeof(WORD);
++        start_index = ib_offset / index_size;
+         base_vertex = vb_offset / vb_stride;
+         ib_offset = vb_offset = 0;
+     }
+@@ -292,11 +293,12 @@ static void d2d_device_context_draw(struct d2d_device_context *render_target, en
+     }
+     if (!bound->valid)
+         ID3D11DeviceContext1_IASetPrimitiveTopology(context, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+-    if (!bound->valid || bound->ib != ib || bound->ib_offset != ib_offset)
++    if (!bound->valid || bound->ib != ib || bound->ib_offset != ib_offset || bound->ib_format != ib_format)
+     {
+-        ID3D11DeviceContext1_IASetIndexBuffer(context, ib, DXGI_FORMAT_R16_UINT, ib_offset);
++        ID3D11DeviceContext1_IASetIndexBuffer(context, ib, ib_format, ib_offset);
+         bound->ib = ib;
+         bound->ib_offset = ib_offset;
++        bound->ib_format = ib_format;
+     }
+     if (!bound->valid || bound->vb != vb || bound->vb_offset != vb_offset || bound->vb_stride != vb_stride)
+     {
+@@ -461,7 +463,7 @@ static HRESULT d2d_upload_ring_write(struct d2d_device_context *context, const v
+     return hr;
+ }
+ 
+-/* Draw primitives from data in memory: indices (16-bit, may be NULL for a
++/* Draw primitives from data in memory: indices (32-bit, may be NULL for a
+  * non-indexed draw of "count" vertices) and vertices. */
+ static BOOL d2d_draw_batching(void)
+ {
+@@ -498,8 +500,9 @@ void d2d_device_context_flush_draws(struct d2d_device_context *render_target)
+             batch->vertices, batch->vertex_count * batch->vb_stride, batch->vb_stride, &ib_offset, &vb_offset)))
+         WARN("Failed to upload geometry, hr %#lx.\n", hr);
+     else
+-        d2d_device_context_draw(render_target, batch->shape_type, render_target->upload_ring.buffer, ib_offset,
+-                batch->index_count, render_target->upload_ring.buffer, vb_offset, batch->vb_stride, batch->brush, NULL);
++        d2d_device_context_draw(render_target, batch->shape_type, render_target->upload_ring.buffer,
++                DXGI_FORMAT_R16_UINT, ib_offset, batch->index_count, render_target->upload_ring.buffer, vb_offset,
++                batch->vb_stride, batch->brush, NULL);
+ 
+     render_target->vs_cb_offset = vs_cb_offset;
+     render_target->ps_cb_offset = ps_cb_offset;
+@@ -522,7 +525,7 @@ void d2d_device_context_flush_draws(struct d2d_device_context *render_target)
+  * Affinity draws about 540 primitives a frame while a selection is dragged, half of
+  * them with the same state and constants as the one before. */
+ static BOOL d2d_device_context_batch_draw(struct d2d_device_context *render_target, enum d2d_shape_type shape_type,
+-        const WORD *indices, unsigned int index_size, unsigned int count, const void *vertices,
++        const UINT32 *indices, unsigned int index_size, unsigned int count, const void *vertices,
+         unsigned int vertex_size, unsigned int vb_stride, struct d2d_brush *brush, struct d2d_brush *opacity_brush)
+ {
+     struct d2d_draw_batch *batch = &render_target->draw_batch;
+@@ -530,7 +533,7 @@ static BOOL d2d_device_context_batch_draw(struct d2d_device_context *render_targ
+ 
+     if (!d2d_draw_batching() || !indices || !brush || opacity_brush || brush->type != D2D_BRUSH_TYPE_SOLID
+             || render_target->vs_cb_pending || !vb_stride || vertex_size % vb_stride
+-            || index_size != count * sizeof(WORD))
++            || index_size != count * sizeof(*indices))
+         return FALSE;
+     if ((vertex_count = vertex_size / vb_stride) > 0x10000)
+         return FALSE;
+@@ -595,7 +598,8 @@ static void d2d_device_context_draw_data(struct d2d_device_context *render_targe
+         WARN("Failed to upload geometry, hr %#lx.\n", hr);
+     else
+         d2d_device_context_draw(render_target, shape_type, indices ? render_target->upload_ring.buffer : NULL,
+-                ib_offset, count, render_target->upload_ring.buffer, vb_offset, vb_stride, brush, opacity_brush);
++                DXGI_FORMAT_R32_UINT, ib_offset, count, render_target->upload_ring.buffer, vb_offset, vb_stride,
++                brush, opacity_brush);
+ 
+     if (render_target->cs)
+         LeaveCriticalSection(render_target->cs);
+@@ -2433,7 +2437,7 @@ static void STDMETHODCALLTYPE d2d_device_context_Clear(ID2D1DeviceContext6 *ifac
+     ID3D11DeviceContext_Unmap(d3d_context, (ID3D11Resource *)context->cb_ring.buffer, 0);
+     ID3D11DeviceContext_Release(d3d_context);
+ 
+-    d2d_device_context_draw(context, D2D_SHAPE_TYPE_TRIANGLE, context->ib, 0, 6,
++    d2d_device_context_draw(context, D2D_SHAPE_TYPE_TRIANGLE, context->ib, DXGI_FORMAT_R16_UINT, 0, 6,
+             context->vb, 0, context->vb_stride, NULL, NULL);
+ }
+ 
+diff --git a/dlls/d2d1/geometry.c b/dlls/d2d1/geometry.c
+index 0002744..aeb2beb 100644
+--- a/dlls/d2d1/geometry.c
++++ b/dlls/d2d1/geometry.c
+@@ -333,7 +333,7 @@ static void d2d_curve_vertex_set(struct d2d_curve_vertex *b,
+     b->texcoord.sign = sign;
+ }
+ 
+-static void d2d_face_set(struct d2d_face *f, UINT16 v0, UINT16 v1, UINT16 v2)
++static void d2d_face_set(struct d2d_face *f, UINT32 v0, UINT32 v1, UINT32 v2)
+ {
+     f->v[0] = v0;
+     f->v[1] = v1;
+-- 
+2.55.0
+

@@ -1,0 +1,44 @@
+wined3d: Present rects of a windowed discard swapchain as partial updates.
+
+Windows blits windowed presents whatever the swap effect, so a discard
+swapchain presented with rects updates only that part of the window.
+ANGLE presents Chromium's partial updates this way, and the Vulkan
+present filled the rest of the window with an undefined (black) image:
+an embedded WebView2 showed black boxes and bars whenever the pointer
+moved over its page, around the one link that had changed.
+
+Treat these presents as partial, like those of a copy swapchain, but do
+not widen them to the whole back buffer, which a discard swapchain need
+not keep.
+---
+ dlls/wined3d/swapchain.c | 10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/dlls/wined3d/swapchain.c b/dlls/wined3d/swapchain.c
+index df46a43..2b99395 100644
+--- a/dlls/wined3d/swapchain.c
++++ b/dlls/wined3d/swapchain.c
+@@ -606,7 +606,12 @@ static bool swapchain_present_is_partial_copy(struct wined3d_swapchain *swapchai
+     const struct wined3d_swapchain_desc *desc = &swapchain->state.desc;
+     unsigned int width, height;
+ 
+-    if (swap_effect != WINED3D_SWAP_EFFECT_COPY && swap_effect != WINED3D_SWAP_EFFECT_COPY_VSYNC)
++    /* A windowed present blits on Windows whatever the swap effect, so a
++     * discard swapchain presented with rects updates only that part of the
++     * window too: ANGLE presents Chromium's partial updates this way (an
++     * embedded WebView2), and the rest of the window keeps what it shows. */
++    if (swap_effect != WINED3D_SWAP_EFFECT_COPY && swap_effect != WINED3D_SWAP_EFFECT_COPY_VSYNC
++            && !(swap_effect == WINED3D_SWAP_EFFECT_DISCARD && desc->windowed))
+         return false;
+ 
+     if (!desc->windowed)
+@@ -645,6 +650,9 @@ static bool swapchain_present_can_expand(struct wined3d_swapchain *swapchain,
+ 
+     if (!desc->windowed || desc->backbuffer_count != 1 || !EqualRect(src_rect, dst_rect))
+         return false;
++    /* A discard back buffer need not hold the rest of the frame. */
++    if (desc->swap_effect == WINED3D_SWAP_EFFECT_DISCARD)
++        return false;
+     if (!GetClientRect(swapchain->win_handle, &client_rect))
+         return false;
+     if (IsRectEmpty(&client_rect) || client_rect.right > desc->backbuffer_width

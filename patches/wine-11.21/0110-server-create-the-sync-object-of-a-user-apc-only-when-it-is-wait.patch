@@ -1,0 +1,80 @@
+server: Create the sync object of a user APC only when it is waited on.
+
+Every APC got an internal event, which with in-process sync is an
+ntsync kernel object and a file descriptor, created when the APC is
+queued and destroyed when it has run. Only a caller that receives a
+handle to the APC waits on it, and user APCs never hand one out.
+
+The .NET Framework thread pool gives its wait and timer threads their
+work with QueueUserAPC, two per registered wait: in Affinity, about
+27,000 a drag of a few seconds. Creating the event on first use cuts
+wineserver's CPU per user APC by about a tenth (synthetic: 6.0 s to
+5.4 s for 400,000), and in Affinity from 0.98 s to 0.84-0.91 s per
+drag benchmark.
+---
+ server/thread.c | 17 ++++++++++++-----
+ 1 file changed, 12 insertions(+), 5 deletions(-)
+
+diff --git a/server/thread.c b/server/thread.c
+index bdf48c4..b3ddc0e 100644
+--- a/server/thread.c
++++ b/server/thread.c
+@@ -650,6 +650,9 @@ static struct object *thread_apc_get_sync( struct object *obj )
+ {
+     struct thread_apc *apc = (struct thread_apc *)obj;
+     assert( obj->ops == &thread_apc_ops );
++    /* made on first use, see create_apc */
++    if (!apc->sync && !(apc->sync = create_internal_sync( 1, apc->executed )))
++        apc->sync = (struct object *)create_server_internal_sync( 1, apc->executed );
+     return grab_object( apc->sync );
+ }
+ 
+@@ -687,7 +690,11 @@ static struct thread_apc *create_apc( struct object *owner, const union apc_call
+         apc->result.type = APC_NONE;
+         if (owner) grab_object( owner );
+ 
+-        if (!(apc->sync = create_internal_sync( 1, 0 )))
++        /* Only a caller that gets a handle to the APC waits on it, and user APCs never
++         * give one out. With in-process sync each event is a kernel object and a file
++         * descriptor, made and destroyed for every QueueUserAPC; the .NET Framework thread
++         * pool queues tens of thousands a second. Make it on first use instead. */
++        if (apc->call.type != APC_USER && !(apc->sync = create_internal_sync( 1, 0 )))
+         {
+             release_object( apc );
+             return NULL;
+@@ -1467,7 +1474,7 @@ void thread_cancel_apc( struct thread *thread, struct object *owner, enum apc_ty
+         if (apc->owner != owner) continue;
+         list_remove( &apc->entry );
+         apc->executed = 1;
+-        signal_sync( apc->sync );
++        if (apc->sync) signal_sync( apc->sync );
+         release_object( apc );
+         if (list_empty( &thread->user_apc ) && thread->alert_sync)
+             reset_inproc_sync( thread->alert_sync );
+@@ -1501,7 +1508,7 @@ static void clear_apc_queue( struct list *queue )
+         struct thread_apc *apc = LIST_ENTRY( ptr, struct thread_apc, entry );
+         list_remove( &apc->entry );
+         apc->executed = 1;
+-        signal_sync( apc->sync );
++        if (apc->sync) signal_sync( apc->sync );
+         release_object( apc );
+     }
+ }
+@@ -1981,7 +1988,7 @@ DECL_HANDLER(select)
+             apc->result.create_thread.handle = handle;
+             clear_error();  /* ignore errors from the above calls */
+         }
+-        signal_sync( apc->sync );
++        if (apc->sync) signal_sync( apc->sync );
+         close_handle( current->process, req->prev_apc );
+         release_object( apc );
+     }
+@@ -2004,7 +2011,7 @@ DECL_HANDLER(select)
+         else
+         {
+             apc->executed = 1;
+-            signal_sync( apc->sync );
++            if (apc->sync) signal_sync( apc->sync );
+         }
+         release_object( apc );
+     }

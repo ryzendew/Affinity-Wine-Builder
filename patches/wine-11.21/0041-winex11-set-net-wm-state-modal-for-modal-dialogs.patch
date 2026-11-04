@@ -1,0 +1,240 @@
+winex11: tell the window manager when a dialog is modal.
+
+Wine never sets _NET_WM_STATE_MODAL. The atom is not in the atom table at all,
+and net_wm_state_atoms[] carries only six states. WM_TRANSIENT_FOR alone does
+not oblige a window manager to keep a window above its parent -- MODAL is the
+hint that does -- so a modal dialog can be stacked *below* the very window it
+has disabled. The user then cannot find the dialog, the owner refuses input,
+and the application appears to have frozen.
+
+Observed with Affinity's Export dialog on Plasma 6: correct WM_TRANSIENT_FOR,
+no MODAL, and the dialog sitting behind its owner.
+
+Win32 modality needs no new flag to detect: a modal dialog is one whose owner
+has been disabled for its duration, which is exactly what DialogBox and
+IFileDialog::Show do.
+
+Two things are needed beyond adding the atom:
+
+  - the state must be recomputed when the OWNER's WS_DISABLED changes. It
+    depends on the owner, not on the window itself, so nothing else triggers it:
+    the dialog's state is otherwise computed once at creation, before the owner
+    is disabled, and never corrected.
+
+  - the enum in x11drv.h must stay in the same order as the name table in
+    x11drv_main.c. X11DRV_Atoms[] is indexed by that enum, so inserting MODAL in
+    a different position in each makes every atom from there on resolve to the
+    wrong name -- setting MODAL then emits _NET_WM_STATE_SKIP_PAGER, which is
+    both wrong and silent.
+
+A disabled owner is a necessary condition for modality but nowhere near a
+sufficient one, and taking it as sufficient costs the user the keyboard.
+
+Every floating palette an application owns is owned by a disabled window for
+as long as any dialog is up, so every one of them was advertised as modal.
+Window.ShowDialog makes it worse by disabling all of the thread's top-level
+windows rather than just the owner, and patch 0021 produces the same shape with
+no Win32 dialog in it at all: the XDG portal chooser is the portal's own
+window, and all Wine does is disable the owner for the duration.
+
+A window manager that honours the hint then sends the owner's activation to a
+palette. KWin does. Measured with a 90-line test program and no Affinity
+involved, driving a main window, an owned WS_EX_TOOLWINDOW palette and a
+dialog that comes and goes:
+
+  before  dialog destroyed -> active = PALETTE, and it stays there after the
+          owner is re-enabled and the state clears; the main window never gets
+          the focus back
+  after   dialog destroyed -> active = MAIN
+
+The application is left running with the focus on a palette that does not
+handle the keyboard, so typing and every shortcut do nothing until the user
+alt-tabs away and back. Intermittent enough to look like individual shortcuts
+failing one at a time.
+
+So require two more things of a candidate:
+
+  - it is not a tool window. A floating palette is one and a dialog is not --
+    the same distinction this driver already draws for SC_MOVE. This is what
+    rules out the palettes in the portal shape, where there is no dialog to
+    prefer over them.
+
+  - it is the owner's GW_ENABLEDPOPUP, the window Windows itself activates when
+    a disabled owner is clicked. That is the modal dialog by definition, and it
+    guarantees at most one window per owner claims the state.
+
+GW_ENABLEDPOPUP is a property of the whole set of windows one owner owns, so
+enabling or disabling any one of them can move it; a window whose WS_DISABLED
+changes now refreshes its siblings as well as the windows it owns.
+
+Verified across the three shapes an application can produce, counting samples
+in which each window was advertised modal:
+
+                     palette (wrong)   dialog (right)
+  ShowDialog    old     153 / 506           91
+                new       0 / 605          104
+  DialogBox     old     161 / 564           96
+                new       0 / 607          104
+  portal 0021   old     183 / 614            -
+                new       0 / 577            -
+
+diff --git a/dlls/winex11.drv/window.c b/dlls/winex11.drv/window.c
+index d105040..f1ed029 100644
+--- a/dlls/winex11.drv/window.c
++++ b/dlls/winex11.drv/window.c
+@@ -83,6 +83,7 @@ static const unsigned int net_wm_state_atoms[NB_NET_WM_STATES] =
+     XATOM__NET_WM_STATE_ABOVE,
+     XATOM__NET_WM_STATE_MAXIMIZED_VERT,
+     XATOM__NET_WM_STATE_SKIP_PAGER,
++    XATOM__NET_WM_STATE_MODAL,
+     XATOM__NET_WM_STATE_SKIP_TASKBAR
+ };
+ 
+@@ -1477,6 +1478,7 @@ static void update_net_wm_states( struct x11drv_win_data *data )
+ {
+     static const UINT fullscreen_mask = (1 << NET_WM_STATE_MAXIMIZED) | (1 << NET_WM_STATE_FULLSCREEN);
+     UINT style, ex_style, new_state = 0;
++    HWND owner;
+ 
+     if (data->embedded) return;
+     if (data->whole_window == root_window)
+@@ -1500,6 +1502,38 @@ static void update_net_wm_states( struct x11drv_win_data *data )
+     ex_style = NtUserGetWindowLongW( data->hwnd, GWL_EXSTYLE );
+     if (ex_style & WS_EX_TOPMOST)
+         new_state |= (1 << NET_WM_STATE_ABOVE);
++
++    /* A modal dialog must stay above the window it blocks. WM_TRANSIENT_FOR
++     * alone does not oblige the window manager to do that -- _NET_WM_STATE_MODAL
++     * is the hint that does, and Wine has never set it. Without it a modal dialog
++     * can be stacked below its own owner, where the user cannot find it while the
++     * owner refuses input, so the application appears to have frozen.
++     *
++     * Win32 modality is not directly observable: there is no "is modal" flag to
++     * consult. A disabled owner is a necessary condition, but on its own it is
++     * far too weak -- it is equally true of every floating palette the
++     * application owns for as long as any dialog is up, and Window.ShowDialog
++     * disables every top-level window in the thread, not just the owner. Marking
++     * a palette modal is not cosmetic: the window manager sends the owner's
++     * activation to it instead, and since a palette is not where the application
++     * handles the keyboard, the application stops answering the keyboard until
++     * something re-activates it by hand.
++     *
++     * So require two more things of a candidate:
++     *
++     *  - it is not a tool window. A floating palette is one and a dialog is not;
++     *    this is the same distinction winex11 already draws in SC_MOVE handling.
++     *    It is what rules out the palettes when the owner is disabled and there
++     *    is no Win32 dialog at all, which is exactly the shape the XDG portal
++     *    file chooser produces.
++     *  - it is the owner's GW_ENABLEDPOPUP, the window Windows itself activates
++     *    when a disabled owner is clicked. That is the modal dialog by
++     *    definition, and it guarantees at most one window per owner claims the
++     *    state. */
++    if ((owner = NtUserGetWindowRelative( data->hwnd, GW_OWNER )) &&
++        !NtUserIsWindowEnabled( owner ) && !(ex_style & WS_EX_TOOLWINDOW) &&
++        NtUserGetWindowRelative( owner, GW_ENABLEDPOPUP ) == data->hwnd)
++        new_state |= (1 << NET_WM_STATE_MODAL);
+     if (!data->add_taskbar)
+     {
+         if (data->skip_taskbar || (ex_style & WS_EX_NOACTIVATE)
+@@ -2593,11 +2627,38 @@ void X11DRV_SetWindowText( HWND hwnd, LPCWSTR text )
+  *
+  * Update the X state of a window to reflect a style change
+  */
++/* _NET_WM_STATE_MODAL on an owned window depends on its OWNER being disabled,
++ * not on anything about the window itself. So when a window's WS_DISABLED
++ * changes, the windows it owns have to be recomputed: their own styles have not
++ * changed, and nothing else will do it. Without this the state is computed once
++ * when the dialog is created -- before the owner is disabled -- and never
++ * corrected, so a modal dialog is never advertised as modal. */
++static void update_owned_windows_net_wm_states( HWND owner )
++{
++    HWND *list;
++    UINT i;
++
++    /* build_hwnd_list, as has_owned_popups uses: walking GW_CHILD from the
++     * desktop does not enumerate top-level windows. */
++    if (!(list = build_hwnd_list())) return;
++
++    for (i = 0; list[i] != HWND_BOTTOM; i++)
++    {
++        struct x11drv_win_data *data;
++
++        if (NtUserGetWindowRelative( list[i], GW_OWNER ) != owner) continue;
++        if (!(data = get_win_data( list[i] ))) continue;
++        if (data->whole_window) update_net_wm_states( data );
++        release_win_data( data );
++    }
++    free( list );
++}
++
+ void X11DRV_SetWindowStyle( HWND hwnd, INT offset, STYLESTRUCT *style )
+ {
+     struct x11drv_win_data *data;
+     DWORD changed = style->styleNew ^ style->styleOld;
+-    BOOL flush = FALSE;
++    BOOL flush = FALSE, disabled_changed = FALSE;
+ 
+     if (hwnd == NtUserGetDesktopWindow()) return;
+     if (!(data = get_win_data( hwnd ))) return;
+@@ -2607,6 +2668,7 @@ void X11DRV_SetWindowStyle( HWND hwnd, INT offset, STYLESTRUCT *style )
+     {
+         set_wm_hints( data );
+         flush = TRUE;
++        disabled_changed = TRUE;
+     }
+ 
+     if (offset == GWL_EXSTYLE)
+@@ -2624,6 +2686,20 @@ void X11DRV_SetWindowStyle( HWND hwnd, INT offset, STYLESTRUCT *style )
+     if (flush) XFlush( data->display );
+ done:
+     release_win_data( data );
++
++    /* after release_win_data: these take the lock for each window they touch */
++    if (disabled_changed)
++    {
++        HWND owner;
++
++        update_owned_windows_net_wm_states( hwnd );
++        /* MODAL now depends on GW_ENABLEDPOPUP, which is a property of the whole
++         * set of windows one owner owns: enabling or disabling any one of them
++         * can move it to a different window. So refresh this window's siblings
++         * too, not only the windows it owns itself. */
++        if ((owner = NtUserGetWindowRelative( hwnd, GW_OWNER )))
++            update_owned_windows_net_wm_states( owner );
++    }
+ }
+ 
+ 
+diff --git a/dlls/winex11.drv/x11drv.h b/dlls/winex11.drv/x11drv.h
+index 22462df..67639a9 100644
+--- a/dlls/winex11.drv/x11drv.h
++++ b/dlls/winex11.drv/x11drv.h
+@@ -545,6 +545,7 @@ enum x11drv_atoms
+     XATOM__NET_WM_STATE_FULLSCREEN,
+     XATOM__NET_WM_STATE_MAXIMIZED_HORZ,
+     XATOM__NET_WM_STATE_MAXIMIZED_VERT,
++    XATOM__NET_WM_STATE_MODAL,
+     XATOM__NET_WM_STATE_SKIP_PAGER,
+     XATOM__NET_WM_STATE_SKIP_TASKBAR,
+     XATOM__NET_WM_USER_TIME,
+@@ -646,6 +647,7 @@ enum x11drv_net_wm_state
+     NET_WM_STATE_ABOVE,
+     NET_WM_STATE_MAXIMIZED,
+     NET_WM_STATE_SKIP_PAGER,
++    NET_WM_STATE_MODAL,
+     NET_WM_STATE_SKIP_TASKBAR,
+     NB_NET_WM_STATES
+ };
+diff --git a/dlls/winex11.drv/x11drv_main.c b/dlls/winex11.drv/x11drv_main.c
+index b14d4d1..715b590 100644
+--- a/dlls/winex11.drv/x11drv_main.c
++++ b/dlls/winex11.drv/x11drv_main.c
+@@ -148,6 +148,7 @@ const char * const X11DRV_atom_names[NB_XATOMS - FIRST_XATOM] =
+     "_NET_WM_STATE_FULLSCREEN",
+     "_NET_WM_STATE_MAXIMIZED_HORZ",
+     "_NET_WM_STATE_MAXIMIZED_VERT",
++    "_NET_WM_STATE_MODAL",
+     "_NET_WM_STATE_SKIP_PAGER",
+     "_NET_WM_STATE_SKIP_TASKBAR",
+     "_NET_WM_USER_TIME",

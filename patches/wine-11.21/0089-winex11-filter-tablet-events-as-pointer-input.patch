@@ -1,0 +1,56 @@
+winex11: Filter tablet events as pointer input.
+
+The XInput event types of a tablet are allocated at run time, so the
+event filter treated them as other events and only processed them when
+the caller waited for sent messages, leaving them queued while an
+application waited for mouse input.
+---
+ dlls/winex11.drv/event.c  | 3 +++
+ dlls/winex11.drv/wintab.c | 7 +++++++
+ dlls/winex11.drv/x11drv.h | 1 +
+ 3 files changed, 11 insertions(+)
+
+diff --git a/dlls/winex11.drv/event.c b/dlls/winex11.drv/event.c
+index c4b6c01..fd95124 100644
+--- a/dlls/winex11.drv/event.c
++++ b/dlls/winex11.drv/event.c
+@@ -316,6 +316,9 @@ static Bool filter_event( Display *display, XEvent *event, char *arg )
+         /* fallthrough */
+ #endif
+     default:
++        /* a tablet's XInput events, whose types are allocated at run time */
++        if (is_tablet_pointer_event( event->type ))
++            return (mask & (QS_MOUSEMOVE | QS_MOUSEBUTTON | QS_RAWINPUT)) != 0;
+         return (mask & QS_SENDMESSAGE) != 0;
+     }
+ }
+diff --git a/dlls/winex11.drv/wintab.c b/dlls/winex11.drv/wintab.c
+index 3dfbb52..87d5c1a 100644
+--- a/dlls/winex11.drv/wintab.c
++++ b/dlls/winex11.drv/wintab.c
+@@ -265,6 +265,13 @@ static int           key_release_type;
+ static int           proximity_in_type;
+ static int           proximity_out_type;
+ 
++/* the dynamic event types are pointer input like core pointer events */
++BOOL is_tablet_pointer_event( int type )
++{
++    return type && (type == motion_type || type == button_press_type || type == button_release_type ||
++                    type == proximity_in_type || type == proximity_out_type);
++}
++
+ static HWND          hwndTabletDefault;
+ static WTPACKET      gMsgPacket;
+ static DWORD         gSerial;
+diff --git a/dlls/winex11.drv/x11drv.h b/dlls/winex11.drv/x11drv.h
+index 95281ea..a4c66a3 100644
+--- a/dlls/winex11.drv/x11drv.h
++++ b/dlls/winex11.drv/x11drv.h
+@@ -607,6 +607,7 @@ extern HWND systray_hwnd;
+ typedef BOOL (*x11drv_event_handler)( HWND hwnd, XEvent *event );
+ 
+ extern void X11DRV_register_event_handler( int type, x11drv_event_handler handler, const char *name );
++extern BOOL is_tablet_pointer_event( int type );
+ 
+ extern BOOL X11DRV_ButtonPress( HWND hwnd, XEvent *event );
+ extern BOOL X11DRV_ButtonRelease( HWND hwnd, XEvent *event );

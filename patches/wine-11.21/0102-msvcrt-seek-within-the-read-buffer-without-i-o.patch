@@ -1,0 +1,273 @@
+msvcrt: Seek within the read buffer without I/O.
+
+fseek always dropped the stream's buffer and moved the descriptor, so a
+reader that seeks and then reads a few bytes paid a seek and a full
+buffer refill each time. Affinity's PDF importer reads that way: opening
+one business card took 33 million seeks and 4 KB reads of a 516 KB file
+(153 GB through ReadFile) while the PDF Options dialog drew its preview.
+
+When the target lies inside the buffer, move the read pointer instead,
+as glibc and musl do. The stream records which file range its buffer
+holds and where its descriptor stands, and every low-level read, write,
+seek and close bumps a per-descriptor counter, so the fast path is taken
+only when nothing has moved the descriptor since the buffer was filled,
+and only for binary read-only file streams. The descriptor then stays at
+the end of the buffer, where the next fill continues, and ftell still
+reports the stream position.
+
+The one visible difference: after an fseek that fails, the stream falls
+back to the descriptor's position, which can now be the end of an
+earlier fill rather than of the last one. The position after a failed
+fseek is unspecified.
+
+msvcrt and ucrtbase file tests pass unchanged (1152 and 524 checks). A
+randomized test of 200,000 mixed seeks, reads, ungetc, EOF and
+descriptor moves behind the stream's back gives the same results as
+before; seeking one byte and reading it is 50 times faster. Affinity's
+preview of that card makes 14 million reads instead of 33 million.
+---
+ dlls/msvcrt/file.c | 118 ++++++++++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 116 insertions(+), 2 deletions(-)
+
+diff --git a/dlls/msvcrt/file.c b/dlls/msvcrt/file.c
+index be88624..e2b6046 100644
+--- a/dlls/msvcrt/file.c
++++ b/dlls/msvcrt/file.c
+@@ -246,8 +246,32 @@ static inline void ioinfo_set_unicode(ioinfo *info, BOOL unicode)
+ typedef struct {
+     FILE file;
+     CRITICAL_SECTION crit;
++    /* What the read buffer holds, so that fseek within it needs no I/O:
++     * file offsets [buf_pos, buf_pos + buf_len) when buf_valid, the
++     * descriptor's position in pos when pos_valid, and fd_gen of the
++     * descriptor when either was recorded. */
++    __int64 pos;
++    __int64 buf_pos;
++    int buf_len;
++    LONG gen;
++    BOOL pos_valid;
++    BOOL buf_valid;
+ } file_crit;
+ 
++/* Bumped by every low-level read, write, seek or close of a descriptor, so
++ * a stream can tell that its descriptor moved behind its back. */
++static LONG fd_gen[MSVCRT_MAX_FILES];
++
++static inline void fd_touch(int fd)
++{
++    if (fd >= 0 && fd < MSVCRT_MAX_FILES) InterlockedIncrement(&fd_gen[fd]);
++}
++
++static inline LONG fd_get_gen(int fd)
++{
++    return (fd >= 0 && fd < MSVCRT_MAX_FILES) ? fd_gen[fd] : 0;
++}
++
+ #if _MSVCR_VER >= 140
+ file_crit MSVCRT__iob[_IOB_ENTRIES] = { 0 };
+ 
+@@ -277,6 +301,46 @@ static CRITICAL_SECTION* file_get_cs(FILE *f)
+ #endif
+ 
+ static file_crit* MSVCRT_fstream[MSVCRT_MAX_FILES/MSVCRT_FD_BLOCK_SIZE];
++
++/* The stream's file_crit, or NULL for a string stream (often a bare FILE on
++ * the caller's stack) and for msvcrt's standard streams, which are plain
++ * FILEs. */
++static file_crit *file_get_ext(FILE *f)
++{
++    if (f->_flag & _IOSTRG) return NULL;
++#if _MSVCR_VER < 140
++    if (f >= iob_get_file(0) && f < iob_get_file(_IOB_ENTRIES)) return NULL;
++#endif
++    return (file_crit *)f;
++}
++
++static void file_forget_pos(FILE *f)
++{
++    file_crit *ext = file_get_ext(f);
++    if (ext) ext->pos_valid = ext->buf_valid = FALSE;
++}
++
++/* After a read of ret bytes from the stream's descriptor: advance the known
++ * position, and record what the buffer holds if the read filled it. */
++static void file_note_read(FILE *f, __int64 ret, BOOL into_buffer)
++{
++    file_crit *ext = file_get_ext(f);
++
++    if (!ext) return;
++    if (!ext->pos_valid || ext->gen + 1 != fd_get_gen(f->_file) || ret < 0)
++    {
++        ext->pos_valid = ext->buf_valid = FALSE;
++        return;
++    }
++    if (into_buffer)
++    {
++        ext->buf_pos = ext->pos;
++        ext->buf_len = ret;
++        ext->buf_valid = TRUE;
++    }
++    ext->pos += ret;
++    ext->gen = fd_get_gen(f->_file);
++}
+ static int MSVCRT_max_streams = 512, MSVCRT_stream_idx;
+ 
+ /* INTERNAL: process umask */
+@@ -639,6 +703,7 @@ static int msvcrt_init_fp(FILE* file, int fd, unsigned stream_flags)
+   file->_file = fd;
+   file->_flag = stream_flags;
+   file->_tmpfname = NULL;
++  file_forget_pos(file);
+ 
+   TRACE(":got FILE* (%p)\n",file);
+   return 0;
+@@ -799,6 +864,7 @@ static int msvcrt_flush_buffer(FILE* file)
+ 
+     file->_ptr=file->_base;
+     file->_cnt=0;
++    if (file_get_ext(file)) file_get_ext(file)->buf_valid = FALSE;
+     return ret;
+ }
+ 
+@@ -1188,6 +1254,7 @@ int CDECL _close(int fd)
+   int ret;
+ 
+   TRACE(":fd (%d) handle (%p)\n", fd, info->handle);
++  fd_touch(fd);
+ 
+   if (fd == MSVCRT_NO_CONSOLE_FD) {
+     *_errno() = EBADF;
+@@ -1227,6 +1294,7 @@ int CDECL _dup2(int od, int nd)
+   int ret;
+ 
+   TRACE("(od=%d, nd=%d)\n", od, nd);
++  fd_touch(nd);
+ 
+   if (od < nd)
+   {
+@@ -1423,6 +1491,7 @@ __int64 CDECL _lseeki64(int fd, __int64 offset, int whence)
+   /* The MoleBox protection scheme expects msvcrt to use SetFilePointer only,
+    * so a LARGE_INTEGER offset cannot be passed directly via SetFilePointerEx. */
+   ofs.QuadPart = offset;
++  if (whence != SEEK_CUR || offset) fd_touch(fd);
+   if ((ofs.u.LowPart = SetFilePointer(info->handle, ofs.u.LowPart, &ofs.u.HighPart, whence)) != INVALID_SET_FILE_POINTER ||
+       GetLastError() == ERROR_SUCCESS)
+   {
+@@ -1549,8 +1618,35 @@ int CDECL _fseeki64(FILE* file, __int64 offset, int whence)
+  */
+ int CDECL _fseeki64_nolock(FILE* file, __int64 offset, int whence)
+ {
++  file_crit *ext = file_get_ext(file);
++  __int64 pos;
+   int ret;
+ 
++  /* A target inside the read buffer needs no I/O: move within the buffer,
++   * as glibc does. Only for a binary read-only stream whose buffer and
++   * descriptor position are known and whose descriptor nobody else has
++   * touched since; the descriptor then stays at the end of the buffer,
++   * where the next fill continues. */
++  if (ext && ext->buf_valid && ext->pos_valid && ext->gen == fd_get_gen(file->_file)
++      && ext->pos == ext->buf_pos + ext->buf_len
++      && (file->_flag & (_IOREAD | _IOWRT | _IORW | _IOSTRG)) == _IOREAD
++      && (file->_flag & (_IOMYBUF | MSVCRT__USERBUF))
++      && file->_ptr >= file->_base && file->_ptr <= file->_base + ext->buf_len
++      && !(get_ioinfo_nolock(file->_file)->wxflag & WX_TEXT)
++      && (whence == SEEK_SET || whence == SEEK_CUR))
++  {
++      __int64 target = offset;
++      if (whence == SEEK_CUR) target += ext->buf_pos + (file->_ptr - file->_base);
++      if (target >= ext->buf_pos && target <= ext->buf_pos + ext->buf_len)
++      {
++          file->_ptr = file->_base + (target - ext->buf_pos);
++          file->_cnt = ext->buf_len - (target - ext->buf_pos);
++          file->_flag &= ~_IOEOF;
++          get_ioinfo_nolock(file->_file)->wxflag &= ~WX_ATEOF;
++          return 0;
++      }
++  }
++
+   if(whence == SEEK_CUR && file->_flag & _IOREAD ) {
+       whence = SEEK_SET;
+       offset += _ftelli64_nolock(file);
+@@ -1564,7 +1660,15 @@ int CDECL _fseeki64_nolock(FILE* file, __int64 offset, int whence)
+   }
+   /* Clear end of file flag */
+   file->_flag &= ~_IOEOF;
+-  ret = (_lseeki64(file->_file,offset,whence) == -1)?-1:0;
++  pos = _lseeki64(file->_file,offset,whence);
++  ret = (pos == -1)?-1:0;
++  if (ext)
++  {
++      ext->buf_valid = FALSE;
++      ext->pos_valid = (pos != -1);
++      ext->pos = pos;
++      ext->gen = fd_get_gen(file->_file);
++  }
+ 
+   return ret;
+ }
+@@ -3078,6 +3182,7 @@ int CDECL _read(int fd, void *buf, unsigned int count)
+         return -1;
+     }
+ 
++    fd_touch(fd);
+     info = get_ioinfo(fd);
+     num_read = read_i(fd, info, buf, count);
+     release_ioinfo(info);
+@@ -3446,6 +3551,7 @@ int CDECL _write(int fd, const void* buf, unsigned int count)
+     DWORD num_written, i;
+     BOOL console = FALSE;
+ 
++    fd_touch(fd);
+     if (hand == INVALID_HANDLE_VALUE || fd == MSVCRT_NO_CONSOLE_FD)
+     {
+         *_errno() = EBADF;
+@@ -3717,7 +3823,9 @@ int CDECL _filbuf(FILE* file)
+ 
+     if(!(file->_flag & (MSVCRT__NOBUF | _IOMYBUF | MSVCRT__USERBUF))) {
+         int r;
+-        if ((r = _read(file->_file,&c,1)) != 1) {
++        r = _read(file->_file,&c,1);
++        file_note_read(file, r, FALSE);
++        if (r != 1) {
+             file->_flag |= (r == 0) ? _IOEOF : _IOERR;
+             return EOF;
+         }
+@@ -3725,6 +3833,7 @@ int CDECL _filbuf(FILE* file)
+         return c;
+     } else {
+         file->_cnt = _read(file->_file, file->_base, file->_bufsiz);
++        file_note_read(file, file->_cnt, TRUE);
+         if(file->_cnt<=0) {
+             file->_flag |= (file->_cnt == 0) ? _IOEOF : _IOERR;
+             file->_cnt = 0;
+@@ -4326,6 +4435,7 @@ size_t CDECL _fread_nolock(void *ptr, size_t size, size_t nmemb, FILE* file)
+     int i;
+     if (!file->_cnt && rcnt<file->_bufsiz && (file->_flag & (_IOMYBUF | MSVCRT__USERBUF))) {
+       i = _read(file->_file, file->_base, file->_bufsiz);
++      file_note_read(file, i, TRUE);
+       file->_ptr = file->_base;
+       if (i != -1) {
+           file->_cnt = i;
+@@ -4343,10 +4453,13 @@ size_t CDECL _fread_nolock(void *ptr, size_t size, size_t nmemb, FILE* file)
+       }
+     } else if (rcnt > INT_MAX) {
+       i = _read(file->_file, ptr, INT_MAX);
++      file_note_read(file, i, FALSE);
+     } else if (rcnt < (file->_bufsiz ? file->_bufsiz : MSVCRT_INTERNAL_BUFSIZ)) {
+       i = _read(file->_file, ptr, rcnt);
++      file_note_read(file, i, FALSE);
+     } else {
+       i = _read(file->_file, ptr, rcnt - rcnt % (file->_bufsiz ? file->_bufsiz : MSVCRT_INTERNAL_BUFSIZ));
++      file_note_read(file, i, FALSE);
+     }
+     pread += i;
+     rcnt -= i;
+@@ -5739,6 +5852,7 @@ int CDECL _ungetc_nolock(int c, FILE * file)
+         file->_cnt++;
+         file->_flag &= ~(_IOERR | _IOEOF);
+         file->_flag |= _IOREAD;
++        if (file_get_ext(file)) file_get_ext(file)->buf_valid = FALSE;
+         return c;
+     }
+ 

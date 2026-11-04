@@ -1,0 +1,263 @@
+winex11: Pass the modifier keys to the drop target.
+
+The drop target always got MK_LBUTTON as its key state, so it could
+not tell a Ctrl or Shift drop from a plain one. XDND carries no
+modifiers, but the X server reports them for the window under the
+drag: with a drag from a Wayland client, Xwayland gives the drag
+target the keyboard state, so XQueryPointer has Shift, Control and
+Mod1 as the user holds them (checked against KWin 6.7).
+
+Read them at every XdndPosition and at XdndDrop and pass them through
+to DragEnter, DragOver and Drop. The button is not in the mask during
+a compositor-driven drag, so MK_LBUTTON is added while dragging and
+left out at the drop, as native ole32 does once the button is
+released. Drivers that pass no key state keep MK_LBUTTON.
+---
+ dlls/user32/clipboard.c    | 14 +++++++-------
+ dlls/user32/user_main.c    |  4 ++--
+ dlls/user32/user_private.h |  4 ++--
+ dlls/win32u/clipboard.c    |  3 ++-
+ dlls/winex11.drv/event.c   | 33 +++++++++++++++++++++++++++------
+ dlls/wow64win/user.c       |  4 ++++
+ include/ntuser.h           |  2 ++
+ 7 files changed, 46 insertions(+), 18 deletions(-)
+
+diff --git a/dlls/user32/clipboard.c b/dlls/user32/clipboard.c
+index da25686..5cd259a 100644
+--- a/dlls/user32/clipboard.c
++++ b/dlls/user32/clipboard.c
+@@ -1180,14 +1180,14 @@ void drag_drop_leave(void)
+     IDataObject_Release( &object->IDataObject_iface );
+ }
+ 
+-DWORD drag_drop_drag( HWND hwnd, POINT point, DWORD effect )
++DWORD drag_drop_drag( HWND hwnd, POINT point, DWORD effect, DWORD key_state )
+ {
+     int accept = 0; /* Assume we're not accepting */
+     POINTL pointl = {.x = point.x, .y = point.y};
+     struct data_object *object;
+     HRESULT hr;
+ 
+-    TRACE( "hwnd %p, point %s, effect %#lx\n", hwnd, wine_dbgstr_point(&point), effect );
++    TRACE( "hwnd %p, point %s, effect %#lx, key_state %#lx\n", hwnd, wine_dbgstr_point(&point), effect, key_state );
+ 
+     if (!(object = get_data_object( FALSE ))) return DROPEFFECT_NONE;
+     object->target_pos = point;
+@@ -1217,7 +1217,7 @@ DWORD drag_drop_drag( HWND hwnd, POINT point, DWORD effect )
+         {
+             DWORD effect_enter = effect;
+             hr = IDropTarget_DragEnter( object->drop_target, &object->IDataObject_iface,
+-                                        MK_LBUTTON, pointl, &effect_enter );
++                                        key_state, pointl, &effect_enter );
+             /* What DragEnter chose is the current effect until the next DragOver, as with
+              * native ole32. Ignoring it answered the source with the previous window's
+              * effect, or none: on KWin every such flip makes its Xwayland bridge resend a
+@@ -1238,7 +1238,7 @@ DWORD drag_drop_drag( HWND hwnd, POINT point, DWORD effect )
+     else if (object->drop_target)
+     {
+         DWORD effect_over = effect;
+-        hr = IDropTarget_DragOver( object->drop_target, MK_LBUTTON, pointl, &effect_over );
++        hr = IDropTarget_DragOver( object->drop_target, key_state, pointl, &effect_over );
+         /* the target may only choose among the effects the source allows */
+         if (hr == S_OK) object->target_effect = effect_over & effect;
+         else WARN( "IDropTarget_DragOver returned %#lx\n", hr );
+@@ -1267,14 +1267,14 @@ DWORD drag_drop_drag( HWND hwnd, POINT point, DWORD effect )
+     return effect;
+ }
+ 
+-DWORD drag_drop_drop( HWND hwnd )
++DWORD drag_drop_drop( HWND hwnd, DWORD key_state )
+ {
+     DWORD effect;
+     int accept = 0; /* Assume we're not accepting */
+     struct data_object *object;
+     BOOL drop_file = TRUE;
+ 
+-    TRACE( "hwnd %p\n", hwnd );
++    TRACE( "hwnd %p, key_state %#lx\n", hwnd, key_state );
+ 
+     if (!(object = get_data_object( TRUE ))) return DROPEFFECT_NONE;
+     effect = object->target_effect;
+@@ -1289,7 +1289,7 @@ DWORD drag_drop_drop( HWND hwnd )
+          * chosen last; the result is limited to them */
+         effect = object->allowed_effect ? object->allowed_effect : effect;
+         hr = IDropTarget_Drop( object->drop_target, &object->IDataObject_iface,
+-                               MK_LBUTTON, pointl, &effect );
++                               key_state, pointl, &effect );
+         if (object->allowed_effect) effect &= object->allowed_effect;
+         if (hr == S_OK)
+         {
+diff --git a/dlls/user32/user_main.c b/dlls/user32/user_main.c
+index ebd8373..b52f229 100644
+--- a/dlls/user32/user_main.c
++++ b/dlls/user32/user_main.c
+@@ -171,14 +171,14 @@ static NTSTATUS WINAPI User32DragDropLeave( void *args, ULONG size )
+ static NTSTATUS WINAPI User32DragDropDrag( void *args, ULONG size )
+ {
+     const struct drag_drop_drag_params *params = args;
+-    UINT effect = drag_drop_drag( params->hwnd, params->point, params->effect );
++    UINT effect = drag_drop_drag( params->hwnd, params->point, params->effect, params->key_state );
+     return NtCallbackReturn( &effect, sizeof(effect), STATUS_SUCCESS );
+ }
+ 
+ static NTSTATUS WINAPI User32DragDropDrop( void *args, ULONG size )
+ {
+     const struct drag_drop_drop_params *params = args;
+-    UINT effect = drag_drop_drop( params->hwnd );
++    UINT effect = drag_drop_drop( params->hwnd, params->key_state );
+     return NtCallbackReturn( &effect, sizeof(effect), STATUS_SUCCESS );
+ }
+ 
+diff --git a/dlls/user32/user_private.h b/dlls/user32/user_private.h
+index abb84b0..3e57500 100644
+--- a/dlls/user32/user_private.h
++++ b/dlls/user32/user_private.h
+@@ -52,8 +52,8 @@ extern void free_cached_data( UINT format, HANDLE handle );
+ extern HANDLE render_synthesized_format( UINT format, UINT from );
+ extern BOOL drag_drop_enter( UINT entries_size, const struct format_entry *entries );
+ extern void drag_drop_leave(void);
+-extern DWORD drag_drop_drag( HWND hwnd, POINT point, DWORD effect );
+-extern DWORD drag_drop_drop( HWND hwnd );
++extern DWORD drag_drop_drag( HWND hwnd, POINT point, DWORD effect, DWORD key_state );
++extern DWORD drag_drop_drop( HWND hwnd, DWORD key_state );
+ extern void drag_drop_post( HWND hwnd, UINT drop_size, const DROPFILES *drop );
+ extern void unpack_message( HWND hwnd, UINT message, WPARAM *wparam, LPARAM *lparam,
+                             void *buffer, BOOL ansi );
+diff --git a/dlls/win32u/clipboard.c b/dlls/win32u/clipboard.c
+index ec48cd0..e775865 100644
+--- a/dlls/win32u/clipboard.c
++++ b/dlls/win32u/clipboard.c
+@@ -763,6 +763,7 @@ LRESULT drag_drop_call( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam, void
+         {
+             .hwnd = hwnd,
+             .effect = lparam,
++            .key_state = data ? *(UINT *)data : MK_LBUTTON,
+         };
+ 
+         rect = map_rect_raw_to_virt( rect, get_thread_dpi() );
+@@ -775,7 +776,7 @@ LRESULT drag_drop_call( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam, void
+     }
+     case WINE_DRAG_DROP_DROP:
+     {
+-        struct drag_drop_drop_params params = {.hwnd = hwnd};
++        struct drag_drop_drop_params params = {.hwnd = hwnd, .key_state = data ? *(UINT *)data : MK_LBUTTON};
+         if (KeUserModeCallback( NtUserDragDropDrop, &params, sizeof(params), &ret_ptr, &ret_len ) || ret_len != sizeof(DWORD))
+             return DROPEFFECT_NONE;
+         return *(DWORD *)ret_ptr;
+diff --git a/dlls/winex11.drv/event.c b/dlls/winex11.drv/event.c
+index 37f549a..75baddc 100644
+--- a/dlls/winex11.drv/event.c
++++ b/dlls/winex11.drv/event.c
+@@ -1342,15 +1342,15 @@ static void drag_drop_leave(void)
+                        NtUserDragDropCall, FALSE );
+ }
+ 
+-static DWORD drag_drop_drag( HWND hwnd, POINT point, DWORD effect )
++static DWORD drag_drop_drag( HWND hwnd, POINT point, DWORD effect, UINT key_state )
+ {
+-    return NtUserMessageCall( hwnd, WINE_DRAG_DROP_DRAG, MAKELONG(point.x, point.y), effect, NULL,
++    return NtUserMessageCall( hwnd, WINE_DRAG_DROP_DRAG, MAKELONG(point.x, point.y), effect, &key_state,
+                               NtUserDragDropCall, FALSE );
+ }
+ 
+-static DWORD drag_drop_drop( HWND hwnd )
++static DWORD drag_drop_drop( HWND hwnd, UINT key_state )
+ {
+-    return NtUserMessageCall( hwnd, WINE_DRAG_DROP_DROP, 0, 0, NULL,
++    return NtUserMessageCall( hwnd, WINE_DRAG_DROP_DROP, 0, 0, &key_state,
+                               NtUserDragDropCall, FALSE );
+ }
+ 
+@@ -1595,6 +1595,27 @@ static long drop_effect_to_xdnd_action( UINT effect )
+ }
+ 
+ 
++/* The drop target's grfKeyState. XDND carries no modifiers, but the X server reports them
++ * for the window under the drag: with a Wayland source, Xwayland gives the drag target
++ * the keyboard state. The button is not in the mask during a compositor-driven drag, and
++ * an XDND drag is always a button drag, so it is added while dragging, and left out at the
++ * drop, as native ole32 does once the button is released. */
++static UINT xdnd_key_state( Display *display, BOOL dragging )
++{
++    Window root, child;
++    int root_x, root_y, x, y;
++    unsigned int mask;
++    UINT state = dragging ? MK_LBUTTON : 0;
++
++    if (!XQueryPointer( display, DefaultRootWindow( display ), &root, &child,
++                        &root_x, &root_y, &x, &y, &mask ))
++        return state;
++    if (mask & ShiftMask) state |= MK_SHIFT;
++    if (mask & (1 << 2) /* ControlMask, #undef in x11drv.h */) state |= MK_CONTROL;
++    if (mask & Mod1Mask) state |= 0x20 /* MK_ALT */;
++    return state;
++}
++
+ static void handle_xdnd_position_event( HWND hwnd, XClientMessageEvent *event )
+ {
+     XClientMessageEvent e;
+@@ -1628,7 +1649,7 @@ static void handle_xdnd_position_event( HWND hwnd, XClientMessageEvent *event )
+     }
+     point = root_to_virtual_screen( x, y );
+     effect = xdnd_action_to_drop_effect( event->data.l[4] );
+-    effect = drag_drop_drag( hwnd, point, effect );
++    effect = drag_drop_drag( hwnd, point, effect, xdnd_key_state( event->display, TRUE ) );
+ 
+     TRACE( "actionRequested(%ld) chosen(0x%x) at x(%d),y(%d)\n",
+            event->data.l[4], effect, point.x, point.y );
+@@ -1657,7 +1678,7 @@ static void handle_xdnd_drop_event( HWND hwnd, XClientMessageEvent *event )
+     UINT effect;
+ 
+     xdnd_target = 0;
+-    effect = drag_drop_drop( hwnd );
++    effect = drag_drop_drop( hwnd, xdnd_key_state( event->display, FALSE ) );
+ 
+     /* Tell the target we are finished. */
+     memset( &e, 0, sizeof(e) );
+diff --git a/dlls/wow64win/user.c b/dlls/wow64win/user.c
+index 92c1877..bab5563 100644
+--- a/dlls/wow64win/user.c
++++ b/dlls/wow64win/user.c
+@@ -1477,10 +1477,12 @@ static NTSTATUS WINAPI wow64_NtUserDragDropDrag( void *arg, ULONG size )
+         ULONG hwnd;
+         POINT point;
+         UINT effect;
++        UINT key_state;
+     } params32;
+     params32.hwnd = HandleToUlong( params->hwnd );
+     params32.point = params->point;
+     params32.effect = params->effect;
++    params32.key_state = params->key_state;
+     return dispatch_callback( NtUserDragDropDrag, &params32, sizeof(params32) );
+ }
+ 
+@@ -1490,8 +1492,10 @@ static NTSTATUS WINAPI wow64_NtUserDragDropDrop( void *arg, ULONG size )
+     struct
+     {
+         ULONG hwnd;
++        UINT key_state;
+     } params32;
+     params32.hwnd = HandleToUlong( params->hwnd );
++    params32.key_state = params->key_state;
+     return dispatch_callback( NtUserDragDropDrop, &params32, sizeof(params32) );
+ }
+ 
+diff --git a/include/ntuser.h b/include/ntuser.h
+index 99ecce4..45c3cce 100644
+--- a/include/ntuser.h
++++ b/include/ntuser.h
+@@ -335,12 +335,14 @@ struct drag_drop_drag_params
+     HWND hwnd;
+     POINT point;
+     UINT effect;
++    UINT key_state;
+ };
+ 
+ /* NtUserDragDropDrop params */
+ struct drag_drop_drop_params
+ {
+     HWND hwnd;
++    UINT key_state;
+ };
+ 
+ /* NtUserDragDropPost params */

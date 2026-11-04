@@ -1,0 +1,1045 @@
+d2d1: Cache path geometry Close() results and cut its quadratic work.
+
+ID2D1GeometrySink::Close() resolves self-intersections, splits overlapping
+bezier control triangles and triangulates the fill, eagerly, and each step
+tests every segment against every other. Affinity 3 draws its ruler labels
+as about a thousand small path geometries (~70 points each, nearly all
+beziers) and closes each one afresh on every canvas redraw. On its UI thread
+that cost about 0.4 s per redraw, and scrolling kept the thread saturated.
+
+- Cache Close() results, keyed on a full copy of what Close() reads: the fill
+  mode and, per figure, the vertices, their types, the bezier controls, the
+  bounds and the flags. A geometry whose input matches byte for byte gets a
+  copy of the stored figures and fill data. LRU, 24 MiB; geometries under 8
+  vertices are not cached.
+- Skip segment pairs whose boxes are apart: in d2d_geometry_intersect_self()
+  (boxes computed once), and in d2d_geometry_resolve_beziers() (pairs walked
+  over a list of the bezier segments and their boxes, rebuilt after each
+  split). The margin scales with the geometry's extent, so float rounding in
+  the pair tests cannot bridge it.
+- Bucket the polygon edges by y for the inside tests of the triangulation's
+  faces and of the bezier sign pass; a probe tests only the edges whose y
+  range can contain it, with the same test and the same sum.
+- Filter the in-circle test in double precision before the adaptive float
+  test. The vertices are floats, so exact as doubles, and a conclusive result
+  under Shewchuk's error bound is the exact sign. Not used on i386, where the
+  triangulation runs with the x87 precision set to 24 bits.
+
+Each change gives the same result as before: the cache returns what the
+computation would, and the filters skip only work that cannot change the
+outcome. The d2d1 conformance tests give identical output with and without
+the patch (17379 tests, 0 failures, the same todos and the same figure
+differences in them). In Affinity, a build that recomputed every cache hit
+and compared found 8000+ hits identical, none different.
+
+Affinity 3.3, a 48 MP image with a live Gaussian blur, on the UI thread:
+moving the layer 457 -> 190 ms of CPU per move; twenty scroll steps
+3.1 -> 0.8 s. A path not in the cache closes in about 150 us instead of 440.
+
+diff --git a/dlls/d2d1/geometry.c b/dlls/d2d1/geometry.c
+index a161e34..9f4e1ef 100644
+--- a/dlls/d2d1/geometry.c
++++ b/dlls/d2d1/geometry.c
+@@ -250,6 +250,22 @@ struct d2d_cdt_edge
+     unsigned int flags;
+ };
+ 
++struct d2d_probe_edge
++{
++    D2D1_POINT_2F p0, p1;
++    const D2D1_RECT_F *bounds;
++};
++
++/* The figures' polygon edges, bucketed by y. A probe needs only the edges
++ * whose y range can contain it; see d2d_probe_edges_point_inside(). */
++struct d2d_probe_edges
++{
++    float top, scale;
++    size_t bucket_count;
++    size_t *starts;
++    struct d2d_probe_edge *edges;
++};
++
+ struct d2d_cdt
+ {
+     struct d2d_cdt_edge *edges;
+@@ -258,6 +274,7 @@ struct d2d_cdt
+     size_t free_edge;
+ 
+     const D2D1_POINT_2F *vertices;
++    const struct d2d_probe_edges *probe_edges;
+ };
+ 
+ struct d2d_geometry_intersection
+@@ -901,6 +918,24 @@ static BOOL d2d_rect_check_overlap(const D2D_RECT_F *p, const D2D_RECT_F *q)
+     return p->left < q->right && p->top < q->bottom && p->right > q->left && p->bottom > q->top;
+ }
+ 
++static void d2d_rect_set_points(D2D_RECT_F *r, const D2D1_POINT_2F *p0, const D2D1_POINT_2F *p1,
++        const D2D1_POINT_2F *p2)
++{
++    r->left = min(min(p0->x, p1->x), p2->x);
++    r->top = min(min(p0->y, p1->y), p2->y);
++    r->right = max(max(p0->x, p1->x), p2->x);
++    r->bottom = max(max(p0->y, p1->y), p2->y);
++}
++
++/* TRUE when the boxes are further apart than "margin". The pair tests below
++ * are skipped only for such boxes; boxes that touch or nearly touch are
++ * still tested. */
++static BOOL d2d_rect_apart(const D2D_RECT_F *p, const D2D_RECT_F *q, float margin)
++{
++    return p->right + margin < q->left || q->right + margin < p->left
++            || p->bottom + margin < q->top || q->bottom + margin < p->top;
++}
++
+ static void d2d_rect_get_bezier_bounds(D2D_RECT_F *bounds, const D2D1_POINT_2F *p0,
+         const D2D1_POINT_2F *p1, const D2D1_POINT_2F *p2)
+ {
+@@ -1783,7 +1818,7 @@ static void d2d_cdt_incircle_refine2(struct d2d_fp_fin *fin, const struct d2d_fp
+  * This implementation is based on the paper "Adaptive Precision
+  * Floating-Point Arithmetic and Fast Robust Geometric Predicates" and
+  * associated (Public Domain) code by Jonathan Richard Shewchuk. */
+-static BOOL d2d_cdt_incircle(const struct d2d_cdt *cdt, size_t a, size_t b, size_t c, size_t d)
++static BOOL DECLSPEC_NOINLINE d2d_cdt_incircle_adapt(const struct d2d_cdt *cdt, size_t a, size_t b, size_t c, size_t d)
+ {
+     static const float err_bound_result = (3.0f + 8.0f * D2D_FP_EPS) * D2D_FP_EPS;
+     static const float err_bound_a = (10.0f + 96.0f * D2D_FP_EPS) * D2D_FP_EPS;
+@@ -1912,6 +1947,52 @@ static BOOL d2d_cdt_incircle(const struct d2d_cdt *cdt, size_t a, size_t b, size
+     return fin.now[fin.length - 1] > 0.0f;
+ }
+ 
++/* The in-circle test, first in double precision. The vertices are floats, so
++ * they are exact as doubles, and with Shewchuk's first-stage error bound for
++ * doubles a conclusive result is the exact sign, the same one the adaptive
++ * float test arrives at. That test, with its large stack frame and its
++ * exact stages, is needed only when this one is inconclusive; points spaced
++ * closely along a curve are nearly cocircular, and are often too close for
++ * the float filter but rarely for this one. Not used on i386, where the
++ * triangulation runs with the x87 precision set to 24 bits. */
++static BOOL d2d_cdt_incircle(const struct d2d_cdt *cdt, size_t a, size_t b, size_t c, size_t d)
++{
++#ifndef __i386__
++    static const double eps = 1.0 / (1ull << DBL_MANT_DIG);
++    const double err_bound_a = (10.0 + 96.0 * eps) * eps;
++    double dax, day, dbx, dby, dcx, dcy, daz, dbz, dcz;
++    double dbxdcy, dbydcx, dcxday, dcydax, daxdby, daydbx;
++    const D2D1_POINT_2F *p = cdt->vertices;
++    double permanent, det;
++
++    dax = (double)p[a].x - p[d].x;
++    day = (double)p[a].y - p[d].y;
++    dbx = (double)p[b].x - p[d].x;
++    dby = (double)p[b].y - p[d].y;
++    dcx = (double)p[c].x - p[d].x;
++    dcy = (double)p[c].y - p[d].y;
++
++    daz = dax * dax + day * day;
++    dbz = dbx * dbx + dby * dby;
++    dcz = dcx * dcx + dcy * dcy;
++    dbxdcy = dbx * dcy;
++    dbydcx = dby * dcx;
++    dcxday = dcx * day;
++    dcydax = dcy * dax;
++    daxdby = dax * dby;
++    daydbx = day * dbx;
++
++    det = daz * (dbxdcy - dbydcx) + dbz * (dcxday - dcydax) + dcz * (daxdby - daydbx);
++    permanent = daz * (fabs(dbxdcy) + fabs(dbydcx))
++            + dbz * (fabs(dcxday) + fabs(dcydax))
++            + dcz * (fabs(daxdby) + fabs(daydbx));
++    if (det > err_bound_a * permanent || -det > err_bound_a * permanent)
++        return det > 0.0;
++#endif
++
++    return d2d_cdt_incircle_adapt(cdt, a, b, c, d);
++}
++
+ static void d2d_cdt_splice(const struct d2d_cdt *cdt, const struct d2d_cdt_edge_ref *a,
+         const struct d2d_cdt_edge_ref *b)
+ {
+@@ -2232,6 +2313,151 @@ static BOOL d2d_path_geometry_point_inside(const struct d2d_geometry *geometry,
+     return geometry->u.path.fill_mode == D2D1_FILL_MODE_ALTERNATE ? score & 1 : score;
+ }
+ 
++static size_t d2d_probe_edges_bucket(const struct d2d_probe_edges *pe, float y)
++{
++    float f = (y - pe->top) * pe->scale;
++
++    if (!(f > 0.0f))
++        return 0;
++    if (f >= pe->bucket_count)
++        return pe->bucket_count - 1;
++    return f;
++}
++
++/* The last vertex d2d_path_geometry_point_inside() uses in a figure. */
++static size_t d2d_probe_edges_last(const struct d2d_figure *figure, BOOL triangles_only)
++{
++    size_t last = figure->vertex_count - 1;
++
++    if (!triangles_only)
++    {
++        while (last && figure->vertex_types[last] == D2D_VERTEX_TYPE_NONE)
++            --last;
++    }
++    return last;
++}
++
++/* The polygon edges d2d_path_geometry_point_inside() walks: in each figure,
++ * every vertex it uses joined to the next, and the last to the first. */
++#define D2D_FOR_EACH_PROBE_EDGE(geometry, triangles_only, figure, p0, p1, i, j, last) \
++    for (i = 0; i < (geometry)->u.path.figure_count; ++i) \
++        for (figure = &(geometry)->u.path.figures[i], \
++                last = figure->vertex_count ? d2d_probe_edges_last(figure, triangles_only) : 0, \
++                p0 = figure->vertex_count ? &figure->vertices[last] : NULL, j = 0; \
++                figure->vertex_count && j <= last; ++j) \
++            if ((triangles_only || figure->vertex_types[j] != D2D_VERTEX_TYPE_NONE) \
++                    && (p1 = &figure->vertices[j]))
++
++static void d2d_probe_edge_set(struct d2d_probe_edge *e, const D2D1_POINT_2F *p0, const D2D1_POINT_2F *p1,
++        const D2D1_RECT_F *bounds)
++{
++    e->p0 = *p0;
++    e->p1 = *p1;
++    e->bounds = bounds;
++}
++
++/* Edges are copied; bounds are read through the figure, as they are by
++ * d2d_path_geometry_point_inside(). The structure stays valid while the
++ * figures array is not reallocated and no vertex the walk uses changes:
++ * inserting D2D_VERTEX_TYPE_NONE vertices is fine when "triangles_only" is
++ * not set. */
++static BOOL d2d_probe_edges_init(struct d2d_probe_edges *pe, const struct d2d_geometry *geometry,
++        BOOL triangles_only)
++{
++    float top = FLT_MAX, bottom = -FLT_MAX;
++    const D2D1_POINT_2F *p0, *p1;
++    const struct d2d_figure *figure;
++    size_t i, j, b, last, edge_count = 0;
++    struct d2d_probe_edge *e;
++
++    memset(pe, 0, sizeof(*pe));
++    D2D_FOR_EACH_PROBE_EDGE(geometry, triangles_only, figure, p0, p1, i, j, last)
++    {
++        top = min(top, p1->y);
++        bottom = max(bottom, p1->y);
++        ++edge_count;
++        p0 = p1;
++    }
++    if (!edge_count)
++        return FALSE;
++
++    pe->bucket_count = min(edge_count, 4096);
++    pe->top = top;
++    pe->scale = bottom > top ? pe->bucket_count / (bottom - top) : 0.0f;
++    if (!(pe->starts = calloc(pe->bucket_count + 1, sizeof(*pe->starts))))
++        return FALSE;
++
++    D2D_FOR_EACH_PROBE_EDGE(geometry, triangles_only, figure, p0, p1, i, j, last)
++    {
++        for (b = d2d_probe_edges_bucket(pe, min(p0->y, p1->y)); b <= d2d_probe_edges_bucket(pe, max(p0->y, p1->y)); ++b)
++            ++pe->starts[b + 1];
++        p0 = p1;
++    }
++    for (b = 0; b < pe->bucket_count; ++b)
++        pe->starts[b + 1] += pe->starts[b];
++
++    if (!(pe->edges = malloc(max(pe->starts[pe->bucket_count], 1) * sizeof(*pe->edges))))
++    {
++        free(pe->starts);
++        return FALSE;
++    }
++    D2D_FOR_EACH_PROBE_EDGE(geometry, triangles_only, figure, p0, p1, i, j, last)
++    {
++        for (b = d2d_probe_edges_bucket(pe, min(p0->y, p1->y)); b <= d2d_probe_edges_bucket(pe, max(p0->y, p1->y)); ++b)
++        {
++            e = &pe->edges[pe->starts[b]++];
++            d2d_probe_edge_set(e, p0, p1, &figure->bounds);
++        }
++        p0 = p1;
++    }
++    /* The fill pass advanced each start to the next bucket's start. */
++    memmove(&pe->starts[1], &pe->starts[0], pe->bucket_count * sizeof(*pe->starts));
++    pe->starts[0] = 0;
++
++    return TRUE;
++}
++
++static void d2d_probe_edges_cleanup(struct d2d_probe_edges *pe)
++{
++    free(pe->starts);
++    free(pe->edges);
++}
++
++/* Same as d2d_path_geometry_point_inside() with the "triangles_only" the
++ * edges were collected for. An edge can only count when the probe's y lies
++ * within the edge's y range, and the probe's bucket holds every such edge;
++ * the test and the score are the same, and the score is a sum, so the order
++ * of the edges does not matter. */
++static BOOL d2d_probe_edges_point_inside(const struct d2d_probe_edges *pe,
++        const struct d2d_geometry *geometry, const D2D1_POINT_2F *probe)
++{
++    const struct d2d_probe_edge *e, *end;
++    D2D1_POINT_2F v_p, v_probe;
++    unsigned int score = 0;
++    size_t b;
++
++    b = d2d_probe_edges_bucket(pe, probe->y);
++    for (e = &pe->edges[pe->starts[b]], end = &pe->edges[pe->starts[b + 1]]; e < end; ++e)
++    {
++        if (probe->x < e->bounds->left || probe->x > e->bounds->right
++                || probe->y < e->bounds->top || probe->y > e->bounds->bottom)
++            continue;
++
++        d2d_point_subtract(&v_p, &e->p1, &e->p0);
++        d2d_point_subtract(&v_probe, probe, &e->p0);
++
++        if ((probe->y < e->p0.y) != (probe->y < e->p1.y) && v_probe.x < v_p.x * (v_probe.y / v_p.y))
++        {
++            if (geometry->u.path.fill_mode == D2D1_FILL_MODE_ALTERNATE || (probe->y < e->p0.y))
++                ++score;
++            else
++                --score;
++        }
++    }
++
++    return geometry->u.path.fill_mode == D2D1_FILL_MODE_ALTERNATE ? score & 1 : score;
++}
++
+ static BOOL d2d_path_geometry_add_fill_face(struct d2d_geometry *geometry, const struct d2d_cdt *cdt,
+         const struct d2d_cdt_edge_ref *base_edge)
+ {
+@@ -2272,7 +2498,9 @@ static BOOL d2d_path_geometry_add_fill_face(struct d2d_geometry *geometry, const
+     probe.x += cdt->vertices[d2d_cdt_edge_origin(cdt, &tmp)].x * 0.50f;
+     probe.y += cdt->vertices[d2d_cdt_edge_origin(cdt, &tmp)].y * 0.50f;
+ 
+-    if (d2d_cdt_leftof(cdt, face->v[2], base_edge) && d2d_path_geometry_point_inside(geometry, &probe, TRUE))
++    if (d2d_cdt_leftof(cdt, face->v[2], base_edge) && (cdt->probe_edges
++            ? d2d_probe_edges_point_inside(cdt->probe_edges, geometry, &probe)
++            : d2d_path_geometry_point_inside(geometry, &probe, TRUE)))
+         ++geometry->fill.face_count;
+ 
+     return TRUE;
+@@ -2815,6 +3043,44 @@ static BOOL d2d_geometry_apply_intersections(struct d2d_geometry *geometry,
+     return TRUE;
+ }
+ 
++/* Box around a segment: its control triangle for a bezier, its end points
++ * for a line (the closing line of a figure wraps to vertex 0). */
++static void d2d_geometry_get_segment_box(const struct d2d_geometry *geometry,
++        const struct d2d_segment_idx *idx, BOOL bezier, D2D_RECT_F *box)
++{
++    const struct d2d_figure *figure = &geometry->u.path.figures[idx->figure_idx];
++    size_t next = idx->vertex_idx + 1;
++
++    if (bezier)
++        d2d_rect_set_points(box, &figure->vertices[idx->vertex_idx],
++                &figure->bezier_controls[idx->control_idx], &figure->vertices[next]);
++    else
++        d2d_rect_set_points(box, &figure->vertices[idx->vertex_idx],
++                &figure->vertices[next == figure->vertex_count ? 0 : next], &figure->vertices[idx->vertex_idx]);
++}
++
++/* A distance that float rounding in the pair tests cannot bridge: boxes
++ * further apart than this hold segments that neither intersect nor overlap.
++ * Splitting beziers only adds points inside their control triangles, so the
++ * margin stays valid while the figures are being resolved. */
++static float d2d_geometry_get_box_margin(const struct d2d_geometry *geometry)
++{
++    const struct d2d_figure *figure;
++    float extent = 1.0f;
++    size_t i, j;
++
++    for (i = 0; i < geometry->u.path.figure_count; ++i)
++    {
++        figure = &geometry->u.path.figures[i];
++        for (j = 0; j < figure->vertex_count; ++j)
++            extent = max(extent, max(fabsf(figure->vertices[j].x), fabsf(figure->vertices[j].y)));
++        for (j = 0; j < figure->bezier_control_count; ++j)
++            extent = max(extent, max(fabsf(figure->bezier_controls[j].x), fabsf(figure->bezier_controls[j].y)));
++    }
++
++    return extent * 1e-5f;
++}
++
+ /* Intersect the geometry's segments with themselves. This uses the
+  * straightforward approach of testing everything against everything, but
+  * there certainly exist more scalable algorithms for this. */
+@@ -2824,12 +3090,29 @@ static BOOL d2d_geometry_intersect_self(struct d2d_geometry *geometry)
+     const struct d2d_figure *figure_p, *figure_q;
+     struct d2d_segment_idx idx_p, idx_q;
+     enum d2d_vertex_type type_p, type_q;
++    size_t max_q, *box_offsets, box_count, i;
++    const D2D_RECT_F *box_p;
++    D2D_RECT_F *boxes;
+     BOOL ret = FALSE;
+-    size_t max_q;
++    float margin;
+ 
+     if (!geometry->u.path.figure_count)
+         return TRUE;
+ 
++    /* The figures don't change until the intersections are applied, after
++     * the loop, so each segment's box is computed once. */
++    if (!(box_offsets = malloc(geometry->u.path.figure_count * sizeof(*box_offsets))))
++        return FALSE;
++    for (i = 0, box_count = 0; i < geometry->u.path.figure_count; ++i)
++    {
++        box_offsets[i] = box_count;
++        box_count += geometry->u.path.figures[i].vertex_count;
++    }
++    if (!(boxes = malloc(max(box_count, 1) * sizeof(*boxes))))
++    {
++        free(box_offsets);
++        return FALSE;
++    }
+     for (idx_p.figure_idx = 0; idx_p.figure_idx < geometry->u.path.figure_count; ++idx_p.figure_idx)
+     {
+         figure_p = &geometry->u.path.figures[idx_p.figure_idx];
+@@ -2838,6 +3121,23 @@ static BOOL d2d_geometry_intersect_self(struct d2d_geometry *geometry)
+         {
+             if ((type_p = figure_p->vertex_types[idx_p.vertex_idx]) == D2D_VERTEX_TYPE_END)
+                 continue;
++            d2d_geometry_get_segment_box(geometry, &idx_p, d2d_vertex_type_is_bezier(type_p),
++                    &boxes[box_offsets[idx_p.figure_idx] + idx_p.vertex_idx]);
++            if (d2d_vertex_type_is_bezier(type_p))
++                ++idx_p.control_idx;
++        }
++    }
++    margin = d2d_geometry_get_box_margin(geometry);
++
++    for (idx_p.figure_idx = 0; idx_p.figure_idx < geometry->u.path.figure_count; ++idx_p.figure_idx)
++    {
++        figure_p = &geometry->u.path.figures[idx_p.figure_idx];
++        idx_p.control_idx = 0;
++        for (idx_p.vertex_idx = 0; idx_p.vertex_idx < figure_p->vertex_count; ++idx_p.vertex_idx)
++        {
++            if ((type_p = figure_p->vertex_types[idx_p.vertex_idx]) == D2D_VERTEX_TYPE_END)
++                continue;
++            box_p = &boxes[box_offsets[idx_p.figure_idx] + idx_p.vertex_idx];
+ 
+             for (idx_q.figure_idx = 0; idx_q.figure_idx <= idx_p.figure_idx; ++idx_q.figure_idx)
+             {
+@@ -2859,6 +3159,12 @@ static BOOL d2d_geometry_intersect_self(struct d2d_geometry *geometry)
+                 for (idx_q.vertex_idx = 0; idx_q.vertex_idx < max_q; ++idx_q.vertex_idx)
+                 {
+                     type_q = figure_q->vertex_types[idx_q.vertex_idx];
++                    if (d2d_rect_apart(box_p, &boxes[box_offsets[idx_q.figure_idx] + idx_q.vertex_idx], margin))
++                    {
++                        if (d2d_vertex_type_is_bezier(type_q))
++                            ++idx_q.control_idx;
++                        continue;
++                    }
+                     if (d2d_vertex_type_is_bezier(type_q))
+                     {
+                         if (d2d_vertex_type_is_bezier(type_p))
+@@ -2900,11 +3206,14 @@ static BOOL d2d_geometry_intersect_self(struct d2d_geometry *geometry)
+ 
+ done:
+     free(intersections.intersections);
++    free(boxes);
++    free(box_offsets);
+     return ret;
+ }
+ 
+ static HRESULT d2d_path_geometry_triangulate(struct d2d_geometry *geometry)
+ {
++    struct d2d_probe_edges probe_edges;
+     struct d2d_cdt_edge_ref left_edge, right_edge;
+     size_t vertex_count, i, j;
+     struct d2d_cdt cdt = {0};
+@@ -2976,13 +3285,19 @@ static HRESULT d2d_path_geometry_triangulate(struct d2d_geometry *geometry)
+     mask = 0;
+ #endif
+ 
++    if (d2d_probe_edges_init(&probe_edges, geometry, TRUE))
++        cdt.probe_edges = &probe_edges;
+     if (!d2d_cdt_generate_faces(&cdt, geometry))
+         goto fail;
+ 
++    if (cdt.probe_edges)
++        d2d_probe_edges_cleanup(&probe_edges);
+     free(cdt.edges);
+     return S_OK;
+ 
+ fail:
++    if (cdt.probe_edges)
++        d2d_probe_edges_cleanup(&probe_edges);
+     geometry->fill.vertices = NULL;
+     geometry->fill.vertex_count = 0;
+     free(vertices);
+@@ -3738,8 +4053,60 @@ static BOOL d2d_geometry_split_bezier(struct d2d_geometry *geometry, const struc
+     return TRUE;
+ }
+ 
++static BOOL d2d_geometry_bezier_triangles_apart(const struct d2d_geometry *geometry,
++        const struct d2d_segment_idx *idx_p, const struct d2d_segment_idx *idx_q, float margin)
++{
++    D2D_RECT_F box_p, box_q;
++
++    d2d_geometry_get_segment_box(geometry, idx_p, TRUE, &box_p);
++    d2d_geometry_get_segment_box(geometry, idx_q, TRUE, &box_q);
++    return d2d_rect_apart(&box_p, &box_q, margin);
++}
++
++struct d2d_bezier_ref
++{
++    struct d2d_segment_idx idx;
++    D2D_RECT_F box;
++};
++
++/* Lists the bezier segments in the order d2d_geometry_get_next_bezier_segment_idx()
++ * visits them, with their control triangles' boxes. */
++static size_t d2d_geometry_list_beziers(struct d2d_geometry *geometry, struct d2d_bezier_ref *list)
++{
++    struct d2d_segment_idx idx;
++    size_t count = 0;
++
++    if (!d2d_geometry_get_first_bezier_segment_idx(geometry, &idx))
++        return 0;
++    do
++    {
++        list[count].idx = idx;
++        d2d_geometry_get_segment_box(geometry, &idx, TRUE, &list[count].box);
++        ++count;
++    } while (d2d_geometry_get_next_bezier_segment_idx(geometry, &idx));
++
++    return count;
++}
++
++static size_t d2d_bezier_list_find(const struct d2d_bezier_ref *list, size_t count, const struct d2d_segment_idx *idx)
++{
++    size_t i;
++
++    for (i = 0; i < count; ++i)
++    {
++        if (list[i].idx.figure_idx == idx->figure_idx && list[i].idx.vertex_idx == idx->vertex_idx)
++            break;
++    }
++    return i;
++}
++
+ static HRESULT d2d_geometry_resolve_beziers(struct d2d_geometry *geometry)
+ {
++    float margin = d2d_geometry_get_box_margin(geometry);
++    struct d2d_probe_edges probe_edges;
++    struct d2d_bezier_ref *list;
++    size_t list_count, pi, qi;
++    BOOL have_probe_edges;
+     struct d2d_segment_idx idx_p, idx_q;
+     struct d2d_curve_vertex *b;
+     const D2D1_POINT_2F *p[3];
+@@ -3749,6 +4116,13 @@ static HRESULT d2d_geometry_resolve_beziers(struct d2d_geometry *geometry)
+     if (!d2d_geometry_get_first_bezier_segment_idx(geometry, &idx_p))
+         return S_OK;
+ 
++    for (i = 0, list_count = 0; i < geometry->u.path.figure_count; ++i)
++        list_count += geometry->u.path.figures[i].bezier_control_count;
++    /* Each split adds one segment, and there are at most 512. */
++    if (!(list = malloc((list_count + 512) * sizeof(*list))))
++        return E_OUTOFMEMORY;
++    list_count = d2d_geometry_list_beziers(geometry, list);
++
+     /* Split overlapping bezier control triangles.
+      * A global split budget prevents runaway splitting for pathological
+      * geometries (e.g. nearly-identical overlapping beziers) where the outer
+@@ -3756,23 +4130,39 @@ static HRESULT d2d_geometry_resolve_beziers(struct d2d_geometry *geometry)
+      * segments.  Once the budget is spent, no new segments are created, the
+      * total bezier count is bounded, and the outer loop terminates.  A
+      * secondary per-pair cap prevents any single pair from monopolising the
+-     * global budget at the expense of other pairs. */
++     * global budget at the expense of other pairs.
++     *
++     * Every bezier is checked against each one before it. Pairs whose boxes
++     * are apart cannot overlap and are passed over; the list is rebuilt
++     * whenever a split changes the segments, and the walk resumes from the
++     * same pair. */
+     {
+         unsigned int total_splits = 0;
+-        while (d2d_geometry_get_next_bezier_segment_idx(geometry, &idx_p))
++        for (pi = 1; pi < list_count; ++pi)
+         {
+-            d2d_geometry_get_first_bezier_segment_idx(geometry, &idx_q);
+-            while (idx_q.figure_idx < idx_p.figure_idx || idx_q.vertex_idx < idx_p.vertex_idx)
++            for (qi = 0; qi < pi; ++qi)
+             {
+                 unsigned int pair_splits = 0;
++                BOOL split = FALSE;
++
++                if (d2d_rect_apart(&list[pi].box, &list[qi].box, margin))
++                    continue;
++
++                idx_p = list[pi].idx;
++                idx_q = list[qi].idx;
+                 while (total_splits < 512 && pair_splits++ < 16
++                        && !d2d_geometry_bezier_triangles_apart(geometry, &idx_p, &idx_q, margin)
+                         && d2d_geometry_check_bezier_overlap(geometry, &idx_p, &idx_q))
+                 {
+                     ++total_splits;
++                    split = TRUE;
+                     if (fabsf(d2d_geometry_bezier_ccw(geometry, &idx_q)) > fabsf(d2d_geometry_bezier_ccw(geometry, &idx_p)))
+                     {
+                         if (!d2d_geometry_split_bezier(geometry, &idx_q))
++                        {
++                            free(list);
+                             return E_OUTOFMEMORY;
++                        }
+                         if (idx_p.figure_idx == idx_q.figure_idx)
+                         {
+                             ++idx_p.vertex_idx;
+@@ -3782,13 +4172,22 @@ static HRESULT d2d_geometry_resolve_beziers(struct d2d_geometry *geometry)
+                     else
+                     {
+                         if (!d2d_geometry_split_bezier(geometry, &idx_p))
++                        {
++                            free(list);
+                             return E_OUTOFMEMORY;
++                        }
+                     }
+                 }
+-                d2d_geometry_get_next_bezier_segment_idx(geometry, &idx_q);
++                if (split)
++                {
++                    list_count = d2d_geometry_list_beziers(geometry, list);
++                    pi = d2d_bezier_list_find(list, list_count, &idx_p);
++                    qi = d2d_bezier_list_find(list, list_count, &idx_q);
++                }
+             }
+         }
+     }
++    free(list);
+ 
+     for (i = 0; i < geometry->u.path.figure_count; ++i)
+     {
+@@ -3805,6 +4204,9 @@ static HRESULT d2d_geometry_resolve_beziers(struct d2d_geometry *geometry)
+         return E_OUTOFMEMORY;
+     }
+ 
++    /* Inserting control points below adds only D2D_VERTEX_TYPE_NONE vertices,
++     * which the probe edges do not use. */
++    have_probe_edges = d2d_probe_edges_init(&probe_edges, geometry, FALSE);
+     bezier_idx = 0;
+     d2d_geometry_get_first_bezier_segment_idx(geometry, &idx_p);
+     for (;;)
+@@ -3816,7 +4218,8 @@ static HRESULT d2d_geometry_resolve_beziers(struct d2d_geometry *geometry)
+         p[1] = &figure->bezier_controls[idx_p.control_idx];
+ 
+         i = idx_p.vertex_idx + 1;
+-        if (d2d_path_geometry_point_inside(geometry, p[1], FALSE))
++        if (have_probe_edges ? d2d_probe_edges_point_inside(&probe_edges, geometry, p[1])
++                : d2d_path_geometry_point_inside(geometry, p[1], FALSE))
+         {
+             sign = 1.0f;
+             d2d_figure_insert_vertex(figure, i, *p[1]);
+@@ -3839,13 +4242,377 @@ static HRESULT d2d_geometry_resolve_beziers(struct d2d_geometry *geometry)
+         ++bezier_idx;
+     }
+ 
++    if (have_probe_edges)
++        d2d_probe_edges_cleanup(&probe_edges);
+     return S_OK;
+ }
+ 
++/* Close() result cache.
++ *
++ * Close() resolves self-intersections, splits overlapping beziers and
++ * triangulates the fill, all eagerly and all at least quadratic in the
++ * segment count. Applications that rebuild the same geometries for every
++ * frame pay that again each time; text drawn as paths, a thousand small
++ * curved figures per redraw, costs a large part of a second.
++ *
++ * Close() is a function of the fill mode and the figures alone, so its
++ * result is kept, keyed on a full copy of that input. A geometry whose input
++ * matches byte for byte gets an exact copy of the stored figures and fill
++ * data, the same state the computation would have produced. */
++
++#define D2D_CLOSE_CACHE_MIN_VERTICES 8
++#define D2D_CLOSE_CACHE_BUCKETS 1024
++#define D2D_CLOSE_CACHE_MAX_BYTES (24u << 20)
++
++struct d2d_close_cache_figure
++{
++    D2D1_POINT_2F *vertices;
++    enum d2d_vertex_type *vertex_types;
++    size_t vertex_count;
++    D2D1_POINT_2F *bezier_controls;
++    size_t bezier_control_count;
++    D2D1_RECT_F bounds;
++    unsigned int flags;
++};
++
++struct d2d_close_cache_entry
++{
++    struct list lru_entry;
++    struct list bucket_entry;
++    UINT64 hash;
++    size_t bytes;
++
++    unsigned char *key;
++    size_t key_size;
++
++    struct d2d_close_cache_figure *figures;
++    size_t figure_count;
++    D2D1_POINT_2F *fill_vertices;
++    size_t fill_vertex_count;
++    struct d2d_face *faces;
++    size_t face_count;
++    struct d2d_curve_vertex *bezier_vertices;
++    size_t bezier_vertex_count;
++};
++
++static struct
++{
++    SRWLOCK lock;
++    struct list lru;
++    struct list buckets[D2D_CLOSE_CACHE_BUCKETS];
++    BOOL initialised;
++    size_t bytes;
++} d2d_close_cache = {SRWLOCK_INIT, LIST_INIT(d2d_close_cache.lru)};
++
++static void *d2d_memdup(const void *src, size_t size)
++{
++    void *dst;
++
++    if (!size)
++        return NULL;
++    if ((dst = malloc(size)))
++        memcpy(dst, src, size);
++    return dst;
++}
++
++static unsigned char *d2d_close_cache_put(unsigned char *p, const void *data, size_t size)
++{
++    if (size)
++        memcpy(p, data, size);
++    return p + size;
++}
++
++/* The input Close() reads: the fill mode and, per figure, the vertices,
++ * their types, the bezier controls, the bounds and the flags. */
++static unsigned char *d2d_close_cache_make_key(const struct d2d_geometry *geometry, size_t *size)
++{
++    size_t i, total = sizeof(geometry->u.path.fill_mode) + sizeof(geometry->u.path.figure_count);
++    const struct d2d_figure *figure;
++    unsigned char *key, *p;
++
++    for (i = 0; i < geometry->u.path.figure_count; ++i)
++    {
++        figure = &geometry->u.path.figures[i];
++        total += 2 * sizeof(size_t) + sizeof(figure->bounds) + sizeof(figure->flags)
++                + figure->vertex_count * (sizeof(*figure->vertices) + sizeof(*figure->vertex_types))
++                + figure->bezier_control_count * sizeof(*figure->bezier_controls);
++    }
++
++    if (!(key = malloc(total)))
++        return NULL;
++
++    p = d2d_close_cache_put(key, &geometry->u.path.fill_mode, sizeof(geometry->u.path.fill_mode));
++    p = d2d_close_cache_put(p, &geometry->u.path.figure_count, sizeof(geometry->u.path.figure_count));
++    for (i = 0; i < geometry->u.path.figure_count; ++i)
++    {
++        figure = &geometry->u.path.figures[i];
++        p = d2d_close_cache_put(p, &figure->vertex_count, sizeof(size_t));
++        p = d2d_close_cache_put(p, &figure->bezier_control_count, sizeof(size_t));
++        p = d2d_close_cache_put(p, &figure->bounds, sizeof(figure->bounds));
++        p = d2d_close_cache_put(p, &figure->flags, sizeof(figure->flags));
++        p = d2d_close_cache_put(p, figure->vertices, figure->vertex_count * sizeof(*figure->vertices));
++        p = d2d_close_cache_put(p, figure->vertex_types, figure->vertex_count * sizeof(*figure->vertex_types));
++        p = d2d_close_cache_put(p, figure->bezier_controls,
++                figure->bezier_control_count * sizeof(*figure->bezier_controls));
++    }
++
++    *size = total;
++    return key;
++}
++
++static UINT64 d2d_close_cache_hash(const unsigned char *data, size_t size)
++{
++    UINT64 h = 0xcbf29ce484222325ull, w;
++
++    for (; size >= sizeof(w); data += sizeof(w), size -= sizeof(w))
++    {
++        memcpy(&w, data, sizeof(w));
++        h = (h ^ w) * 0x9e3779b97f4a7c15ull;
++        h ^= h >> 29;
++    }
++    while (size--)
++        h = (h ^ *data++) * 0x100000001b3ull;
++    return h;
++}
++
++static void d2d_close_cache_entry_free(struct d2d_close_cache_entry *entry)
++{
++    size_t i;
++
++    for (i = 0; i < entry->figure_count; ++i)
++    {
++        free(entry->figures[i].vertices);
++        free(entry->figures[i].vertex_types);
++        free(entry->figures[i].bezier_controls);
++    }
++    free(entry->figures);
++    free(entry->fill_vertices);
++    free(entry->faces);
++    free(entry->bezier_vertices);
++    free(entry->key);
++    free(entry);
++}
++
++static BOOL d2d_geometry_close_cache_eligible(const struct d2d_geometry *geometry)
++{
++    size_t i, vertex_count = 0;
++
++    /* Close() starts from empty fill data; anything else is not ours to key. */
++    if (geometry->fill.vertex_count || geometry->fill.face_count
++            || geometry->fill.bezier_vertex_count || geometry->fill.arc_vertex_count)
++        return FALSE;
++
++    for (i = 0; i < geometry->u.path.figure_count; ++i)
++        vertex_count += geometry->u.path.figures[i].vertex_count;
++    return vertex_count >= D2D_CLOSE_CACHE_MIN_VERTICES;
++}
++
++/* Hands the geometry copies of a stored result. Called with the lock held. */
++static BOOL d2d_geometry_close_cache_apply(struct d2d_geometry *geometry,
++        const struct d2d_close_cache_entry *entry)
++{
++    struct d2d_close_cache_figure *copies;
++    D2D1_POINT_2F *fill_vertices = NULL;
++    struct d2d_curve_vertex *bezier_vertices = NULL;
++    struct d2d_face *faces = NULL;
++    struct d2d_figure *figure;
++    BOOL ok = TRUE;
++    size_t i;
++
++    if (!(copies = calloc(entry->figure_count, sizeof(*copies))))
++        return FALSE;
++    for (i = 0; i < entry->figure_count && ok; ++i)
++    {
++        const struct d2d_close_cache_figure *src = &entry->figures[i];
++
++        copies[i] = *src;
++        copies[i].vertices = d2d_memdup(src->vertices, src->vertex_count * sizeof(*src->vertices));
++        copies[i].vertex_types = d2d_memdup(src->vertex_types, src->vertex_count * sizeof(*src->vertex_types));
++        copies[i].bezier_controls = d2d_memdup(src->bezier_controls,
++                src->bezier_control_count * sizeof(*src->bezier_controls));
++        ok = (!src->vertex_count || (copies[i].vertices && copies[i].vertex_types))
++                && (!src->bezier_control_count || copies[i].bezier_controls);
++    }
++    if (ok)
++    {
++        fill_vertices = d2d_memdup(entry->fill_vertices, entry->fill_vertex_count * sizeof(*fill_vertices));
++        faces = d2d_memdup(entry->faces, entry->face_count * sizeof(*faces));
++        bezier_vertices = d2d_memdup(entry->bezier_vertices, entry->bezier_vertex_count * sizeof(*bezier_vertices));
++        ok = (!entry->fill_vertex_count || fill_vertices) && (!entry->face_count || faces)
++                && (!entry->bezier_vertex_count || bezier_vertices);
++    }
++    if (!ok)
++    {
++        for (i = 0; i < entry->figure_count; ++i)
++        {
++            free(copies[i].vertices);
++            free(copies[i].vertex_types);
++            free(copies[i].bezier_controls);
++        }
++        free(copies);
++        free(fill_vertices);
++        free(faces);
++        free(bezier_vertices);
++        return FALSE;
++    }
++
++    for (i = 0; i < entry->figure_count; ++i)
++    {
++        figure = &geometry->u.path.figures[i];
++        free(figure->vertices);
++        free(figure->vertex_types);
++        free(figure->bezier_controls);
++        figure->vertices = copies[i].vertices;
++        figure->vertices_size = copies[i].vertex_count;
++        figure->vertex_types = copies[i].vertex_types;
++        figure->vertex_types_size = copies[i].vertex_count;
++        figure->vertex_count = copies[i].vertex_count;
++        figure->bezier_controls = copies[i].bezier_controls;
++        figure->bezier_controls_size = copies[i].bezier_control_count;
++        figure->bezier_control_count = copies[i].bezier_control_count;
++        figure->bounds = copies[i].bounds;
++        figure->flags = copies[i].flags;
++    }
++    free(copies);
++
++    geometry->fill.vertices = fill_vertices;
++    geometry->fill.vertex_count = entry->fill_vertex_count;
++    geometry->fill.faces = faces;
++    geometry->fill.faces_size = geometry->fill.face_count = entry->face_count;
++    geometry->fill.bezier_vertices = bezier_vertices;
++    geometry->fill.bezier_vertices_size = geometry->fill.bezier_vertex_count = entry->bezier_vertex_count;
++    return TRUE;
++}
++
++static BOOL d2d_geometry_close_cache_lookup(struct d2d_geometry *geometry,
++        const unsigned char *key, size_t key_size, UINT64 hash)
++{
++    struct d2d_close_cache_entry *entry;
++    struct list *bucket;
++    BOOL found = FALSE;
++
++    AcquireSRWLockExclusive(&d2d_close_cache.lock);
++    if (d2d_close_cache.initialised)
++    {
++        bucket = &d2d_close_cache.buckets[hash % D2D_CLOSE_CACHE_BUCKETS];
++        LIST_FOR_EACH_ENTRY(entry, bucket, struct d2d_close_cache_entry, bucket_entry)
++        {
++            if (entry->hash != hash || entry->key_size != key_size || memcmp(entry->key, key, key_size))
++                continue;
++            if ((found = d2d_geometry_close_cache_apply(geometry, entry)))
++            {
++                list_remove(&entry->lru_entry);
++                list_add_head(&d2d_close_cache.lru, &entry->lru_entry);
++            }
++            break;
++        }
++    }
++    ReleaseSRWLockExclusive(&d2d_close_cache.lock);
++    return found;
++}
++
++/* Stores the result Close() just computed. Takes ownership of the key. */
++static void d2d_geometry_close_cache_store(const struct d2d_geometry *geometry,
++        unsigned char *key, size_t key_size, UINT64 hash)
++{
++    struct d2d_close_cache_entry *entry, *old;
++    const struct d2d_figure *figure;
++    struct list *bucket, *tail;
++    BOOL ok = TRUE;
++    size_t i;
++
++    if (!(entry = calloc(1, sizeof(*entry))))
++    {
++        free(key);
++        return;
++    }
++    entry->hash = hash;
++    entry->key = key;
++    entry->key_size = key_size;
++    entry->bytes = sizeof(*entry) + key_size;
++
++    entry->figure_count = geometry->u.path.figure_count;
++    if (!(entry->figures = calloc(entry->figure_count, sizeof(*entry->figures))))
++        ok = FALSE;
++    for (i = 0; ok && i < entry->figure_count; ++i)
++    {
++        struct d2d_close_cache_figure *dst = &entry->figures[i];
++
++        figure = &geometry->u.path.figures[i];
++        dst->vertex_count = figure->vertex_count;
++        dst->bezier_control_count = figure->bezier_control_count;
++        dst->bounds = figure->bounds;
++        dst->flags = figure->flags;
++        dst->vertices = d2d_memdup(figure->vertices, figure->vertex_count * sizeof(*figure->vertices));
++        dst->vertex_types = d2d_memdup(figure->vertex_types, figure->vertex_count * sizeof(*figure->vertex_types));
++        dst->bezier_controls = d2d_memdup(figure->bezier_controls,
++                figure->bezier_control_count * sizeof(*figure->bezier_controls));
++        ok = (!figure->vertex_count || (dst->vertices && dst->vertex_types))
++                && (!figure->bezier_control_count || dst->bezier_controls);
++        entry->bytes += sizeof(*dst) + figure->vertex_count * (sizeof(*figure->vertices) + sizeof(*figure->vertex_types))
++                + figure->bezier_control_count * sizeof(*figure->bezier_controls);
++    }
++    if (ok)
++    {
++        entry->fill_vertex_count = geometry->fill.vertex_count;
++        entry->face_count = geometry->fill.face_count;
++        entry->bezier_vertex_count = geometry->fill.bezier_vertex_count;
++        entry->fill_vertices = d2d_memdup(geometry->fill.vertices,
++                entry->fill_vertex_count * sizeof(*entry->fill_vertices));
++        entry->faces = d2d_memdup(geometry->fill.faces, entry->face_count * sizeof(*entry->faces));
++        entry->bezier_vertices = d2d_memdup(geometry->fill.bezier_vertices,
++                entry->bezier_vertex_count * sizeof(*entry->bezier_vertices));
++        ok = (!entry->fill_vertex_count || entry->fill_vertices) && (!entry->face_count || entry->faces)
++                && (!entry->bezier_vertex_count || entry->bezier_vertices);
++        entry->bytes += entry->fill_vertex_count * sizeof(*entry->fill_vertices)
++                + entry->face_count * sizeof(*entry->faces)
++                + entry->bezier_vertex_count * sizeof(*entry->bezier_vertices);
++    }
++    if (!ok || entry->bytes > D2D_CLOSE_CACHE_MAX_BYTES / 16)
++    {
++        d2d_close_cache_entry_free(entry);
++        return;
++    }
++
++    AcquireSRWLockExclusive(&d2d_close_cache.lock);
++    if (!d2d_close_cache.initialised)
++    {
++        for (i = 0; i < D2D_CLOSE_CACHE_BUCKETS; ++i)
++            list_init(&d2d_close_cache.buckets[i]);
++        d2d_close_cache.initialised = TRUE;
++    }
++    bucket = &d2d_close_cache.buckets[hash % D2D_CLOSE_CACHE_BUCKETS];
++    LIST_FOR_EACH_ENTRY(old, bucket, struct d2d_close_cache_entry, bucket_entry)
++    {
++        /* Another thread stored the same input meanwhile. */
++        if (old->hash == hash && old->key_size == key_size && !memcmp(old->key, key, key_size))
++        {
++            ReleaseSRWLockExclusive(&d2d_close_cache.lock);
++            d2d_close_cache_entry_free(entry);
++            return;
++        }
++    }
++    list_add_head(bucket, &entry->bucket_entry);
++    list_add_head(&d2d_close_cache.lru, &entry->lru_entry);
++    d2d_close_cache.bytes += entry->bytes;
++    while (d2d_close_cache.bytes > D2D_CLOSE_CACHE_MAX_BYTES && (tail = list_tail(&d2d_close_cache.lru)))
++    {
++        old = LIST_ENTRY(tail, struct d2d_close_cache_entry, lru_entry);
++        list_remove(&old->lru_entry);
++        list_remove(&old->bucket_entry);
++        d2d_close_cache.bytes -= old->bytes;
++        d2d_close_cache_entry_free(old);
++    }
++    ReleaseSRWLockExclusive(&d2d_close_cache.lock);
++}
++
+ static HRESULT STDMETHODCALLTYPE d2d_geometry_sink_Close(ID2D1GeometrySink *iface)
+ {
+     struct d2d_geometry *geometry = impl_from_ID2D1GeometrySink(iface);
++    unsigned char *key = NULL;
++    size_t key_size = 0;
+     HRESULT hr = E_FAIL;
++    UINT64 hash = 0;
+ 
+     TRACE("iface %p.\n", iface);
+ 
+@@ -3860,6 +4627,17 @@ static HRESULT STDMETHODCALLTYPE d2d_geometry_sink_Close(ID2D1GeometrySink *ifac
+ 
+     geometry->u.path.state = D2D_GEOMETRY_STATE_CLOSED;
+ 
++    if (d2d_geometry_close_cache_eligible(geometry)
++            && (key = d2d_close_cache_make_key(geometry, &key_size)))
++    {
++        hash = d2d_close_cache_hash(key, key_size);
++        if (d2d_geometry_close_cache_lookup(geometry, key, key_size, hash))
++        {
++            free(key);
++            return S_OK;
++        }
++    }
++
+     if (!d2d_geometry_intersect_self(geometry))
+         goto done;
+     if (FAILED(hr = d2d_geometry_resolve_beziers(geometry)))
+@@ -3867,7 +4645,14 @@ static HRESULT STDMETHODCALLTYPE d2d_geometry_sink_Close(ID2D1GeometrySink *ifac
+     if (FAILED(hr = d2d_path_geometry_triangulate(geometry)))
+         goto done;
+ 
++    if (key)
++    {
++        d2d_geometry_close_cache_store(geometry, key, key_size, hash);
++        key = NULL;
++    }
++
+ done:
++    free(key);
+     if (FAILED(hr))
+     {
+         free(geometry->fill.bezier_vertices);

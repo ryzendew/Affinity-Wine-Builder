@@ -1,0 +1,150 @@
+win32u: Wait for presents to offscreen Vulkan surfaces before copying them.
+
+A Vulkan surface on a child window, or on a window whose children clip it,
+is offscreen: the host presents into a client window that is not shown, and
+client_surface_present() copies that into the window as soon as
+vkQueuePresentKHR returns. The host present completes later -- Mesa's X11
+WSI hands it to a present thread and, with FIFO, to the next vblank -- so
+the copy takes the previous frame, and the window shows one frame behind
+until something presents again. In Affinity the canvas kept the selection
+handles until the mouse moved, and the color picker's zoom preview, which
+reads the window back, kept showing them.
+
+Wait for the present before copying, with VK_KHR_present_wait. win32u
+enables VK_KHR_present_id and VK_KHR_present_wait on the host device when
+the application uses neither, and gives presents to offscreen surfaces ids
+of its own; when the application passes VkPresentIdKHR, its ids are used.
+A wait is capped at 100 ms, and three timeouts in a row stop the waiting on
+that swapchain.
+
+The GL path already waits for the swap before its offscreen copy
+(glXWaitForSbcOML). Upstream master has the same race.
+
+A child window with a vsynced FLIP_SEQUENTIAL swapchain, presenting a new
+color once: 500 ms later the window still showed the old color without
+this (2/2), the new one with it (3/3).
+
+diff --git a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
+index f07e78a..a654794 100644
+--- a/dlls/win32u/vulkan.c
++++ b/dlls/win32u/vulkan.c
+@@ -155,6 +155,8 @@ struct swapchain
+     struct vulkan_swapchain obj;
+     struct surface *surface;
+     VkExtent2D extents;
++    UINT64 present_id;              /* last present id given by win32u, see win32u_vkQueuePresentKHR */
++    UINT present_wait_timeouts;     /* consecutive timed out waits; three stop the waiting */
+ };
+ 
+ static struct swapchain *swapchain_from_handle( VkSwapchainKHR handle )
+@@ -721,6 +723,36 @@ static VkResult convert_device_create_info( struct vulkan_physical_device *physi
+         physical_device->extensions.has_VK_EXT_swapchain_maintenance1)
+         device->extensions.has_VK_EXT_swapchain_maintenance1 = 1;
+ 
++    /* win32u waits for presents to offscreen surfaces before copying them, see win32u_vkQueuePresentKHR.
++     * Only when the application uses neither extension, so the present ids are win32u's alone. */
++    if (device->extensions.has_VK_KHR_swapchain && !device->extensions.has_VK_KHR_present_id &&
++        !device->extensions.has_VK_KHR_present_wait && physical_device->extensions.has_VK_KHR_present_id &&
++        physical_device->extensions.has_VK_KHR_present_wait && instance->p_vkGetPhysicalDeviceFeatures2KHR)
++    {
++        VkPhysicalDevicePresentWaitFeaturesKHR wait_supported = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR};
++        VkPhysicalDevicePresentIdFeaturesKHR id_supported = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR, .pNext = &wait_supported};
++        VkPhysicalDeviceFeatures2 features = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &id_supported};
++        VkPhysicalDevicePresentWaitFeaturesKHR *wait_features;
++        VkPhysicalDevicePresentIdFeaturesKHR *id_features;
++
++        instance->p_vkGetPhysicalDeviceFeatures2KHR( physical_device->host.physical_device, &features );
++        if (id_supported.presentId && wait_supported.presentWait)
++        {
++            if (!(id_features = mem_alloc( pool, sizeof(*id_features) ))) return VK_ERROR_OUT_OF_HOST_MEMORY;
++            if (!(wait_features = mem_alloc( pool, sizeof(*wait_features) ))) return VK_ERROR_OUT_OF_HOST_MEMORY;
++            id_features->sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR;
++            id_features->pNext = wait_features;
++            id_features->presentId = VK_TRUE;
++            wait_features->sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR;
++            wait_features->pNext = (void *)info->pNext;
++            wait_features->presentWait = VK_TRUE;
++            info->pNext = id_features;
++
++            device->extensions.has_VK_KHR_present_id = 1;
++            device->extensions.has_VK_KHR_present_wait = 1;
++        }
++    }
++
+     if (!(extensions = mem_alloc( pool, sizeof(device->extensions) * 8 * sizeof(*extensions) ))) return VK_ERROR_OUT_OF_HOST_MEMORY;
+ #define USE_VK_EXT(x) if (device->extensions.has_ ## x) extensions[count++] = #x;
+     ALL_VK_DEVICE_EXTS
+@@ -1986,6 +2018,12 @@ static VkResult win32u_vkAcquireNextImageKHR( VkDevice client_device, VkSwapchai
+     return res;
+ }
+ 
++static BOOL swapchain_waits_for_present( struct swapchain *swapchain )
++{
++    struct surface *surface = swapchain->surface;
++    return swapchain->present_wait_timeouts < 3 && InterlockedCompareExchange( &surface->client->offscreen, 0, 0 );
++}
++
+ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentInfoKHR *client_present_info )
+ {
+     VkPresentInfoKHR *present_info = (VkPresentInfoKHR *)client_present_info; /* cast away const, it has been copied in the thunks */
+@@ -1993,6 +2031,9 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
+     VkSwapchainKHR swapchains_buffer[16], *swapchains = swapchains_buffer;
+     struct vulkan_device *device = queue->device;
+     const VkSwapchainKHR *client_swapchains;
++    const VkPresentIdKHR *client_present_ids;
++    VkPresentIdKHR present_ids = {.sType = VK_STRUCTURE_TYPE_PRESENT_ID_KHR};
++    UINT64 ids[ARRAY_SIZE(swapchains_buffer)];
+     VkResult res;
+ 
+     TRACE( "queue %p, present_info %p\n", queue, present_info );
+@@ -2024,7 +2065,28 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
+         client_surface_update( surface->client );
+     }
+ 
++    /* client_surface_present() copies a present to an offscreen surface into the window. The host
++     * present completes later, after the host has queued it to another thread or to the next vblank,
++     * and a copy made before then shows the previous frame. So wait for it before copying, with
++     * present ids: the application's, or win32u's own if the application uses none. */
++    if (!(client_present_ids = find_next_struct( present_info->pNext, VK_STRUCTURE_TYPE_PRESENT_ID_KHR )) &&
++        device->extensions.has_VK_KHR_present_wait && !device->client.device->extensions.has_VK_KHR_present_id &&
++        present_info->swapchainCount <= ARRAY_SIZE(ids))
++    {
++        for (uint32_t i = 0; i < present_info->swapchainCount; i++)
++        {
++            struct swapchain *swapchain = swapchain_from_handle( client_swapchains[i] );
++            ids[i] = swapchain_waits_for_present( swapchain ) ? ++swapchain->present_id : 0;
++        }
++        present_ids.pNext = present_info->pNext;
++        present_ids.swapchainCount = present_info->swapchainCount;
++        present_ids.pPresentIds = ids;
++        present_info->pNext = &present_ids;
++        client_present_ids = &present_ids;
++    }
++
+     res = device->p_vkQueuePresentKHR( queue->host.queue, present_info );
++    if (client_present_ids == &present_ids) present_info->pNext = present_ids.pNext;
+ 
+     for (uint32_t i = 0; i < present_info->swapchainCount; i++)
+     {
+@@ -2032,6 +2094,21 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
+         VkResult swapchain_res = present_info->pResults ? present_info->pResults[i] : res;
+         struct surface *surface = swapchain->surface;
+         RECT client_rect;
++        UINT64 id;
++
++        if (swapchain_res >= VK_SUCCESS && device->extensions.has_VK_KHR_present_wait && client_present_ids &&
++            client_present_ids->pPresentIds && i < client_present_ids->swapchainCount &&
++            (id = client_present_ids->pPresentIds[i]) && swapchain_waits_for_present( swapchain ))
++        {
++            VkResult wait_res = device->p_vkWaitForPresentKHR( device->host.device, swapchain->obj.host.swapchain,
++                                                               id, 100000000 /* 100 ms */ );
++            if (wait_res == VK_TIMEOUT)
++            {
++                WARN( "Timed out waiting for present %s on swapchain %p\n", wine_dbgstr_longlong( id ), swapchain );
++                swapchain->present_wait_timeouts++;
++            }
++            else if (wait_res >= VK_SUCCESS) swapchain->present_wait_timeouts = 0;
++        }
+ 
+         client_surface_present( surface->client );
+ 

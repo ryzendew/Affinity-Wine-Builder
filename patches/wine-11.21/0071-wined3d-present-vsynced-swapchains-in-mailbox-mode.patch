@@ -1,0 +1,78 @@
+wined3d: Present vsynced Vulkan swapchains in mailbox mode when available.
+
+With FIFO, an application that renders faster than the display fills the
+frame latency queue (three frames by default) and the swapchain, and then
+shows each frame two or three refreshes after it was drawn. Affinity's
+canvas does that once its buffers are fast (0050): the brush tip trailed
+the cursor by about 90 ms instead of 50, flipping between the two from one
+session to the next as the queue stayed filled or drained.
+
+Mailbox never tears either, but shows the newest frame at each refresh and
+does not block, so nothing queues up. Use it for swap intervals other
+than 0 when the surface supports it, with at least three images. A present
+then no longer throttles the application to the refresh rate; set
+MailboxPresent (DWORD) to 0 under HKCU\Software\Wine\Direct3D to restore
+FIFO.
+
+Measured with 0050 on an Arc A750 under a nested KWin (Xwayland offers
+IMMEDIATE, MAILBOX, FIFO and FIFO_RELAXED): the canvas present queue went
+from 37-51 ms to under 1 ms, and present to completion from 16 ms to 8 ms.
+
+diff --git a/dlls/wined3d/swapchain.c b/dlls/wined3d/swapchain.c
+index 258692f..41fd48d 100644
+--- a/dlls/wined3d/swapchain.c
++++ b/dlls/wined3d/swapchain.c
+@@ -1041,6 +1041,20 @@ static HRESULT wined3d_swapchain_vk_create_vulkan_swapchain(struct wined3d_swapc
+     }
+ 
+     vk_present_mode = VK_PRESENT_MODE_FIFO_KHR;
++    /* With FIFO, an application that renders faster than the display fills
++     * the frame latency queue and then shows every frame two or three
++     * refreshes late; Affinity's brush trailed the cursor by about twice as
++     * much. Mailbox still never tears, but shows the newest frame at each
++     * refresh and does not block, so nothing queues up. It also means a
++     * present no longer throttles the application to the refresh rate;
++     * MailboxPresent=0 in the Direct3D key restores FIFO. */
++    if (swapchain_vk->s.swap_interval && wined3d_settings.mailbox_present
++            && wined3d_swapchain_vk_present_mode_supported(swapchain_vk, VK_PRESENT_MODE_MAILBOX_KHR))
++    {
++        vk_present_mode = VK_PRESENT_MODE_MAILBOX_KHR;
++        if (image_count < 3 && (!surface_caps.maxImageCount || surface_caps.maxImageCount >= 3))
++            image_count = 3;
++    }
+     if (!swapchain_vk->s.swap_interval)
+     {
+         if (wined3d_swapchain_vk_present_mode_supported(swapchain_vk, VK_PRESENT_MODE_IMMEDIATE_KHR))
+diff --git a/dlls/wined3d/wined3d_main.c b/dlls/wined3d/wined3d_main.c
+index ec34aa3..29d2e61 100644
+--- a/dlls/wined3d/wined3d_main.c
++++ b/dlls/wined3d/wined3d_main.c
+@@ -123,6 +123,7 @@ struct wined3d_settings wined3d_settings =
+     .pci_device_id = PCI_DEVICE_NONE,
+     .multisample_textures = TRUE,
+     .sample_count = ~0u,
++    .mailbox_present = TRUE,
+     .max_sm_vs = UINT_MAX,
+     .max_sm_ps = UINT_MAX,
+     .max_sm_ds = UINT_MAX,
+@@ -444,6 +445,8 @@ static BOOL wined3d_dll_init(HINSTANCE hInstDLL)
+         }
+         if (!get_config_key_dword(hkey, appkey, env, "strict_shader_math", &wined3d_settings.strict_shader_math))
+             ERR_(winediag)("Setting strict shader math to %#x.\n", wined3d_settings.strict_shader_math);
++        if (!get_config_key_dword(hkey, appkey, env, "MailboxPresent", &wined3d_settings.mailbox_present))
++            TRACE("Mailbox presentation %s.\n", wined3d_settings.mailbox_present ? "enabled" : "disabled");
+         if (!get_config_key_dword(hkey, appkey, env, "MaxShaderModelVS", &wined3d_settings.max_sm_vs))
+             TRACE("Limiting VS shader model to %u.\n", wined3d_settings.max_sm_vs);
+         if (!get_config_key_dword(hkey, appkey, env, "MaxShaderModelHS", &wined3d_settings.max_sm_hs))
+diff --git a/dlls/wined3d/wined3d_private.h b/dlls/wined3d/wined3d_private.h
+index 85344a6..d51c91f 100644
+--- a/dlls/wined3d/wined3d_private.h
++++ b/dlls/wined3d/wined3d_private.h
+@@ -481,6 +481,7 @@ struct wined3d_settings
+     unsigned int multisample_textures;
+     unsigned int sample_count;
+     unsigned int strict_shader_math;
++    unsigned int mailbox_present;
+     unsigned int max_sm_vs;
+     unsigned int max_sm_hs;
+     unsigned int max_sm_ds;

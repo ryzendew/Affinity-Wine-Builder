@@ -1,0 +1,45 @@
+winex11.drv: Copy client surfaces into windows of another process's toplevel.
+
+Only the process that owns a toplevel can attach a client window to its
+X window, and it moves, resizes and destroys that window without telling
+anyone else. A GPU process drawing for windows of another process (an
+embedded WebView2: its GPU process draws for its browser process's
+windows) created an onscreen client window that ended up in the wrong
+place, or attached nowhere: the page stayed blank, and Chromium's link
+preview bubble, a toplevel of the browser process, showed as an empty
+white or black box.
+
+Render offscreen and copy into the X window whenever the toplevel belongs
+to another process, toplevels included.
+---
+ dlls/winex11.drv/init.c | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/dlls/winex11.drv/init.c b/dlls/winex11.drv/init.c
+index 6cca9c4..88e84d7 100644
+--- a/dlls/winex11.drv/init.c
++++ b/dlls/winex11.drv/init.c
+@@ -225,13 +225,22 @@ static BOOL needs_client_window_clipping( HWND hwnd )
+ 
+ static BOOL needs_offscreen_rendering( HWND hwnd, BOOL raw )
+ {
++    HWND toplevel = NtUserGetAncestor( hwnd, GA_ROOT );
++    DWORD pid;
++
+     if (!raw && NtUserGetDpiForWindow( hwnd ) != NtUserGetWinMonitorDpi( hwnd, MDT_RAW_DPI )) return TRUE; /* needs DPI scaling */
++    /* Not in a toplevel of this process: the owner moves, resizes and destroys its X
++     * window without telling us, and only it can attach a client window to it, so ours
++     * would be in the wrong place or nowhere (an embedded WebView2, whose GPU process
++     * draws for windows of its browser process). Copy into its X window instead. */
++    NtUserGetWindowThread( toplevel, &pid );
++    if (pid != GetCurrentProcessId()) return TRUE;
+     if (NtUserGetAncestor( hwnd, GA_PARENT ) != NtUserGetDesktopWindow())
+     {
+         /* A child window that is shown and that nothing clips can be drawn in its
+          * toplevel's X window directly, like a toplevel's own client window. A hidden
+          * window has an empty visible region, so it is clipped too. */
+-        if (!X11DRV_get_whole_window( NtUserGetAncestor( hwnd, GA_ROOT ) )) return TRUE;
++        if (!X11DRV_get_whole_window( toplevel )) return TRUE;
+         return needs_client_window_clipping( hwnd );
+     }
+     if (NtUserGetWindowRelative( hwnd, GW_CHILD )) return needs_client_window_clipping( hwnd ); /* window has children, needs compositing */

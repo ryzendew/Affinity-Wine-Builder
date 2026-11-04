@@ -1,0 +1,42 @@
+winex11: Move owned windows without a caption internally too.
+
+0016 has SC_MOVE run win32u's own move loop for owned tool windows: an
+application docking a floating palette needs WM_MOVING and the mouse for the
+whole drag, which a move handed to the window manager does not give it. An
+owned window without a caption is a palette as well, dragged by a grip of its
+own -- Affinity's sub-tool panel, a borderless layered WPF window. It used to
+be unmanaged, and unmanaged windows are always moved internally, until 0037
+managed owned windows. Since then its drags went to KWin: Affinity never saw
+WM_MOVING, never showed its pin targets, and every drop left the panel
+floating at a fixed screen position instead of pinned beside the canvas.
+
+Move owned windows without a caption internally too. Captioned owned
+windows, dialogs among them, are still moved by the window manager.
+
+Under a nested KWin, with real pointer input (org_kde_kwin_fake_input): a drag
+of the panel by its grip now shows Affinity's dock adorner window and pins the
+panel where it is dropped, and the pinned position survives studio switches
+and a restart. Before, the panel stayed wherever KWin left it.
+diff --git a/dlls/winex11.drv/window.c b/dlls/winex11.drv/window.c
+index 7f12cd1..a4b8278 100644
+--- a/dlls/winex11.drv/window.c
++++ b/dlls/winex11.drv/window.c
+@@ -3748,10 +3748,16 @@ LRESULT X11DRV_SysCommand( HWND hwnd, WPARAM wparam, LPARAM lparam, const POINT
+          * Without this, panels in Affinity undock but cannot be re-docked
+          * under KWin. Undocking starts from a client-area press and never
+          * reaches here; re-docking grabs the palette's caption, which does. */
+-        if ((NtUserGetWindowLongW( hwnd, GWL_EXSTYLE ) & WS_EX_TOOLWINDOW) &&
++        if (((NtUserGetWindowLongW( hwnd, GWL_EXSTYLE ) & WS_EX_TOOLWINDOW) ||
++             (NtUserGetWindowLongW( hwnd, GWL_STYLE ) & WS_CAPTION) != WS_CAPTION) &&
+             NtUserGetWindowRelative( hwnd, GW_OWNER ))
+         {
+-            TRACE( "hwnd %p is an owned tool window, moving it internally\n", hwnd );
++            /* An owned window without a caption is a palette too, dragged by a
++             * grip of its own: Affinity's sub-tool panel, which shows its pin
++             * targets while it receives WM_MOVING and pins itself where it is
++             * dropped. It used to be unmanaged, and moved internally for that
++             * reason, until 0037 managed owned windows. */
++            TRACE( "hwnd %p is an owned palette, moving it internally\n", hwnd );
+             goto failed;
+         }
+         if (!hittest) dir = _NET_WM_MOVERESIZE_MOVE_KEYBOARD;

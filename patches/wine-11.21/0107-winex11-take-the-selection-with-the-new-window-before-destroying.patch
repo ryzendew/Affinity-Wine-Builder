@@ -1,0 +1,47 @@
+winex11: Take the selection with the new window before destroying the old one.
+
+Every change to the Win32 clipboard made acquire_selection destroy the
+old selection window and only then create a new one and take the
+selection, so the X selection had no owner for a moment. Applications
+often copy in several open/close rounds; Affinity sets seven formats
+in seven rounds. Clipboard managers such as Klipper take each gap for
+an emptied clipboard and put back their previous entry, which replaced
+the copy: pasting then did nothing, until a second copy won the race.
+
+Create the new window and take the selection first, then destroy the
+old window, so the owner changes from one window to the next without a
+gap.
+---
+ dlls/winex11.drv/clipboard.c | 15 +++++++++++----
+ 1 file changed, 11 insertions(+), 4 deletions(-)
+
+diff --git a/dlls/winex11.drv/clipboard.c b/dlls/winex11.drv/clipboard.c
+index e2e07a6..1a1aadf 100644
+--- a/dlls/winex11.drv/clipboard.c
++++ b/dlls/winex11.drv/clipboard.c
+@@ -1913,14 +1913,21 @@ static BOOL read_property( Display *display, Window w, Atom prop,
+  */
+ static void acquire_selection( Display *display )
+ {
+-    if (selection_window) XDestroyWindow( display, selection_window );
++    Window old_window = selection_window;
+ 
++    /* Take the selection with the new window before destroying the old one. Destroying the
++     * owner first leaves the selection without an owner for a moment, and an application
++     * may copy in several open/close rounds; a clipboard manager such as Klipper takes each
++     * gap for an emptied clipboard and puts back its previous entry, replacing ours. */
+     selection_window = XCreateWindow( display, root_window, 0, 0, 1, 1, 0, CopyFromParent,
+                                       InputOutput, CopyFromParent, 0, NULL );
++    if (selection_window)
++    {
++        XSetSelectionOwner( display, x11drv_atom(CLIPBOARD), selection_window, CurrentTime );
++        if (use_primary_selection) XSetSelectionOwner( display, XA_PRIMARY, selection_window, CurrentTime );
++    }
++    if (old_window) XDestroyWindow( display, old_window );
+     if (!selection_window) return;
+-
+-    XSetSelectionOwner( display, x11drv_atom(CLIPBOARD), selection_window, CurrentTime );
+-    if (use_primary_selection) XSetSelectionOwner( display, XA_PRIMARY, selection_window, CurrentTime );
+     XFlush( display );
+     TRACE( "win %lx\n", selection_window );
+ }

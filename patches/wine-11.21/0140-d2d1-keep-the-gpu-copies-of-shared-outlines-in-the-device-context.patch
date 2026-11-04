@@ -1,0 +1,198 @@
+From b66f377256882c6ccf7a8dade8563e1c82d10b2c Mon Sep 17 00:00:00 2001
+From: jfacemyer <1776340+jfacemyer@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 01:47:24 -0500
+Subject: [PATCH 8/8] d2d1: Keep the GPU copies of shared outlines in the
+ device context.
+
+Every stroke of a path went through the upload ring. For the selection
+outline of a path of 138,000 curves that was 72 MB per draw, in two
+uploads that each wrapped the ring and mapped it with DISCARD: 26 ms,
+6-10 times per select or nudge in Affinity. A device context now keeps
+immutable index and vertex buffers for the last four shared outlines it
+drew (holding a reference to each outline, not the other way round, so
+devices are released as before), and draws them from there: the draw
+call is all that is left.
+---
+ dlls/d2d1/d2d1_private.h |  11 +++++
+ dlls/d2d1/device.c       | 102 +++++++++++++++++++++++++++++++++++++--
+ 2 files changed, 110 insertions(+), 3 deletions(-)
+
+diff --git a/dlls/d2d1/d2d1_private.h b/dlls/d2d1/d2d1_private.h
+index 40ca535..82e8aef 100644
+--- a/dlls/d2d1/d2d1_private.h
++++ b/dlls/d2d1/d2d1_private.h
+@@ -170,6 +170,8 @@ struct d2d_indexed_objects
+     size_t count;
+ };
+ 
++struct d2d_outline_cache_entry;
++
+ struct d2d_device_context
+ {
+     ID2D1DeviceContext6 ID2D1DeviceContext6_iface;
+@@ -203,6 +205,15 @@ struct d2d_device_context
+         ID3D11Buffer *buffer;
+         unsigned int size, pos;
+     } upload_ring, cb_ring;
++    /* GPU copies of the last few shared outlines drawn here: a large outline
++     * went through the upload ring at every draw, tens of megabytes each
++     * time. */
++    struct d2d_outline_buffers
++    {
++        struct d2d_outline_cache_entry *entry;
++        ID3D11Buffer *buffers[6];
++    } outline_buffers[4];
++    unsigned int outline_buffers_next;
+     unsigned int vs_cb_offset, ps_cb_offset;
+     struct d2d_vs_cb vs_cb_data;  /* written with the next pixel shader constants, in one map */
+     BOOL vs_cb_pending;
+diff --git a/dlls/d2d1/device.c b/dlls/d2d1/device.c
+index a1081a3..d75c528 100644
+--- a/dlls/d2d1/device.c
++++ b/dlls/d2d1/device.c
+@@ -230,6 +230,21 @@ static ID3DDeviceContextState *d2d_device_context_begin_draw_state(struct d2d_de
+ 
+ static void d2d_device_context_flush_vs_cb(struct d2d_device_context *context);
+ 
++static void d2d_outline_buffers_cleanup(struct d2d_outline_buffers *b)
++{
++    unsigned int i;
++
++    for (i = 0; i < ARRAY_SIZE(b->buffers); ++i)
++    {
++        if (b->buffers[i])
++            ID3D11Buffer_Release(b->buffers[i]);
++        b->buffers[i] = NULL;
++    }
++    if (b->entry)
++        d2d_outline_cache_entry_release(b->entry);
++    b->entry = NULL;
++}
++
+ static void d2d_device_context_draw(struct d2d_device_context *render_target, enum d2d_shape_type shape_type,
+         ID3D11Buffer *ib, DXGI_FORMAT ib_format, unsigned int ib_offset, unsigned int index_count, ID3D11Buffer *vb,
+         unsigned int vb_offset, unsigned int vb_stride, struct d2d_brush *brush, struct d2d_brush *opacity_brush)
+@@ -692,6 +707,8 @@ static ULONG STDMETHODCALLTYPE d2d_device_context_inner_Release(IUnknown *iface)
+         ID3D11Buffer_Release(context->ib);
+         if (context->upload_ring.buffer)
+             ID3D11Buffer_Release(context->upload_ring.buffer);
++        for (i = 0; i < ARRAY_SIZE(context->outline_buffers); ++i)
++            d2d_outline_buffers_cleanup(&context->outline_buffers[i]);
+         if (context->cb_ring.buffer)
+             ID3D11Buffer_Release(context->cb_ring.buffer);
+         ID3D11Buffer_Release(context->ps_cb);
+@@ -1380,6 +1397,81 @@ static HRESULT d2d_device_context_update_vs_cb(struct d2d_device_context *contex
+     return S_OK;
+ }
+ 
++static ID3D11Buffer *d2d_outline_create_buffer(ID3D11Device1 *device, const void *data, size_t size, UINT bind)
++{
++    D3D11_SUBRESOURCE_DATA init = {.pSysMem = data};
++    D3D11_BUFFER_DESC desc = {0};
++    ID3D11Buffer *buffer;
++
++    if (!size || size > ~0u)
++        return NULL;
++    desc.ByteWidth = size;
++    desc.Usage = D3D11_USAGE_IMMUTABLE;
++    desc.BindFlags = bind;
++    if (FAILED(ID3D11Device1_CreateBuffer(device, &desc, &init, &buffer)))
++        return NULL;
++    return buffer;
++}
++
++/* Draws part 0 (lines and joins), 1 (beziers) or 2 (arcs) of a shared outline
++ * from this context's GPU copy of it, made at its first draw here. FALSE if
++ * the outline is not shared, or the copy cannot be made. */
++static BOOL d2d_device_context_draw_shared_outline(struct d2d_device_context *render_target,
++        const struct d2d_geometry *outline, unsigned int part, enum d2d_shape_type shape_type,
++        unsigned int count, unsigned int vb_stride, struct d2d_brush *brush)
++{
++    const struct d2d_geometry_outline *o = &outline->outline;
++    ID3D11Device1 *device = render_target->d3d_device;
++    struct d2d_outline_buffers *b = NULL;
++    unsigned int i;
++
++    if (!outline->outline_entry)
++        return FALSE;
++
++    if (render_target->cs)
++        EnterCriticalSection(render_target->cs);
++    for (i = 0; i < ARRAY_SIZE(render_target->outline_buffers); ++i)
++    {
++        if (render_target->outline_buffers[i].entry == outline->outline_entry)
++        {
++            b = &render_target->outline_buffers[i];
++            break;
++        }
++    }
++    if (!b)
++    {
++        b = &render_target->outline_buffers[render_target->outline_buffers_next];
++        render_target->outline_buffers_next = (render_target->outline_buffers_next + 1)
++                % ARRAY_SIZE(render_target->outline_buffers);
++        d2d_outline_buffers_cleanup(b);
++        d2d_outline_cache_entry_addref(b->entry = outline->outline_entry);
++        b->buffers[0] = d2d_outline_create_buffer(device, o->faces,
++                o->face_count * sizeof(*o->faces), D3D11_BIND_INDEX_BUFFER);
++        b->buffers[1] = d2d_outline_create_buffer(device, o->vertices,
++                o->vertex_count * sizeof(*o->vertices), D3D11_BIND_VERTEX_BUFFER);
++        b->buffers[2] = d2d_outline_create_buffer(device, o->bezier_faces,
++                o->bezier_face_count * sizeof(*o->bezier_faces), D3D11_BIND_INDEX_BUFFER);
++        b->buffers[3] = d2d_outline_create_buffer(device, o->beziers,
++                o->bezier_count * sizeof(*o->beziers), D3D11_BIND_VERTEX_BUFFER);
++        b->buffers[4] = d2d_outline_create_buffer(device, o->arc_faces,
++                o->arc_face_count * sizeof(*o->arc_faces), D3D11_BIND_INDEX_BUFFER);
++        b->buffers[5] = d2d_outline_create_buffer(device, o->arcs,
++                o->arc_count * sizeof(*o->arcs), D3D11_BIND_VERTEX_BUFFER);
++    }
++    if (!b->buffers[2 * part] || !b->buffers[2 * part + 1])
++    {
++        if (render_target->cs)
++            LeaveCriticalSection(render_target->cs);
++        return FALSE;
++    }
++    d2d_device_context_flush_draws(render_target);
++    d2d_device_context_draw(render_target, shape_type, b->buffers[2 * part], DXGI_FORMAT_R32_UINT, 0, count,
++            b->buffers[2 * part + 1], 0, vb_stride, brush, NULL);
++    if (render_target->cs)
++        LeaveCriticalSection(render_target->cs);
++    return TRUE;
++}
++
+ static void d2d_device_context_draw_geometry(struct d2d_device_context *render_target,
+         const struct d2d_geometry *geometry, struct d2d_brush *brush, float stroke_width)
+ {
+@@ -1398,14 +1490,16 @@ static void d2d_device_context_draw_geometry(struct d2d_device_context *render_t
+         return;
+     }
+ 
+-    if (outline->outline.face_count)
++    if (outline->outline.face_count && !d2d_device_context_draw_shared_outline(render_target, outline, 0,
++            D2D_SHAPE_TYPE_OUTLINE, 3 * outline->outline.face_count, sizeof(*outline->outline.vertices), brush))
+         d2d_device_context_draw_data(render_target, D2D_SHAPE_TYPE_OUTLINE,
+                 outline->outline.faces, outline->outline.face_count * sizeof(*outline->outline.faces),
+                 3 * outline->outline.face_count, outline->outline.vertices,
+                 outline->outline.vertex_count * sizeof(*outline->outline.vertices),
+                 sizeof(*outline->outline.vertices), brush, NULL);
+ 
+-    if (outline->outline.bezier_face_count)
++    if (outline->outline.bezier_face_count && !d2d_device_context_draw_shared_outline(render_target, outline, 1,
++            D2D_SHAPE_TYPE_BEZIER_OUTLINE, 3 * outline->outline.bezier_face_count, sizeof(*outline->outline.beziers), brush))
+         d2d_device_context_draw_data(render_target, D2D_SHAPE_TYPE_BEZIER_OUTLINE,
+                 outline->outline.bezier_faces, outline->outline.bezier_face_count * sizeof(*outline->outline.bezier_faces),
+                 3 * outline->outline.bezier_face_count, outline->outline.beziers,
+@@ -1413,7 +1507,9 @@ static void d2d_device_context_draw_geometry(struct d2d_device_context *render_t
+                 sizeof(*outline->outline.beziers), brush, NULL);
+ 
+     if (outline->outline.arc_face_count
+-            && SUCCEEDED(d2d_device_context_update_ps_cb(render_target, brush, NULL, TRUE, TRUE)))
++            && SUCCEEDED(d2d_device_context_update_ps_cb(render_target, brush, NULL, TRUE, TRUE))
++            && !d2d_device_context_draw_shared_outline(render_target, outline, 2,
++            D2D_SHAPE_TYPE_ARC_OUTLINE, 3 * outline->outline.arc_face_count, sizeof(*outline->outline.arcs), brush))
+         d2d_device_context_draw_data(render_target, D2D_SHAPE_TYPE_ARC_OUTLINE,
+                 outline->outline.arc_faces, outline->outline.arc_face_count * sizeof(*outline->outline.arc_faces),
+                 3 * outline->outline.arc_face_count, outline->outline.arcs,
+-- 
+2.55.0
+

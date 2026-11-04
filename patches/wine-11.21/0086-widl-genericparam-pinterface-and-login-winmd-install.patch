@@ -1,0 +1,178 @@
+widl + winmd install: complete the 11.18 SharedStorageAccessManager login fix on 11.19
+
+0085 ports 11.18's 0053-twinapi-appcore-SharedStorageAccessManager-loginfix
+but deliberately leaves out its tools/widl/metadata.c and
+include/Makefile.in hunks ("already in this set"). They are not:
+
+- No 11.19 patch emits GenericParam rows or TypeDefs for parameterized
+  (generic) interfaces, so a winmd referencing e.g.
+  IAsyncOperation<StorageFile> -- exactly what
+  SharedStorageAccessManager.RedeemTokenForFileAsync returns -- leaves
+  the CLR with a TypeRef it can never resolve, and Affinity's
+  ProcessCommandLineArguments still throws TypeLoadException on the
+  affinity:// OAuth callback path. Port those hunks here.
+- No 11.19 patch adds windows.applicationmodel.datatransfer.winmd,
+  windows.foundation.winmd or windows.storage.streams.winmd to
+  INSTALL_LIB, so 0085 registers winmds in wine.inf that are never
+  installed and RoResolveNamespace cannot find them. Add them.
+
+Upstream 11.19 already implements RoResolveNamespace and declares
+SharedStorageAccessManager in the IDL, so 11.18's 0032 and the IDL halves
+of 0053 are correctly left out; this patch carries only the two missing
+halves. Applies after 0085 with no fuzz.
+---
+ include/Makefile.in  |  3 +++
+ tools/widl/metadata.c | 97 +++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 100 insertions(+)
+
+--- a/include/Makefile.in
++++ b/include/Makefile.in
+@@ -1261,12 +1261,15 @@
+ 
+ INSTALL_LIB = \
+ 	windows.applicationmodel.winmd \
++	windows.applicationmodel.datatransfer.winmd \
++	windows.foundation.winmd \
+ 	windows.globalization.winmd \
+ 	windows.graphics.winmd \
+ 	windows.media.winmd \
+ 	windows.networking.winmd \
+ 	windows.perception.winmd \
+ 	windows.storage.winmd \
++	windows.storage.streams.winmd \
+ 	windows.system.winmd \
+ 	windows.ui.winmd \
+ 	windows.ui.xaml.winmd
+--- a/tools/widl/metadata.c
++++ b/tools/widl/metadata.c
+@@ -927,6 +927,40 @@
+     return add_row( TABLE_INTERFACEIMPL, (const BYTE *)&row, sizeof(row) );
+ }
+ 
++/* GenericParam rows are sorted by owner first so the in-memory layout keeps
++ * the table ordered; the wire order (number, flags, owner, name) is handled
++ * by the serializer below. */
++struct genericparam_row
++{
++    UINT owner;
++    UINT number;
++    UINT flags;
++    UINT name;
++};
++
++static UINT add_genericparam_row( UINT owner, UINT number, UINT flags, UINT name )
++{
++    struct genericparam_row row = { owner, number, flags, name };
++    return add_row( TABLE_GENERICPARAM, (const BYTE *)&row, sizeof(row) );
++}
++
++static void serialize_genericparam_table( void )
++{
++    const struct genericparam_row *row = (const struct genericparam_row *)current_winmd->tables[TABLE_GENERICPARAM].ptr;
++    UINT i;
++
++    for (i = 0; i < current_winmd->tables[TABLE_GENERICPARAM].count; i++)
++    {
++        serialize_ushort( row->number );
++        serialize_ushort( row->flags );
++        /* Owner uses a single tag bit (0 for TypeDef); verified against
++         * Microsoft's own winmds and System.Reflection.Metadata. */
++        serialize_table_idx( row->owner, TABLE_TYPEDEF );
++        serialize_string_idx( row->name );
++        row++;
++    }
++}
++
+ static int cmp_interfaceimpl_row( const void *a, const void *b )
+ {
+     const struct interfaceimpl_row *row = a, *row2 = b;
+@@ -2895,6 +2929,55 @@
+     add_exclusiveto_attr_step2( type );
+ }
+ 
++/* Parameterized (generic) interface templates, e.g. IAsyncOperation<TResult>.
++ * These were skipped entirely, so any signature referencing an instantiation
++ * (such as IAsyncOperation<StorageFile>) left the CLR with a TypeRef it could
++ * never resolve to a TypeDef. Emit a minimal TypeDef: name with arity, the
++ * namespace, the generic parameters and the uuid/contract attributes. Methods
++ * are intentionally omitted; callers only need the type identity to bind. */
++static void add_pinterface_type_step1( type_t *type )
++{
++    add_contract_attr_step1( type );
++    add_uuid_attr_step1( type );
++    add_exclusiveto_attr_step1( type );
++}
++
++static void add_pinterface_type_step2( type_t *type )
++{
++    type_t *tmpl = type->details.parameterized.type;
++    typeref_list_t *params = type->details.parameterized.params;
++    typeref_t *ref;
++    char *name, *namespace_str;
++    UINT count = 0, number = 0;
++    UINT flags = TYPE_ATTR_INTERFACE | TYPE_ATTR_ABSTRACT | TYPE_ATTR_UNKNOWN;
++
++    if (type->md.def) return;
++    if (!is_attr( type->attrs, ATTR_EXCLUSIVETO )) flags |= TYPE_ATTR_PUBLIC;
++
++    if (params) LIST_FOR_EACH_ENTRY( ref, params, typeref_t, entry ) count++;
++    name = strmake( "%s`%u", tmpl->name, count );
++    namespace_str = format_namespace( type->namespace, "", ".", NULL, NULL );
++
++    type->md.name = add_string( name );
++    type->md.namespace = add_string( namespace_str );
++    type->md.def = add_typedef_row( flags, type->md.name, type->md.namespace, 0, 0, 0 );
++
++    if (params) LIST_FOR_EACH_ENTRY( ref, params, typeref_t, entry )
++    {
++        /* Owner tag is a single bit (0 for TypeDef); this matches Microsoft's
++         * own winmds as read by System.Reflection.Metadata. */
++        add_genericparam_row( type->md.def << 1, number++, 0,
++                              add_string( ref->type->name ) );
++    }
++
++    add_contract_attr_step2( type );
++    add_uuid_attr_step2( type );
++    add_exclusiveto_attr_step2( type );
++
++    free( name );
++    free( namespace_str );
++}
++
+ static void add_contractversion_attr_step1( const type_t *type )
+ {
+     static const BYTE sig[] = { SIG_TYPE_HASTHIS, 1, ELEMENT_TYPE_VOID, ELEMENT_TYPE_U4 };
+@@ -3752,6 +3835,13 @@
+         case TYPE_DELEGATE:
+             add_delegate_type_step1( type );
+             break;
++        case TYPE_PARAMETERIZED_TYPE:
++            if (type->details.parameterized.type &&
++                type->details.parameterized.type->type_type == TYPE_INTERFACE)
++                add_pinterface_type_step1( type );
++            else
++                fprintf( stderr, "Unhandled type %u name '%s'.\n", type->type_type, type->name );
++            break;
+         default:
+             fprintf( stderr, "Unhandled type %u name '%s'.\n", type->type_type, type->name );
+             break;
+@@ -3789,6 +3879,11 @@
+         case TYPE_DELEGATE:
+             add_delegate_type_step2( type );
+             break;
++        case TYPE_PARAMETERIZED_TYPE:
++            if (type->details.parameterized.type &&
++                type->details.parameterized.type->type_type == TYPE_INTERFACE)
++                add_pinterface_type_step2( type );
++            break;
+         default:
+             break;
+         }
+@@ -3831,6 +3926,7 @@
+     serialize_methodimpl_table();
+     serialize_assembly_table();
+     serialize_assemblyref_table();
++    serialize_genericparam_table();
+ }
+ 
+ static void build_streams( void )

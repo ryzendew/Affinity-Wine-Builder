@@ -1,0 +1,89 @@
+From: Arecsu <alejandro9r@gmail.com>
+Date: Sat, 28 Mar 2026 03:50:47 -0300
+Subject: d2d1: prevent runaway bezier splitting and recursion in geometry processing
+
+Add a recursion guard in d2d_geometry_intersect_bezier_bezier that
+returns early when bezier parameter ranges shrink below 1e-6, preventing
+infinite recursion on overlapping or collinear beziers.
+
+Add a split budget (512 total, 16 per pair) in d2d_geometry_resolve_beziers
+to cap bezier control triangle splitting, preventing pathological
+geometries from causing unbounded segment growth and application freezes.
+
+Fixes Affinity apps hanging on complex vector paths.
+
+diff --git a/dlls/d2d1/geometry.c b/dlls/d2d1/geometry.c
+index 28dc761..e29e863 100644
+--- a/dlls/d2d1/geometry.c
++++ b/dlls/d2d1/geometry.c
+@@ -2607,6 +2607,9 @@ static BOOL d2d_geometry_intersect_bezier_bezier(struct d2d_geometry *geometry,
+     float centre_p, centre_q;
+     size_t next;
+ 
++    if (end_p - start_p < 1e-6f || end_q - start_q < 1e-6f)
++        return TRUE;
++
+     figure = &geometry->u.path.figures[idx_p->figure_idx];
+     p[0] = &figure->vertices[idx_p->vertex_idx];
+     p[1] = &figure->bezier_controls[idx_p->control_idx];
+@@ -3636,31 +3639,44 @@ static HRESULT d2d_geometry_resolve_beziers(struct d2d_geometry *geometry)
+     if (!d2d_geometry_get_first_bezier_segment_idx(geometry, &idx_p))
+         return S_OK;
+ 
+-    /* Split overlapping bezier control triangles. */
+-    while (d2d_geometry_get_next_bezier_segment_idx(geometry, &idx_p))
++    /* Split overlapping bezier control triangles.
++     * A global split budget prevents runaway splitting for pathological
++     * geometries (e.g. nearly-identical overlapping beziers) where the outer
++     * loop would otherwise process an ever-growing list of newly-created
++     * segments.  Once the budget is spent, no new segments are created, the
++     * total bezier count is bounded, and the outer loop terminates.  A
++     * secondary per-pair cap prevents any single pair from monopolising the
++     * global budget at the expense of other pairs. */
+     {
+-        d2d_geometry_get_first_bezier_segment_idx(geometry, &idx_q);
+-        while (idx_q.figure_idx < idx_p.figure_idx || idx_q.vertex_idx < idx_p.vertex_idx)
++        unsigned int total_splits = 0;
++        while (d2d_geometry_get_next_bezier_segment_idx(geometry, &idx_p))
+         {
+-            while (d2d_geometry_check_bezier_overlap(geometry, &idx_p, &idx_q))
++            d2d_geometry_get_first_bezier_segment_idx(geometry, &idx_q);
++            while (idx_q.figure_idx < idx_p.figure_idx || idx_q.vertex_idx < idx_p.vertex_idx)
+             {
+-                if (fabsf(d2d_geometry_bezier_ccw(geometry, &idx_q)) > fabsf(d2d_geometry_bezier_ccw(geometry, &idx_p)))
++                unsigned int pair_splits = 0;
++                while (total_splits < 512 && pair_splits++ < 16
++                        && d2d_geometry_check_bezier_overlap(geometry, &idx_p, &idx_q))
+                 {
+-                    if (!d2d_geometry_split_bezier(geometry, &idx_q))
+-                        return E_OUTOFMEMORY;
+-                    if (idx_p.figure_idx == idx_q.figure_idx)
++                    ++total_splits;
++                    if (fabsf(d2d_geometry_bezier_ccw(geometry, &idx_q)) > fabsf(d2d_geometry_bezier_ccw(geometry, &idx_p)))
+                     {
+-                        ++idx_p.vertex_idx;
+-                        ++idx_p.control_idx;
++                        if (!d2d_geometry_split_bezier(geometry, &idx_q))
++                            return E_OUTOFMEMORY;
++                        if (idx_p.figure_idx == idx_q.figure_idx)
++                        {
++                            ++idx_p.vertex_idx;
++                            ++idx_p.control_idx;
++                        }
++                    }
++                    else
++                    {
++                        if (!d2d_geometry_split_bezier(geometry, &idx_p))
++                            return E_OUTOFMEMORY;
+                     }
+                 }
+-                else
+-                {
+-                    if (!d2d_geometry_split_bezier(geometry, &idx_p))
+-                        return E_OUTOFMEMORY;
+-                }
++                d2d_geometry_get_next_bezier_segment_idx(geometry, &idx_q);
+             }
+-            d2d_geometry_get_next_bezier_segment_idx(geometry, &idx_q);
+         }
+     }

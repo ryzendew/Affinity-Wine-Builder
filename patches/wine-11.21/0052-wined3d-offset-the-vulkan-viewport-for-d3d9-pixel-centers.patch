@@ -1,0 +1,41 @@
+wined3d: Offset the Vulkan viewport for d3d8 and d3d9 pixel centers.
+
+d3d8 and d3d9 put pixel centers on integer coordinates
+(WINED3D_PIXEL_CENTER_INTEGER). The GL backend shifts the viewport by half a
+pixel to match; the Vulkan backend passes it through unchanged. Everything a
+d3d9 application draws on the Vulkan renderer then lands half a pixel off
+and is resampled: edges blur and text goes soft.
+
+Shift the viewport as the GL backend does. A 36-cell WPF feature gallery,
+drawn through d3d9, differed from software rendering in every cell on Vulkan
+(36,600 px); with this it matches the GL renderer exactly (the same 732 px
+differ from software for both).
+
+Upstream master has the same gap.
+
+diff --git a/dlls/wined3d/context_vk.c b/dlls/wined3d/context_vk.c
+index 704d755..a8ac0f4 100644
+--- a/dlls/wined3d/context_vk.c
++++ b/dlls/wined3d/context_vk.c
+@@ -4169,6 +4169,10 @@ VkCommandBuffer wined3d_context_vk_apply_draw_state(struct wined3d_context_vk *c
+             || wined3d_context_is_graphics_state_dirty(&context_vk->c, STATE_RASTERIZER))
+     {
+         unsigned int viewport_count = (context_vk->vk_info->multiple_viewports ? WINED3D_MAX_VIEWPORTS : 1);
++        /* d3d8 and d3d9 put pixel centers on integer coordinates; Vulkan puts
++         * them half a pixel in. Shift the viewport as the GL backend does. */
++        float pixel_center_offset = context_vk->c.d3d_info->wined3d_creation_flags
++                & WINED3D_PIXEL_CENTER_INTEGER ? 0.5f : 0.0f;
+         VkViewport viewports[WINED3D_MAX_VIEWPORTS];
+         VkRect2D scissors[WINED3D_MAX_VIEWPORTS];
+         unsigned int i;
+@@ -4191,8 +4195,8 @@ VkCommandBuffer wined3d_context_vk_apply_draw_state(struct wined3d_context_vk *c
+                 continue;
+             }
+ 
+-            viewport->x = src_viewport->x;
+-            viewport->y = src_viewport->y;
++            viewport->x = src_viewport->x + pixel_center_offset;
++            viewport->y = src_viewport->y + pixel_center_offset;
+             viewport->width = src_viewport->width;
+             viewport->height = src_viewport->height;
+             viewport->minDepth = src_viewport->min_z;

@@ -1,0 +1,245 @@
+d2d1, wined3d: Fewer commands per Direct2D draw.
+
+Each Direct2D primitive still cost a viewport, an index buffer, a vertex
+buffer and two constant buffer commands for wined3d's command stream, and
+three buffer maps:
+
+- wined3d emitted a viewport command for every RSSetViewports(), unlike
+  scissor rectangles, blend and rasterizer states, which it skips when
+  they do not change. Skip identical viewports too.
+- Direct2D bound its upload buffer as index and vertex buffer at the
+  draw's offsets. Vertex data in the upload buffer now starts at a
+  multiple of the stride, and draws bind the buffer at offset 0 and pass
+  a start index and a base vertex, so wined3d skips the rebinding.
+- The vertex and pixel shader constants of a draw go into the constant
+  buffer with one map instead of two.
+
+The d2d1 (17491), d3d11 (562560) and d3d9 visual (210933) conformance
+tests give the same results before and after. Affinity's interface
+renders identically. Vector editing in Affinity under a nested KWin, on
+top of 0059, three rounds each, CPU per presented frame on wined3d's
+thread / the UI thread:
+
+                 before          after
+  drag         3.9 / 7.1 ms    3.5 / 6.6 ms
+  node edit    3.6 / 5.4 ms    3.3 / 5.0 ms
+  typing       2.0 / 13.0 ms   1.9 / 12.4 ms
+  drag frames  373             395
+
+diff --git a/dlls/d2d1/d2d1_private.h b/dlls/d2d1/d2d1_private.h
+index 05a62e3..f4a3c56 100644
+--- a/dlls/d2d1/d2d1_private.h
++++ b/dlls/d2d1/d2d1_private.h
+@@ -204,6 +204,8 @@ struct d2d_device_context
+         unsigned int size, pos;
+     } upload_ring, cb_ring;
+     unsigned int vs_cb_offset, ps_cb_offset;
++    struct d2d_vs_cb vs_cb_data;  /* written with the next pixel shader constants, in one map */
++    BOOL vs_cb_pending;
+     ID3DDeviceContextState *batch_prev_state; /* the application's state, while ours stays bound */
+     ID3D11Buffer *vs_cb;
+     ID3D11PixelShader *ps;
+diff --git a/dlls/d2d1/device.c b/dlls/d2d1/device.c
+index 04a6cc7..04055b6 100644
+--- a/dlls/d2d1/device.c
++++ b/dlls/d2d1/device.c
+@@ -225,6 +225,8 @@ static ID3DDeviceContextState *d2d_device_context_begin_draw_state(struct d2d_de
+     return NULL;
+ }
+ 
++static void d2d_device_context_flush_vs_cb(struct d2d_device_context *context);
++
+ static void d2d_device_context_draw(struct d2d_device_context *render_target, enum d2d_shape_type shape_type,
+         ID3D11Buffer *ib, unsigned int ib_offset, unsigned int index_count, ID3D11Buffer *vb, unsigned int vb_offset,
+         unsigned int vb_stride, struct d2d_brush *brush, struct d2d_brush *opacity_brush)
+@@ -237,8 +239,8 @@ static void d2d_device_context_draw(struct d2d_device_context *render_target, en
+     unsigned int vs_first = render_target->vs_cb_offset / 16, ps_first = render_target->ps_cb_offset / 16;
+     unsigned int vs_count = ((sizeof(struct d2d_vs_cb) + 255) & ~255u) / 16;
+     unsigned int ps_count = ((sizeof(struct d2d_ps_cb) + 255) & ~255u) / 16;
++    unsigned int offset, start_index = 0, base_vertex = 0;
+     D3D11_RECT scissor_rect;
+-    unsigned int offset;
+     D3D11_VIEWPORT vp;
+ 
+     vp.TopLeftX = 0;
+@@ -252,8 +254,21 @@ static void d2d_device_context_draw(struct d2d_device_context *render_target, en
+         EnterCriticalSection(render_target->cs);
+ 
+     ID3D11Device1_GetImmediateContext1(device, &context);
++    if (render_target->vs_cb_pending)
++        d2d_device_context_flush_vs_cb(render_target);
++    vs_first = render_target->vs_cb_offset / 16;
+     prev_state = d2d_device_context_begin_draw_state(render_target, context);
+ 
++    /* Bind the buffers at offset 0 and address the draw's data with a start index
++     * and a base vertex, so that consecutive draws from the upload ring bind the
++     * same buffers and wined3d skips the rebinding. */
++    if (!(ib_offset % sizeof(WORD)) && !(vb_offset % vb_stride))
++    {
++        start_index = ib_offset / sizeof(WORD);
++        base_vertex = vb_offset / vb_stride;
++        ib_offset = vb_offset = 0;
++    }
++
+     ID3D11DeviceContext1_IASetInputLayout(context, shape_resources->il);
+     ID3D11DeviceContext1_IASetPrimitiveTopology(context, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+     ID3D11DeviceContext1_IASetIndexBuffer(context, ib, DXGI_FORMAT_R16_UINT, ib_offset);
+@@ -297,9 +312,9 @@ static void d2d_device_context_draw(struct d2d_device_context *render_target, en
+         d2d_brush_bind_resources(opacity_brush, render_target, 1);
+ 
+     if (ib)
+-        ID3D11DeviceContext1_DrawIndexed(context, index_count, 0, 0);
++        ID3D11DeviceContext1_DrawIndexed(context, index_count, start_index, base_vertex);
+     else
+-        ID3D11DeviceContext1_Draw(context, index_count, 0);
++        ID3D11DeviceContext1_Draw(context, index_count, base_vertex);
+ 
+     if (prev_state)
+     {
+@@ -320,7 +335,7 @@ static void d2d_device_context_draw(struct d2d_device_context *render_target, en
+  * with one NO_OVERWRITE map, and the buffer is discarded (renamed) when it
+  * wraps. */
+ static HRESULT d2d_upload_ring_write(struct d2d_device_context *context, const void *indices,
+-        unsigned int index_size, const void *vertices, unsigned int vertex_size,
++        unsigned int index_size, const void *vertices, unsigned int vertex_size, unsigned int vb_stride,
+         unsigned int *ib_offset, unsigned int *vb_offset)
+ {
+     struct d2d_upload_ring *ring = &context->upload_ring;
+@@ -330,7 +345,9 @@ static HRESULT d2d_upload_ring_write(struct d2d_device_context *context, const v
+     D3D11_MAPPED_SUBRESOURCE map;
+     HRESULT hr;
+ 
+-    size = ((index_size + 15) & ~15u) + vertex_size;
++    /* Vertex data starts at a multiple of the stride, so that draws can address it
++     * with a base vertex and the buffer stays bound at offset 0. */
++    size = ((index_size + 15) & ~15u) + vb_stride + vertex_size;
+     if (!ring->buffer || size > ring->size)
+     {
+         unsigned int new_size = max(ring->size * 2, 2 * 1024 * 1024);
+@@ -367,6 +384,7 @@ static HRESULT d2d_upload_ring_write(struct d2d_device_context *context, const v
+         if (index_size)
+             memcpy((BYTE *)map.pData + pos, indices, index_size);
+         *vb_offset = pos + ((index_size + 15) & ~15u);
++        *vb_offset = (*vb_offset + vb_stride - 1) / vb_stride * vb_stride;
+         memcpy((BYTE *)map.pData + *vb_offset, vertices, vertex_size);
+         ID3D11DeviceContext1_Unmap(d3d_context, (ID3D11Resource *)ring->buffer, 0);
+         ring->pos = pos + size;
+@@ -388,7 +406,7 @@ static void d2d_device_context_draw_data(struct d2d_device_context *render_targe
+         EnterCriticalSection(render_target->cs);
+ 
+     if (FAILED(hr = d2d_upload_ring_write(render_target, indices, indices ? index_size : 0,
+-            vertices, vertex_size, &ib_offset, &vb_offset)))
++            vertices, vertex_size, vb_stride, &ib_offset, &vb_offset)))
+         WARN("Failed to upload geometry, hr %#lx.\n", hr);
+     else
+         d2d_device_context_draw(render_target, shape_type, indices ? render_target->upload_ring.buffer : NULL,
+@@ -1042,16 +1060,49 @@ static void *d2d_device_context_map_cb(struct d2d_device_context *context,
+     return (BYTE *)map.pData + pos;
+ }
+ 
++/* Writes vertex shader constants left by d2d_device_context_update_vs_cb() on their own. */
++static void d2d_device_context_flush_vs_cb(struct d2d_device_context *context)
++{
++    ID3D11DeviceContext *d3d_context;
++    struct d2d_vs_cb *cb_data;
++
++    context->vs_cb_pending = FALSE;
++    ID3D11Device1_GetImmediateContext(context->d3d_device, &d3d_context);
++    if ((cb_data = d2d_device_context_map_cb(context, d3d_context, sizeof(*cb_data), &context->vs_cb_offset)))
++    {
++        *cb_data = context->vs_cb_data;
++        ID3D11DeviceContext_Unmap(d3d_context, (ID3D11Resource *)context->cb_ring.buffer, 0);
++    }
++    ID3D11DeviceContext_Release(d3d_context);
++}
++
+ static HRESULT d2d_device_context_update_ps_cb(struct d2d_device_context *context,
+         struct d2d_brush *brush, struct d2d_brush *opacity_brush, BOOL outline, BOOL is_arc)
+ {
++    const unsigned int vs_size = (sizeof(struct d2d_vs_cb) + 255) & ~255u;
+     ID3D11DeviceContext *d3d_context;
+     struct d2d_ps_cb *cb_data;
++    unsigned int offset;
++    BYTE *data;
+     HRESULT hr;
+ 
+     ID3D11Device1_GetImmediateContext(context->d3d_device, &d3d_context);
+ 
+-    if (!(cb_data = d2d_device_context_map_cb(context, d3d_context, sizeof(*cb_data), &context->ps_cb_offset)))
++    /* Most draws set both; one map for both halves the maps per draw. */
++    if (context->vs_cb_pending)
++    {
++        if (!(data = d2d_device_context_map_cb(context, d3d_context, vs_size + sizeof(*cb_data), &offset)))
++        {
++            ID3D11DeviceContext_Release(d3d_context);
++            return E_FAIL;
++        }
++        memcpy(data, &context->vs_cb_data, sizeof(context->vs_cb_data));
++        context->vs_cb_offset = offset;
++        context->ps_cb_offset = offset + vs_size;
++        context->vs_cb_pending = FALSE;
++        cb_data = (struct d2d_ps_cb *)(data + vs_size);
++    }
++    else if (!(cb_data = d2d_device_context_map_cb(context, d3d_context, sizeof(*cb_data), &context->ps_cb_offset)))
+     {
+         ID3D11DeviceContext_Release(d3d_context);
+         return E_FAIL;
+@@ -1076,19 +1127,10 @@ static HRESULT d2d_device_context_update_ps_cb(struct d2d_device_context *contex
+ static HRESULT d2d_device_context_update_vs_cb(struct d2d_device_context *context,
+         const D2D_MATRIX_3X2_F *geometry_transform, float stroke_width)
+ {
+-    ID3D11DeviceContext *d3d_context;
++    struct d2d_vs_cb *cb_data = &context->vs_cb_data;
+     const D2D1_MATRIX_3X2_F *w;
+-    struct d2d_vs_cb *cb_data;
+     float tmp_x, tmp_y;
+ 
+-    ID3D11Device1_GetImmediateContext(context->d3d_device, &d3d_context);
+-
+-    if (!(cb_data = d2d_device_context_map_cb(context, d3d_context, sizeof(*cb_data), &context->vs_cb_offset)))
+-    {
+-        ID3D11DeviceContext_Release(d3d_context);
+-        return E_FAIL;
+-    }
+-
+     cb_data->transform_geometry._11 = geometry_transform->_11;
+     cb_data->transform_geometry._21 = geometry_transform->_21;
+     cb_data->transform_geometry._31 = geometry_transform->_31;
+@@ -1112,9 +1154,8 @@ static HRESULT d2d_device_context_update_vs_cb(struct d2d_device_context *contex
+     cb_data->transform_rty.z = w->_32 * tmp_y;
+     cb_data->transform_rty.w = -2.0f / context->pixel_size.height;
+ 
+-    ID3D11DeviceContext_Unmap(d3d_context, (ID3D11Resource *)context->cb_ring.buffer, 0);
+-    ID3D11DeviceContext_Release(d3d_context);
+-
++    /* Written by the next d2d_device_context_update_ps_cb(), or at the draw. */
++    context->vs_cb_pending = TRUE;
+     return S_OK;
+ }
+ 
+diff --git a/dlls/wined3d/device.c b/dlls/wined3d/device.c
+index 1c042ee..3de5f7e 100644
+--- a/dlls/wined3d/device.c
++++ b/dlls/wined3d/device.c
+@@ -2217,6 +2217,13 @@ void CDECL wined3d_device_context_set_viewports(struct wined3d_device_context *c
+     }
+ 
+     wined3d_device_context_lock(context);
++    if (viewport_count && state->viewport_count == viewport_count
++            && !memcmp(state->viewports, viewports, viewport_count * sizeof(*viewports)))
++    {
++        TRACE("App is setting the old viewports over, nothing to do.\n");
++        goto out;
++    }
++
+     if (viewport_count)
+         memcpy(state->viewports, viewports, viewport_count * sizeof(*viewports));
+     else
+@@ -2224,6 +2231,7 @@ void CDECL wined3d_device_context_set_viewports(struct wined3d_device_context *c
+     state->viewport_count = viewport_count;
+ 
+     wined3d_device_context_emit_set_viewports(context, viewport_count, viewports);
++out:
+     wined3d_device_context_unlock(context);
+ }
+ 

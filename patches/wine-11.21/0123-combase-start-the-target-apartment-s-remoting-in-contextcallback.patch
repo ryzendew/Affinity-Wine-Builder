@@ -1,0 +1,46 @@
+combase: Start the target apartment's remoting in ContextCallback.
+
+IContextCallback::ContextCallback() reaches another apartment of the
+process through that apartment's IRundown object, but started remoting
+only for the calling apartment. An apartment serves remote calls once it
+has marshaled an object, so a call into an MTA that had marshaled
+nothing failed with RPC_S_SERVER_UNAVAILABLE. .NET uses ContextCallback
+to call a COM object from another context than the one it was created
+in: System.Management, connecting on its MTA helper thread and queried
+from a WPF (STA) thread, got nothing back.
+---
+ dlls/combase/combase.c | 14 +++++++++++++-
+ 1 file changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/dlls/combase/combase.c b/dlls/combase/combase.c
+index 94e256f..c238d34 100644
+--- a/dlls/combase/combase.c
++++ b/dlls/combase/combase.c
+@@ -2600,7 +2600,7 @@ static HRESULT WINAPI thread_context_callback_ContextCallback(IContextCallback *
+     struct thread_context *context = impl_from_IContextCallback(iface);
+     IObjContext *current_context;
+     XAptCallback apt_callback;
+-    struct apartment *apt;
++    struct apartment *apt, *target_apt;
+     STDOBJREF stdobjref;
+     OXID_INFO oxid_info;
+     IRundown *rundown;
+@@ -2655,6 +2655,18 @@ static HRESULT WINAPI thread_context_callback_ContextCallback(IContextCallback *
+         return hr;
+     }
+ 
++    /* The call goes to the context's apartment through its IRundown object.
++     * That apartment is in this process, but it serves remote calls only
++     * once its remoting has started, which happens when it first marshals
++     * an object. An MTA that has not marshaled anything yet would refuse
++     * the call (RPC_S_SERVER_UNAVAILABLE): .NET then could not use a WMI
++     * connection made on its MTA helper thread from an STA. */
++    if ((target_apt = apartment_findfromoxid(context->oxid)))
++    {
++        rpc_start_remoting(target_apt);
++        apartment_release(target_apt);
++    }
++
+     hr = rpc_resolve_oxid(context->oxid, &oxid_info);
+     if (SUCCEEDED(hr))
+     {

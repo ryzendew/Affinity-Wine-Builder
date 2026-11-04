@@ -1,0 +1,130 @@
+From 1c27a4ff6284d8e35cbc2c108d8ea72a78467a9e Mon Sep 17 00:00:00 2001
+From: jfacemyer <1776340+jfacemyer@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 00:28:52 -0500
+Subject: [PATCH 5/8] d2d1: Insert a large path's inside control points a
+ figure at a time.
+
+Close() inserts each bezier control point that lies inside the path into
+its figure as a vertex, and each insert moved the rest of the figure. For
+a path of 138,000 curves that took 50 ms. With the inside tests already
+done (d2d_geometry_controls_inside()), the inserts are now collected and
+each figure grown and moved once, in 4 ms. The figures come out the
+same: the inserted vertices are not bezier vertices, so the segment walk
+visits the same segments with or without them.
+---
+ dlls/d2d1/geometry.c | 71 ++++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 69 insertions(+), 2 deletions(-)
+
+diff --git a/dlls/d2d1/geometry.c b/dlls/d2d1/geometry.c
+index 7d64f19..c7d2149 100644
+--- a/dlls/d2d1/geometry.c
++++ b/dlls/d2d1/geometry.c
+@@ -4871,6 +4871,52 @@ static size_t d2d_resolve_candidates(struct d2d_box_grid *grid, const struct d2d
+     return n;
+ }
+ 
++struct d2d_vertex_insert
++{
++    size_t figure_idx;
++    size_t vertex_idx;
++    D2D1_POINT_2F vertex;
++};
++
++/* d2d_figure_insert_vertex() for each of a list of inserts, sorted by figure
++ * and position, with positions counted before any insert: each figure's
++ * arrays are grown and moved once, rather than once per vertex. */
++static void d2d_geometry_apply_inserts(struct d2d_geometry *geometry,
++        const struct d2d_vertex_insert *inserts, size_t count)
++{
++    size_t first, last, j, src, pos;
++    struct d2d_figure *figure;
++
++    for (first = 0; first < count; first = last)
++    {
++        figure = &geometry->u.path.figures[inserts[first].figure_idx];
++        for (last = first; last < count && inserts[last].figure_idx == inserts[first].figure_idx; ++last);
++
++        if (!d2d_array_reserve((void **)&figure->vertices, &figure->vertices_size,
++                figure->vertex_count + last - first, sizeof(*figure->vertices))
++                || !d2d_array_reserve((void **)&figure->vertex_types, &figure->vertex_types_size,
++                figure->vertex_count + last - first, sizeof(*figure->vertex_types)))
++        {
++            ERR("Failed to grow vertex arrays.\n");
++            continue;
++        }
++        src = figure->vertex_count;
++        for (j = last; j-- > first;)
++        {
++            pos = inserts[j].vertex_idx;
++            memmove(&figure->vertices[pos + j - first + 1], &figure->vertices[pos],
++                    (src - pos) * sizeof(*figure->vertices));
++            memmove(&figure->vertex_types[pos + j - first + 1], &figure->vertex_types[pos],
++                    (src - pos) * sizeof(*figure->vertex_types));
++            figure->vertices[pos + j - first] = inserts[j].vertex;
++            figure->vertex_types[pos + j - first] = D2D_VERTEX_TYPE_NONE;
++            d2d_rect_expand(&figure->bounds, &inserts[j].vertex);
++            src = pos;
++        }
++        figure->vertex_count += last - first;
++    }
++}
++
+ struct d2d_controls_inside_ctx
+ {
+     const struct d2d_geometry *geometry;
+@@ -4940,7 +4986,8 @@ static HRESULT d2d_geometry_resolve_beziers(struct d2d_geometry *geometry)
+     struct d2d_curve_vertex *b;
+     const D2D1_POINT_2F *p[3];
+     struct d2d_figure *figure;
+-    size_t bezier_idx, i;
++    struct d2d_vertex_insert *inserts = NULL;
++    size_t bezier_idx, i, insert_count = 0;
+     BOOL *inside = NULL;
+ 
+     if (!d2d_geometry_get_first_bezier_segment_idx(geometry, &idx_p))
+@@ -5105,6 +5152,11 @@ oom:
+      * of type D2D_VERTEX_TYPE_NONE. */
+     if (have_probe_edges && geometry->fill.bezier_vertex_count / 3 >= D2D_PARALLEL_MIN_COUNT)
+         inside = d2d_geometry_controls_inside(geometry, &probe_edges, geometry->fill.bezier_vertex_count / 3);
++    /* For many segments, the inserts are made after the loop, all at once.
++     * The segments come in the same order either way: the inserted
++     * vertices are not bezier vertices. */
++    if (inside)
++        inserts = malloc((geometry->fill.bezier_vertex_count / 3) * sizeof(*inserts));
+     bezier_idx = 0;
+     d2d_geometry_get_first_bezier_segment_idx(geometry, &idx_p);
+     for (;;)
+@@ -5116,7 +5168,17 @@ oom:
+         p[1] = &figure->bezier_controls[idx_p.control_idx];
+ 
+         i = idx_p.vertex_idx + 1;
+-        if (inside ? inside[bezier_idx] : have_probe_edges ? d2d_probe_edges_point_inside(&probe_edges, geometry, p[1])
++        if (inserts && inside[bezier_idx])
++        {
++            /* Until the inserts are made, the vertex after the segment
++             * stays at i. */
++            sign = 1.0f;
++            inserts[insert_count].figure_idx = idx_p.figure_idx;
++            inserts[insert_count].vertex_idx = i;
++            inserts[insert_count].vertex = *p[1];
++            ++insert_count;
++        }
++        else if (inside ? inside[bezier_idx] : have_probe_edges ? d2d_probe_edges_point_inside(&probe_edges, geometry, p[1])
+                 : d2d_path_geometry_point_inside(geometry, p[1], FALSE))
+         {
+             sign = 1.0f;
+@@ -5140,6 +5202,11 @@ oom:
+         ++bezier_idx;
+     }
+ 
++    if (inserts)
++    {
++        d2d_geometry_apply_inserts(geometry, inserts, insert_count);
++        free(inserts);
++    }
+     if (have_probe_edges)
+         d2d_probe_edges_cleanup(&probe_edges);
+     free(inside);
+-- 
+2.55.0
+

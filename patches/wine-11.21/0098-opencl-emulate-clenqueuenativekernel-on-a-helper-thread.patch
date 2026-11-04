@@ -1,0 +1,114 @@
+opencl: Emulate clEnqueueNativeKernel on a helper thread.
+
+A native kernel carries no device code, only a PE function the host can
+never call, so the bridge returned CL_INVALID_OPERATION. Wait for the
+wait list through the host, run user_func on a helper thread and signal
+completion through a user event, released by the thread when the caller
+wants no event. mem_list and args_mem_loc reach user_func unchanged.
+
+From the Affinity-Wine-Builder 11.18 set (its 0065).
+---
+ dlls/opencl/pe_thunks.c | 87 +++++++++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 85 insertions(+), 2 deletions(-)
+
+diff --git a/dlls/opencl/pe_thunks.c b/dlls/opencl/pe_thunks.c
+index 3ac9b11..aa76602 100644
+--- a/dlls/opencl/pe_thunks.c
++++ b/dlls/opencl/pe_thunks.c
+@@ -368,11 +368,94 @@ cl_int WINAPI clEnqueueNDRangeKernel( cl_command_queue command_queue, cl_kernel
+     return ret;
+ }
+ 
++/* Native kernels carry no device code, so run them on a helper thread
++ * instead of the host (which cannot invoke the PE user function).
++ * mem_list/args_mem_loc are opaque to the bridge and reach user_func
++ * unchanged, as on native. */
++struct native_kernel_args
++{
++    void (WINAPI *user_func)(void *args);
++    void *args;
++    cl_uint num_events;
++    cl_event *events;
++    cl_event event;
++    BOOL release_event;
++};
++
++static DWORD WINAPI native_kernel_thread( void *arg )
++{
++    struct native_kernel_args *na = arg;
++    struct clWaitForEvents_params wait = { na->num_events, (const cl_event *)na->events };
++    struct clSetUserEventStatus_params done = { na->event, CL_COMPLETE };
++
++    if (na->num_events) OPENCL_CALL( clWaitForEvents, &wait );
++    na->user_func( na->args );
++    OPENCL_CALL( clSetUserEventStatus, &done );
++    if (na->release_event)
++    {
++        struct clReleaseEvent_params release = { na->event };
++        OPENCL_CALL( clReleaseEvent, &release );
++    }
++    HeapFree( GetProcessHeap(), 0, na->events );
++    HeapFree( GetProcessHeap(), 0, na );
++    return 0;
++}
++
+ cl_int WINAPI clEnqueueNativeKernel( cl_command_queue command_queue, void (WINAPI* user_func)(void*), void* args, size_t cb_args, cl_uint num_mem_objects, const cl_mem* mem_list, const void** args_mem_loc, cl_uint num_events_in_wait_list, const cl_event* event_wait_list, cl_event* event )
+ {
+-    struct clEnqueueNativeKernel_params params = { command_queue, user_func, args, cb_args, num_mem_objects, mem_list, args_mem_loc, num_events_in_wait_list, event_wait_list, event };
++    struct clGetCommandQueueInfo_params qinfo;
++    struct clCreateUserEvent_params uevt;
++    struct native_kernel_args *na;
++    cl_context context = NULL;
++    cl_event ev = NULL;
++    HANDLE thread;
++    cl_int err;
++    cl_uint i;
++    (void)cb_args; (void)num_mem_objects; (void)mem_list; (void)args_mem_loc;
++
+     TRACE( "(%p, %p, %p, %Iu, %u, %p, %p, %u, %p, %p)\n", command_queue, user_func, args, cb_args, num_mem_objects, mem_list, args_mem_loc, num_events_in_wait_list, event_wait_list, event );
+-    return OPENCL_CALL( clEnqueueNativeKernel, &params );
++    if (!user_func) return CL_INVALID_VALUE;
++
++    qinfo.command_queue = command_queue;
++    qinfo.param_name = CL_QUEUE_CONTEXT;
++    qinfo.param_value_size = sizeof(context);
++    qinfo.param_value = &context;
++    qinfo.param_value_size_ret = NULL;
++    if ((err = OPENCL_CALL( clGetCommandQueueInfo, &qinfo )) || !context) return err ? err : CL_OUT_OF_RESOURCES;
++
++    uevt.__retval = &ev;
++    uevt.context = context;
++    uevt.errcode_ret = &err;
++    OPENCL_CALL( clCreateUserEvent, &uevt );
++    if (err || !ev) return err ? err : CL_OUT_OF_RESOURCES;
++
++    na = HeapAlloc( GetProcessHeap(), 0, sizeof(*na) );
++    if (!na) goto fail;
++    na->user_func = user_func;
++    na->args = args;
++    na->num_events = num_events_in_wait_list;
++    na->events = NULL;
++    na->event = ev;
++    na->release_event = !event;
++    if (num_events_in_wait_list)
++    {
++        na->events = HeapAlloc( GetProcessHeap(), 0, num_events_in_wait_list * sizeof(*na->events) );
++        if (!na->events) { HeapFree( GetProcessHeap(), 0, na ); goto fail; }
++        for (i = 0; i < num_events_in_wait_list; i++) na->events[i] = event_wait_list[i];
++    }
++
++    thread = CreateThread( NULL, 0, native_kernel_thread, na, 0, NULL );
++    if (!thread) { HeapFree( GetProcessHeap(), 0, na->events ); HeapFree( GetProcessHeap(), 0, na ); goto fail; }
++    CloseHandle( thread );
++    if (event) *event = ev;
++    return CL_SUCCESS;
++
++fail:
++    {
++        struct clReleaseEvent_params release = { ev };
++        OPENCL_CALL( clReleaseEvent, &release );
++    }
++    return CL_OUT_OF_RESOURCES;
+ }
+ 
+ cl_int WINAPI clEnqueueReadBuffer( cl_command_queue command_queue, cl_mem buffer, cl_bool blocking_read, size_t offset, size_t size, void* ptr, cl_uint num_events_in_wait_list, const cl_event* event_wait_list, cl_event* event )
