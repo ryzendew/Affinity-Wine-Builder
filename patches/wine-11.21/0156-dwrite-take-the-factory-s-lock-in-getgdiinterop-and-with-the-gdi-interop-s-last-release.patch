@@ -1,0 +1,110 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jfacemyer <1776340+jfacemyer@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 09:07:03 -0500
+Subject: [PATCH] dwrite: Take the factory's lock in GetGdiInterop() and with
+ the GDI interop's last release.
+
+GetGdiInterop() handed out the factory's cached interop with an AddRef(),
+and the interop's Release() dropped its count and detached it from the
+factory afterwards, with nothing between them. When one thread released
+the last reference while another called GetGdiInterop(), the second could
+take the interop whose count had just reached zero: it used it after it
+was freed, then released it again, which released the factory once more.
+The shared factory was then freed while still in use.
+
+Affinity enumerates fonts on several threads at startup through
+GetGdiInterop() and CreateFontFaceFromHdc(), and crashed at startup on
+every second or third launch: in CreateFontFaceFromHdc(), calling
+CreateFontFace() through a factory whose vtable was gone, or releasing an
+object whose memory had been reused.
+
+With the window widened by a sleep, a stress test of four threads failed
+2 of 4 runs before and passed 12 of 12 after. dwrite tests unchanged.
+---
+ dlls/dwrite/dwrite_private.h |  2 +-
+ dlls/dwrite/gdiinterop.c     |  4 ++--
+ dlls/dwrite/main.c           | 19 ++++++++++++++++---
+ 3 files changed, 19 insertions(+), 6 deletions(-)
+
+diff --git a/dlls/dwrite/dwrite_private.h b/dlls/dwrite/dwrite_private.h
+index 9be7680..ee8c9e3 100644
+--- a/dlls/dwrite/dwrite_private.h
++++ b/dlls/dwrite/dwrite_private.h
+@@ -363,7 +363,7 @@ extern HRESULT create_fontfacereference(IDWriteFactory7 *factory, IDWriteFontFil
+ extern HRESULT factory_get_cached_fontface(IDWriteFactory7 *factory, IDWriteFontFile * const *files, UINT32 num_files,
+         DWRITE_FONT_SIMULATIONS simulations, struct list **cache, REFIID riid, void **obj);
+ extern void factory_detach_fontcollection(IDWriteFactory7 *factory, IDWriteFontCollection3 *collection);
+-extern void factory_detach_gdiinterop(IDWriteFactory7 *factory, IDWriteGdiInterop1 *interop);
++extern LONG factory_release_gdiinterop(IDWriteFactory7 *factory, IDWriteGdiInterop1 *interop, LONG *refcount);
+ extern struct fontfacecached *factory_cache_fontface(IDWriteFactory7 *factory, struct list *fontfaces,
+         IDWriteFontFace5 *fontface);
+ extern IDWriteFontFile *get_fontfile_from_font(IDWriteFont *font);
+diff --git a/dlls/dwrite/gdiinterop.c b/dlls/dwrite/gdiinterop.c
+index e757444..265413d 100644
+--- a/dlls/dwrite/gdiinterop.c
++++ b/dlls/dwrite/gdiinterop.c
+@@ -668,14 +668,14 @@ static ULONG WINAPI gdiinterop_AddRef(IDWriteGdiInterop1 *iface)
+ static ULONG WINAPI gdiinterop_Release(IDWriteGdiInterop1 *iface)
+ {
+     struct gdiinterop *interop = impl_from_IDWriteGdiInterop1(iface);
+-    LONG refcount = InterlockedDecrement(&interop->refcount);
++    LONG refcount = factory_release_gdiinterop(interop->factory, iface, &interop->refcount);
+ 
+     TRACE("%p, refcount %lu.\n", iface, refcount);
+ 
+     if (!refcount)
+     {
+         IDWriteFactory7_UnregisterFontFileLoader(interop->factory, &interop->IDWriteFontFileLoader_iface);
+-        factory_detach_gdiinterop(interop->factory, iface);
++        IDWriteFactory7_Release(interop->factory);
+         free(interop);
+     }
+ 
+diff --git a/dlls/dwrite/main.c b/dlls/dwrite/main.c
+index b343d65..ed737b4 100644
+--- a/dlls/dwrite/main.c
++++ b/dlls/dwrite/main.c
+@@ -1236,12 +1236,15 @@ static HRESULT WINAPI dwritefactory_GetGdiInterop(IDWriteFactory7 *iface, IDWrit
+ 
+     TRACE("%p, %p.\n", iface, gdi_interop);
+ 
++    /* See factory_release_gdiinterop(). */
++    EnterCriticalSection(&factory->cs);
+     if (factory->gdiinterop)
+         IDWriteGdiInterop1_AddRef(factory->gdiinterop);
+     else
+         hr = create_gdiinterop(iface, &factory->gdiinterop);
+ 
+     *gdi_interop = (IDWriteGdiInterop *)factory->gdiinterop;
++    LeaveCriticalSection(&factory->cs);
+ 
+     return hr;
+ }
+@@ -2257,11 +2260,21 @@ void factory_detach_fontcollection(IDWriteFactory7 *iface, IDWriteFontCollection
+     IDWriteFactory7_Release(iface);
+ }
+ 
+-void factory_detach_gdiinterop(IDWriteFactory7 *iface, IDWriteGdiInterop1 *interop)
++/* Drop a reference to the factory's GDI interop, and detach it from the
++ * factory with the last one. GetGdiInterop() hands out the same interop and
++ * takes the same lock: without it, another thread could take a reference to
++ * an interop whose count had just reached zero and use it after it was freed. */
++LONG factory_release_gdiinterop(IDWriteFactory7 *iface, IDWriteGdiInterop1 *interop, LONG *refcount)
+ {
+     struct dwritefactory *factory = impl_from_IDWriteFactory7(iface);
+-    factory->gdiinterop = NULL;
+-    IDWriteFactory7_Release(iface);
++    LONG ret;
++
++    EnterCriticalSection(&factory->cs);
++    if (!(ret = InterlockedDecrement(refcount)) && factory->gdiinterop == interop)
++        factory->gdiinterop = NULL;
++    LeaveCriticalSection(&factory->cs);
++
++    return ret;
+ }
+ 
+ HRESULT WINAPI DWriteCreateFactory(DWRITE_FACTORY_TYPE type, REFIID riid, IUnknown **ret)
+-- 
+2.55.0
+
